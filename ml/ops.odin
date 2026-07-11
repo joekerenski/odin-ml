@@ -64,11 +64,7 @@ broadcast_add_into :: proc(out: []f32, out_shape: []i32, a: []f32, a_shape: []i3
 	total := numel(out_shape)
 	idx_buf: [MAX_DIMS]i32
 	for flat in 0..<total {
-		r := i32(flat)
-		for d := odim - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(out_shape, d))
-			r = r % stride_of(out_shape, d)
-		}
+		unravel_index(i32(flat), out_shape, idx_buf[:])
 		a_idx: i32 = 0
 		for d := 0; d < adim; d += 1 {
 			ad := odim - adim + d
@@ -87,11 +83,7 @@ mul_broadcast_into :: proc(out: []f32, out_shape: []i32, a: []f32, a_shape: []i3
 	bdim := len(b_shape)
 	idx_buf: [MAX_DIMS]i32
 	for f in 0..<numel(out_shape) {
-		r := f
-		for d := odim - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(out_shape, d))
-			r = r % stride_of(out_shape, d)
-		}
+		unravel_index(i32(f), out_shape, idx_buf[:])
 		a_idx: i32 = 0
 		for d := 0; d < adim; d += 1 {
 			ad := odim - adim + d
@@ -117,11 +109,7 @@ div_broadcast_into :: proc(out: []f32, out_shape: []i32, a: []f32, a_shape: []i3
 	bdim := len(b_shape)
 	idx_buf: [MAX_DIMS]i32
 	for f in 0..<numel(out_shape) {
-		r := f
-		for d := odim - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(out_shape, d))
-			r = r % stride_of(out_shape, d)
-		}
+		unravel_index(i32(f), out_shape, idx_buf[:])
 		a_idx: i32 = 0
 		for d := 0; d < adim; d += 1 {
 			ad := odim - adim + d
@@ -154,11 +142,28 @@ make_ctx :: proc(out: ^Tensor, op: Op, parents: []^Tensor) {
 
 // ---- elementwise binary ops (with broadcasting) ---------------------------
 
+// Contiguous same-shape → SIMD (CPU) or Metal compute shader (GPU).
+// Otherwise general broadcast path (CPU only for now).
 add :: proc(a, b: ^Tensor) -> ^Tensor {
 	assert(shapes_broadcast(a.shape[:], b.shape[:]), "add: shapes not broadcastable")
+	assert(a.device == b.device, "add: tensors must be on same device")
+
+	if a.device == .Metal && shapes_equal(a.shape[:], b.shape[:]) && is_contiguous(a) && is_contiguous(b) {
+		out := new_tensor(a.shape[:], a.requires_grad || b.requires_grad, .Metal)
+		metal_add(out.data, a.data, b.data)
+		make_ctx(out, .Add, {a, b})
+		return out
+	}
+
+	if shapes_equal(a.shape[:], b.shape[:]) && is_contiguous(a) && is_contiguous(b) {
+		out := new_tensor(a.shape[:], a.requires_grad || b.requires_grad, a.device)
+		add_f32_contiguous(out.data, a.data, b.data)
+		make_ctx(out, .Add, {a, b})
+		return out
+	}
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
-	out := new_tensor(out_shape_buf[:ndim])
+	out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
 	broadcast_add_into(out.data, out.shape[:], a.data, a.shape[:])
 	broadcast_add_into(out.data, out.shape[:], b.data, b.shape[:])
 	make_ctx(out, .Add, {a, b})
@@ -167,12 +172,18 @@ add :: proc(a, b: ^Tensor) -> ^Tensor {
 
 sub :: proc(a, b: ^Tensor) -> ^Tensor {
 	assert(shapes_broadcast(a.shape[:], b.shape[:]), "sub: shapes not broadcastable")
+	if shapes_equal(a.shape[:], b.shape[:]) && is_contiguous(a) && is_contiguous(b) {
+		out := new_tensor(a.shape[:])
+		sub_f32_contiguous(out.data, a.data, b.data)
+		make_ctx(out, .Sub, {a, b})
+		return out
+	}
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
 	out := new_tensor(out_shape_buf[:ndim])
 	broadcast_add_into(out.data, out.shape[:], a.data, a.shape[:])
 	neg_b := make([]f32, len(b.data))
-for i in 0..<len(b.data) do neg_b[i] = -b.data[i]
+	for i in 0..<len(b.data) do neg_b[i] = -b.data[i]
 	broadcast_add_into(out.data, out.shape[:], neg_b, b.shape[:])
 	make_ctx(out, .Sub, {a, b})
 	return out
@@ -180,6 +191,12 @@ for i in 0..<len(b.data) do neg_b[i] = -b.data[i]
 
 mul :: proc(a, b: ^Tensor) -> ^Tensor {
 	assert(shapes_broadcast(a.shape[:], b.shape[:]), "mul: shapes not broadcastable")
+	if shapes_equal(a.shape[:], b.shape[:]) && is_contiguous(a) && is_contiguous(b) {
+		out := new_tensor(a.shape[:])
+		mul_f32_contiguous(out.data, a.data, b.data)
+		make_ctx(out, .Mul, {a, b})
+		return out
+	}
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
 	out := new_tensor(out_shape_buf[:ndim])
@@ -190,6 +207,12 @@ mul :: proc(a, b: ^Tensor) -> ^Tensor {
 
 div :: proc(a, b: ^Tensor) -> ^Tensor {
 	assert(shapes_broadcast(a.shape[:], b.shape[:]), "div: shapes not broadcastable")
+	if shapes_equal(a.shape[:], b.shape[:]) && is_contiguous(a) && is_contiguous(b) {
+		out := new_tensor(a.shape[:])
+		div_f32_contiguous(out.data, a.data, b.data)
+		make_ctx(out, .Div, {a, b})
+		return out
+	}
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
 	out := new_tensor(out_shape_buf[:ndim])
@@ -200,7 +223,7 @@ div :: proc(a, b: ^Tensor) -> ^Tensor {
 
 neg :: proc(a: ^Tensor) -> ^Tensor {
 	out := new_tensor(a.shape[:])
-	for i in 0..<len(out.data) do out.data[i] = -a.data[i]
+	neg_f32_contiguous(out.data, a.data)
 	make_ctx(out, .Neg, {a})
 	return out
 }
@@ -209,9 +232,7 @@ neg :: proc(a: ^Tensor) -> ^Tensor {
 
 relu :: proc(a: ^Tensor) -> ^Tensor {
 	out := new_tensor(a.shape[:])
-	for i in 0..<len(out.data) {
-		out.data[i] = a.data[i] > 0 ? a.data[i] : 0.0
-	}
+	relu_f32_contiguous(out.data, a.data)
 	make_ctx(out, .ReLU, {a})
 	return out
 }
@@ -249,13 +270,13 @@ sum :: proc(a: ^Tensor, axis: i32) -> ^Tensor {
 	for i in 0..<len(out.data) do out.data[i] = 0
 	idx_buf: [MAX_DIMS]i32
 	for flat in 0..<len(a.data) {
-		r := i32(flat)
-		for d := len(a.shape) - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(a.shape[:], d))
-			r = r % stride_of(a.shape[:], d)
-		}
+		unravel_index(i32(flat), a.shape[:], idx_buf[:])
 		out_idx: i32 = 0
-		for d in 0..<len(a.shape) do out_idx += (idx_buf[d] == axis ? 0 : idx_buf[d]) * stride_of(out.shape[:], d)
+		for d in 0..<len(a.shape) {
+			v := idx_buf[d]
+			if d == int(axis) do v = 0
+			out_idx += v * stride_of(out.shape[:], d)
+		}
 		out.data[out_idx] += a.data[flat]
 	}
 	out.ctx = new(Context)
@@ -298,11 +319,7 @@ transpose :: proc(a: ^Tensor, axis0, axis1: i32) -> ^Tensor {
 	out := new_tensor(out_shape_buf[:len(a.shape)])
 	idx_buf: [MAX_DIMS]i32
 	for flat in 0..<len(a.data) {
-		r := i32(flat)
-		for d := len(a.shape) - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(a.shape[:], d))
-			r = r % stride_of(a.shape[:], d)
-		}
+		unravel_index(i32(flat), a.shape[:], idx_buf[:])
 		idx_buf[axis0], idx_buf[axis1] = idx_buf[axis1], idx_buf[axis0]
 		o_flat: i32 = 0
 		for d in 0..<len(out.shape) do o_flat += idx_buf[d] * stride_of(out.shape[:], d)
@@ -330,13 +347,7 @@ matmul :: proc(a, b: ^Tensor) -> ^Tensor {
 	assert(a.shape[1] == b.shape[0], "matmul: inner dims must match")
 	M, K, N := a.shape[0], a.shape[1], b.shape[1]
 	out := new_tensor({M, N})
-	for i in 0..<M {
-		for j in 0..<N {
-			s: f32 = 0
-			for k in 0..<K do s += a.data[i*K + k] * b.data[k*N + j]
-			out.data[i*N + j] = s
-		}
-	}
+	matmul_f32(out.data, a.data, b.data, M, K, N)
 	make_ctx(out, .MatMul, {a, b})
 	return out
 }

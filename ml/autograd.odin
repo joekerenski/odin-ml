@@ -34,11 +34,7 @@ sum_to_shape :: proc(grad: []f32, grad_shape, target_shape: []i32) -> []f32 {
 	tg := len(target_shape)
 	idx_buf: [MAX_DIMS]i32
 	for flat in 0..<len(grad) {
-		r := i32(flat)
-		for d := gg - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(grad_shape, d))
-			r = r % stride_of(grad_shape, d)
-		}
+		unravel_index(i32(flat), grad_shape, idx_buf[:])
 		t_flat: i32 = 0
 		for d := 0; d < tg; d += 1 {
 			gd := gg - tg + d
@@ -67,13 +63,7 @@ accum_grad :: proc(parent: ^Tensor, contribution: []f32, contrib_shape: []i32) {
 matmul_raw :: proc(a: []f32, M, K: i32, b: []f32, K2, N: i32) -> []f32 {
 	assert(K == K2, "matmul_raw: inner dim mismatch")
 	out := make([]f32, M * N)
-	for i in 0..<M {
-		for j in 0..<N {
-			s: f32 = 0
-			for k in 0..<K do s += a[i*K + k] * b[k*N + j]
-			out[i*N + j] = s
-		}
-	}
+	matmul_f32(out, a, b, M, K, N)
 	return out
 }
 
@@ -81,11 +71,7 @@ transpose_raw :: proc(data: []f32, shape: []i32, axis0, axis1: int, out_shape: [
 	out := make([]f32, numel(shape))
 	idx_buf: [MAX_DIMS]i32
 	for flat in 0..<len(data) {
-		r := i32(flat)
-		for d := len(shape) - 1; d >= 0; d -= 1 {
-			idx_buf[d] = i32(r / stride_of(shape, d))
-			r = r % stride_of(shape, d)
-		}
+		unravel_index(i32(flat), shape, idx_buf[:])
 		idx_buf[axis0], idx_buf[axis1] = idx_buf[axis1], idx_buf[axis0]
 		o_flat: i32 = 0
 		for d in 0..<len(out_shape) do o_flat += idx_buf[d] * stride_of(out_shape, d)
@@ -188,11 +174,7 @@ backward_op :: proc(out: ^Tensor) {
 			ga := make([]f32, len(a.data))
 			idx_buf: [MAX_DIMS]i32
 			for flat in 0..<len(a.data) {
-				r := i32(flat)
-				for d := len(a.shape) - 1; d >= 0; d -= 1 {
-					idx_buf[d] = i32(r / stride_of(a.shape[:], d))
-					r = r % stride_of(a.shape[:], d)
-				}
+				unravel_index(i32(flat), a.shape[:], idx_buf[:])
 				g_idx: i32 = 0
 				for d in 0..<len(out.shape) {
 					v := idx_buf[d]

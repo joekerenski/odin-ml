@@ -4,3 +4,173 @@ ODIN ML
 cpu first, then we hook into some accelerators
 (cuda or others)
 
+------------------------------------------------------------------------------
+STATUS
+------------------------------------------------------------------------------
+- Tensor + ops + reverse-mode autograd + SGD  (working)
+- Linear regression demo recovers w,b         (odin run .)
+- Tensor op suite (35 tests)                   (odin run tensor_ops)
+- Contiguous f32 SIMD kernels (portable #simd, NEON on Apple Silicon)
+- Accelerate BLAS backend for matmul (macOS, same as NumPy)
+- Metal GPU backend — elementwise add on GPU   (odin run metal_test)
+- Device field on Tensor: .CPU / .Metal
+- Cross-platform: _darwin file suffix gates Metal code
+
+------------------------------------------------------------------------------
+HOW TO RUN
+------------------------------------------------------------------------------
+  odin run .              # linear regression
+  odin run tensor_ops     # tensor forward/shape/broadcast suite
+  odin run metal_test     # GPU compute shader smoke test
+  odin run metal_probe    # Metal device info
+
+  # microbenchmarks vs NumPy (Apple M-series uses Accelerate under NumPy):
+  cd bench
+  uv sync
+  uv run numpy_bench.py
+  odin run odin_matmul -o:speed -no-bounds-check -disable-assert
+  uv run compare.py       # side-by-side % of NumPy, target ≥70%
+
+  Measure on Apple M5 (this machine), median, production path:
+    matmul 1024³  Accelerate ≈ 100% of NumPy
+    matmul 2048³  Accelerate ≈ 100% of NumPy
+    elem add/mul n=4M/16M pure SIMD ≈ 95–110% of NumPy
+    pure tiled SIMD matmul ≈ 2–6% of NumPy (learning only; needs packing+MT)
+    Metal GPU add: WORKS (first kernel, no benchmark yet)
+
+------------------------------------------------------------------------------
+DEVICE / BACKEND ARCHITECTURE
+------------------------------------------------------------------------------
+Tensor has a `device: Device` field (.CPU or .Metal).
+
+  Device :: enum { CPU, Metal }  // extensible: CUDA, Vulkan
+
+Ops check `t.device` and dispatch:
+  .CPU    → pure SIMD kernels / Accelerate BLAS (matmul)
+  .Metal  → Metal compute shaders (MSL strings compiled at runtime)
+
+On Linux, _darwin file suffix excludes Metal code automatically.
+The Device enum + CPU path compile everywhere.
+
+This mirrors tinygrad: the graph is device-agnostic (records what ops happened),
+the backend decides how to compute them. Adding CUDA later = same pattern:
+  Device :: enum { CPU, Metal, CUDA }
+  + backend_cuda.odin (or _linux suffix)
+
+Metal pipeline (backend_metal_darwin.odin):
+  1. metal_init() — creates MTL.Device + CommandQueue
+  2. metal_get_kernel(msl_source, fn_name) — compiles MSL string → pipeline
+  3. metal_new_buffer([]f32) — creates MTL.Buffer (unified memory, zero-copy)
+  4. metal_run_kernel(pipeline, buffers, n) — encode + dispatch + commit + wait
+  5. metal_buffer_to_f32(buf) — read back via contentsAsSlice (zero-copy)
+
+Shaders are cached by function name after first compile.
+
+Where beam search plugs in (tinygrad style):
+  - For each op, generate multiple MSL kernel variants (tile sizes, threadgroup
+    configs, vector widths). Run all, pick fastest, cache it.
+  - The metal_get_kernel → metal_ctx.shaders map already supports this:
+    just store a list of variants per op and benchmark at first use.
+
+------------------------------------------------------------------------------
+TENSOR "NICENESS" TODO
+------------------------------------------------------------------------------
+Done-ish:
+  - from_data (view) vs from_data_copy (owned)
+  - clone, is_contiguous, allclose
+  - MAX_DIMS guard
+  - SIMD path for contiguous same-shape add/mul/sub/div/neg/relu
+  - Device field, Metal backend for add
+
+Next:
+  - More Metal ops: mul, sub, neg, relu, matmul (MSL kernels)
+  - to(device) / transfer method
+  - item / set_item helpers, pretty print for multi-dim
+  - view/slice with custom strides (non-contig layout)
+  - expand / broadcast_to as first-class ops that share storage
+  - detach / no_grad scope
+  - better error messages (return errors instead of assert)
+
+------------------------------------------------------------------------------
+DATA TYPES — design sketch
+------------------------------------------------------------------------------
+Keep f32 only until the graph is trustworthy. Then:
+
+Option A — runtime dtype (tinygrad style, recommended):
+  Dtype :: enum { F32, F64, F16 /* later */, Bool }
+  Tensor :: struct {
+      data:   []byte,          // raw storage
+      dtype:  Dtype,
+      shape, strides: [dynamic]i32,
+      ...
+  }
+  - kernels dispatch: switch t.dtype { case .F32: ... }
+  - elem_size(dtype) for indexing
+  - grad always matches parent's dtype (or force f32 grads for f16)
+
+Option B — parametric Tensor($T):
+  Tensor :: struct($T: typeid) { data: []T, ... }
+  - nice compile-time monomorphization
+  - autograd graph with mixed types / generic Context is awkward
+  - delay this until pure math kernels are settled
+
+Practical plan:
+  1. stay on f32 (and []f32 kernels labeled kernel_f32.odin)
+  2. when needed: introduce Dtype + []byte storage, keep f32 path employed
+  3. only add f64 for debugging / reference; f16 after kernels stabilize
+
+Never branch dtype inside the innermost SIMD loop — monomorphize kernels
+per dtype (add_f32, add_f64) instead of switch-per-element.
+
+------------------------------------------------------------------------------
+SIMD / NEON ON MACOS — plan of attack
+------------------------------------------------------------------------------
+Good news: we are on arm64 and Odin has portable
+  #simd[N]T  +  core:simd  +  base:intrinsics.unaligned_load/store
+
+On Apple Silicon, `#simd[4]f32` is 128-bit NEON (ldp/stp, fadd, etc.) without
+writing assembly. simd.HAS_HARDWARE_SIMD == true on this machine.
+
+Phase 0 (done): elementwise contiguous kernels
+  ml/kernel_f32.odin — add/mul/sub/div/neg/relu via f32x4
+  ops fall back to broadcast path when shapes differ
+
+Phase 1: more contiguous kernels, still scalar-correct
+  - sum reduce with simd_reduce_add
+  - sigmoid: personal vec math is hard — keep scalar or approx for now
+  - copy / fill / scale (axpy): y = a*x + y
+
+Phase 2: matmul microkernel
+  - 4x4 tile of f32x4 FMAs (intrinsics.fused_mul_add)
+  - pack A/B for reuse, outer loop tiling
+  - this is where most "slow attempt" learning lives
+
+Phase 3: broadcast without falling back to full general path
+  - standard pattern: outer dims scalar, innermost dim vectorized
+  - if last dim of both operands is contiguous and >= 4, simd stride-1
+
+Phase 4 (only if needed): platform intrinsics
+  - core:simd/x86 for AVX2/AVX-512 on Intel/AMD
+  - raw NEON only if portable simd misses something (rare for dense f32)
+
+Rules to stay sane:
+  - ALWAYS have a scalar reference; test simd vs scalar (see tensor_ops)
+  - Only special-case contiguous same-shape first
+  - Alignment: unaligned_load is fine for a first pass; later try aligned
+    buffers if profiling shows load cost
+  - Don't SIMD the autograd graph — SIMD the kernels only
+  - Arena allocation can hurt alignment; if needed, force 16-byte aligned
+    alloc for data buffers later
+
+------------------------------------------------------------------------------
+SUGGESTED LEARNING ORDER FROM HERE
+------------------------------------------------------------------------------
+1. Grow tensor_ops tests (already a good shell)
+2. Numerical gradcheck file (op-level correctness)
+3. Multi-feature linear: y = Xw + b with matmul
+4. matmul COME SLOW NEON microkernel + benchmark vs naive
+5. dtype field behind f32 default
+6. MLP toy once the above is firm
+7. More Metal kernels + GPU matmul shader
+8. Beam search for kernel variant selection (tinygrad style)
+9. CUDA backend (same Device pattern, _linux suffix)

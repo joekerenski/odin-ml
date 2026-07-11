@@ -20,9 +20,11 @@ package main
 import "core:fmt"
 import "core:math/rand"
 import "core:mem"
+import "core:os"
 import "ml"
 
 main :: proc() {
+
 	fmt.println("=== Linear regression: y = w*x + b ===")
 
 	true_w: f32 = 2.5
