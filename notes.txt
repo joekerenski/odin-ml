@@ -1,0 +1,6 @@
+ODIN ML
+
+-> why not make a ml library in odin?
+cpu first, then we hook into some accelerators
+(cuda or others)
+
