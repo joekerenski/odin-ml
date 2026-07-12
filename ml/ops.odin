@@ -76,6 +76,47 @@ broadcast_add_into :: proc(out: []f32, out_shape: []i32, a: []f32, a_shape: []i3
 	}
 }
 
+// Is `shape` effectively a scalar? True for empty shape or all dims == 1.
+is_scalar_shape :: proc(shape: []i32) -> bool {
+	for s in shape do if s != 1 do return false
+	return true
+}
+
+// True iff `shape_b` matches the inner part of `shape_a` (right-aligned, exact sizes).
+// Returns the inner element count (i32).
+inner_match_size :: proc(shape_a, shape_b: []i32) -> (matches: bool, inner_elems: i32) {
+	nb := len(shape_b)
+	if nb == 0 || nb > len(shape_a) do return false, 0
+	inner_elems = 1
+	for i in 0..<nb {
+		od := len(shape_a) - nb + i
+		if shape_b[i] != shape_a[od] do return false, 0
+		inner_elems *= shape_b[i]
+	}
+	return true, inner_elems
+}
+
+// True iff `shape_b` matches `shape_a` but with innermost dim = 1.
+// I.e. b = [outer..., 1] and a = [outer..., N] for some N > 1.
+// Returns the outer size and the inner N size for the SIMD loop.
+// This is the "column vector broadcast" pattern: b's inner dim is 1 and gets
+// stretched to a's inner dim.
+col_broadcast_match :: proc(shape_a, shape_b: []i32) -> (matches: bool, outer: i32, inner_n: i32) {
+	na := len(shape_a)
+	nb := len(shape_b)
+	if na == 0 || nb != na do return false, 0, 0
+	if shape_b[nb - 1] != 1 do return false, 0, 0
+	if shape_a[na - 1] <= 1 do return false, 0, 0  // inner_n must be > 1 for SIMD to help
+	// outer dims must match exactly
+	for i in 0..<na - 1 {
+		if shape_a[i] != shape_b[i] do return false, 0, 0
+	}
+	outer = 1
+	for i in 0..<na - 1 do outer *= shape_a[i]
+	inner_n = shape_a[na - 1]
+	return true, outer, inner_n
+}
+
 // out = a * b elementwise-broadcast into out_shape.
 mul_broadcast_into :: proc(out: []f32, out_shape: []i32, a: []f32, a_shape: []i32, b: []f32, b_shape: []i32) {
 	odim := len(out_shape)
@@ -161,6 +202,59 @@ add :: proc(a, b: ^Tensor) -> ^Tensor {
 		make_ctx(out, .Add, {a, b})
 		return out
 	}
+
+	// SIMD broadcast fast paths (CPU only)
+	if a.device == .CPU {
+		// Scalar broadcast: b is shape all-1
+		if is_scalar_shape(b.shape[:]) && is_contiguous(a) {
+			out_shape_buf: [MAX_DIMS]i32
+			ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+			out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+			add_scalar_contiguous(out.data, a.data, b.data[0])
+			make_ctx(out, .Add, {a, b})
+			return out
+		}
+		if is_scalar_shape(a.shape[:]) && is_contiguous(b) {
+			out_shape_buf: [MAX_DIMS]i32
+			ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+			out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+			add_scalar_contiguous(out.data, b.data, a.data[0])
+			make_ctx(out, .Add, {a, b})
+			return out
+		}
+		// Row broadcast: b's shape matches inner dims of out
+		if is_contiguous(a) {
+			if matches, inner_n := inner_match_size(a.shape[:], b.shape[:]); matches && numel(b.shape[:]) == inner_n && inner_n > 1 {
+				outer := numel(a.shape[:]) / i32(inner_n)
+				out_shape_buf: [MAX_DIMS]i32
+				ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+				out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+				add_row_broadcast(out.data, a.data, b.data, outer, inner_n)
+				make_ctx(out, .Add, {a, b})
+				return out
+			}
+		}
+		// Col broadcast: b is [outer..., M, 1], a is [outer..., M, N]
+		if is_contiguous(a) && is_contiguous(b) {
+			if matches, outer, inner_n := col_broadcast_match(a.shape[:], b.shape[:]); matches && inner_n > 1 {
+				out_shape_buf: [MAX_DIMS]i32
+				ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+				out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+				add_col_broadcast(out.data, a.data, b.data, outer, inner_n)
+				make_ctx(out, .Add, {a, b})
+				return out
+			}
+			if matches, outer, inner_n := col_broadcast_match(b.shape[:], a.shape[:]); matches && inner_n > 1 {
+				out_shape_buf: [MAX_DIMS]i32
+				ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+				out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+				add_col_broadcast(out.data, b.data, a.data, outer, inner_n)
+				make_ctx(out, .Add, {a, b})
+				return out
+			}
+		}
+	}
+
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
 	out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
@@ -178,6 +272,17 @@ sub :: proc(a, b: ^Tensor) -> ^Tensor {
 		make_ctx(out, .Sub, {a, b})
 		return out
 	}
+
+	// Scalar broadcast fast paths
+	if is_scalar_shape(b.shape[:]) && is_contiguous(a) {
+		out_shape_buf: [MAX_DIMS]i32
+		ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+		out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+		add_scalar_contiguous(out.data, a.data, -b.data[0])
+		make_ctx(out, .Sub, {a, b})
+		return out
+	}
+
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
 	out := new_tensor(out_shape_buf[:ndim])
@@ -197,6 +302,55 @@ mul :: proc(a, b: ^Tensor) -> ^Tensor {
 		make_ctx(out, .Mul, {a, b})
 		return out
 	}
+
+	// SIMD broadcast fast paths
+	if is_scalar_shape(b.shape[:]) && is_contiguous(a) {
+		out_shape_buf: [MAX_DIMS]i32
+		ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+		out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+		mul_scalar_contiguous(out.data, a.data, b.data[0])
+		make_ctx(out, .Mul, {a, b})
+		return out
+	}
+	if is_scalar_shape(a.shape[:]) && is_contiguous(b) {
+		out_shape_buf: [MAX_DIMS]i32
+		ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+		out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+		mul_scalar_contiguous(out.data, b.data, a.data[0])
+		make_ctx(out, .Mul, {a, b})
+		return out
+	}
+	if is_contiguous(a) {
+		if matches, inner_n := inner_match_size(a.shape[:], b.shape[:]); matches && numel(b.shape[:]) == inner_n && inner_n > 1 {
+			outer := numel(a.shape[:]) / i32(inner_n)
+			out_shape_buf: [MAX_DIMS]i32
+			ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+			out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+			mul_row_broadcast(out.data, a.data, b.data, outer, inner_n)
+			make_ctx(out, .Mul, {a, b})
+			return out
+		}
+	}
+	// Col broadcast
+	if is_contiguous(a) && is_contiguous(b) {
+		if matches, outer, inner_n := col_broadcast_match(a.shape[:], b.shape[:]); matches && inner_n > 1 {
+			out_shape_buf: [MAX_DIMS]i32
+			ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+			out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+			mul_col_broadcast(out.data, a.data, b.data, outer, inner_n)
+			make_ctx(out, .Mul, {a, b})
+			return out
+		}
+		if matches, outer, inner_n := col_broadcast_match(b.shape[:], a.shape[:]); matches && inner_n > 1 {
+			out_shape_buf: [MAX_DIMS]i32
+			ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
+			out := new_tensor(out_shape_buf[:ndim], a.requires_grad || b.requires_grad, a.device)
+			mul_col_broadcast(out.data, b.data, a.data, outer, inner_n)
+			make_ctx(out, .Mul, {a, b})
+			return out
+		}
+	}
+
 	out_shape_buf: [MAX_DIMS]i32
 	ndim := broadcast_result(out_shape_buf[:], a.shape[:], b.shape[:])
 	out := new_tensor(out_shape_buf[:ndim])
@@ -229,6 +383,7 @@ neg :: proc(a: ^Tensor) -> ^Tensor {
 }
 
 // ---- elementwise unary activations ----------------------------------------
+// does it make sense to rely on SIMD for all broadcasting?
 
 relu :: proc(a: ^Tensor) -> ^Tensor {
 	out := new_tensor(a.shape[:])

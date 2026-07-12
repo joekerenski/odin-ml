@@ -10,6 +10,8 @@ package main
 
 import "core:fmt"
 import "core:simd"
+import "core:time"
+import "core:math"
 import ml "../ml"
 
 failed: int
@@ -49,6 +51,8 @@ main :: proc() {
 	test_reshape_transpose()
 	test_matmul()
 	test_simd_kernels_match_scalar()
+	test_broadcast_simd_correctness()
+	test_broadcast_simd_vs_scalar_perf()
 	test_chained()
 
 	fmt.println()
@@ -241,4 +245,223 @@ test_chained :: proc() {
 	// Xw: [1, -1, -3]^T then +0.5 → [1.5, -0.5, -2.5] relu → [1.5, 0, 0]
 	y := ml.relu(ml.add(ml.matmul(X, w), b))
 	expect_close(y, ml.from_data_copy({1.5, 0, 0}, {3, 1}), "relu(Xw+b)")
+}
+
+// ---- SIMD broadcast correctness ----
+
+test_broadcast_simd_correctness :: proc() {
+	fmt.println("-- broadcast SIMD correctness --")
+
+	// Scalar broadcast: [N] + [1]
+	{
+		n := 1024
+		a_data := make([]f32, n)
+		for i in 0..<n do a_data[i] = f32(i) * 0.1
+		a := ml.from_data_copy(a_data, {i32(n)})
+		b := ml.from_data_copy({3.14}, {1})
+		out := ml.add(a, b)
+		want := make([]f32, n)
+		for i in 0..<n do want[i] = a_data[i] + 3.14
+		w := ml.from_data_copy(want, {i32(n)})
+		expect(ml.allclose(out, w), "scalar broadcast add [N]+[1]")
+	}
+
+	// Row broadcast: [M,N] + [N]
+	{
+		M, N := 32, 128
+		a_data := make([]f32, M * N)
+		for i in 0..<M*N do a_data[i] = f32(i)
+		a := ml.from_data_copy(a_data, {i32(M), i32(N)})
+		b_data := make([]f32, N)
+		for i in 0..<N do b_data[i] = f32(i) * 0.01
+		b := ml.from_data_copy(b_data, {i32(N)})
+		out := ml.add(a, b)
+		// verify
+		ok := true
+		for i in 0..<M {
+			for j in 0..<N {
+				idx := i * N + j
+				expected := a_data[idx] + b_data[j]
+				if math.abs(out.data[idx] - expected) > 1e-5 do ok = false
+			}
+		}
+		expect(ok, "row broadcast add [32,128]+[128]")
+	}
+
+	// Row broadcast mul
+	{
+		M, N := 16, 64
+		a_data := make([]f32, M * N)
+		for i in 0..<M*N do a_data[i] = f32(i) + 1
+		a := ml.from_data_copy(a_data, {i32(M), i32(N)})
+		b_data := make([]f32, N)
+		for i in 0..<N do b_data[i] = f32(i) + 1
+		b := ml.from_data_copy(b_data, {i32(N)})
+		out := ml.mul(a, b)
+		ok := true
+		for i in 0..<M {
+			for j in 0..<N {
+				idx := i * N + j
+				expected := a_data[idx] * b_data[j]
+				if math.abs(out.data[idx] - expected) > 1e-4 do ok = false
+			}
+		}
+		expect(ok, "row broadcast mul [16,64]*[64]")
+	}
+
+	// Scalar broadcast sub: [N] - [1]
+	{
+		n := 512
+		a_data := make([]f32, n)
+		for i in 0..<n do a_data[i] = f32(i) * 2
+		a := ml.from_data_copy(a_data, {i32(n)})
+		b := ml.from_data_copy({1.5}, {1})
+		out := ml.sub(a, b)
+		ok := true
+		for i in 0..<n {
+			expected := a_data[i] - 1.5
+			if math.abs(out.data[i] - expected) > 1e-5 do ok = false
+		}
+		expect(ok, "scalar broadcast sub [N]-[1]")
+	}
+
+	// Col broadcast: [M,N] + [M,1]
+	{
+		M, N := 32, 64
+		a_data := make([]f32, M * N)
+		col := make([]f32, M)
+		for i in 0..<M*N do a_data[i] = f32(i)
+		for i in 0..<M do col[i] = f32(i) * 0.5
+		a := ml.from_data_copy(a_data, {i32(M), i32(N)})
+		b := ml.from_data_copy(col, {i32(M), 1})
+		out := ml.add(a, b)
+		ok := true
+		for i in 0..<M {
+			for j in 0..<N {
+				idx := i * N + j
+				expected := a_data[idx] + col[i]
+				if math.abs(out.data[idx] - expected) > 1e-5 do ok = false
+			}
+		}
+		expect(ok, "col broadcast add [32,64]+[32,1]")
+	}
+
+	// Col broadcast mul
+	{
+		M, N := 16, 32
+		a_data := make([]f32, M * N)
+		col := make([]f32, M)
+		for i in 0..<M*N do a_data[i] = f32(i) + 1
+		for i in 0..<M do col[i] = f32(i) + 1
+		a := ml.from_data_copy(a_data, {i32(M), i32(N)})
+		b := ml.from_data_copy(col, {i32(M), 1})
+		out := ml.mul(a, b)
+		ok := true
+		for i in 0..<M {
+			for j in 0..<N {
+				idx := i * N + j
+				expected := a_data[idx] * col[i]
+				if math.abs(out.data[idx] - expected) > 1e-4 do ok = false
+			}
+		}
+		expect(ok, "col broadcast mul [16,32]*[16,1]")
+	}
+}
+
+// ---- SIMD broadcast perf comparison ----
+//
+// Compare the new SIMD broadcast fast paths against the old scalar-broadcast
+// path. Numbers give us a concrete answer to "did SIMD help?".
+
+bench_ms :: proc(label: string, n_iters: int, body: proc(a: ^ml.Tensor, b: ^ml.Tensor), a: ^ml.Tensor, b: ^ml.Tensor) {
+	// warmup
+	for _ in 0..<3 do body(a, b)
+	times := make([]f64, n_iters)
+	defer delete(times)
+	for i in 0..<n_iters {
+		t0 := time.tick_now()
+		body(a, b)
+		dt := time.duration_seconds(time.tick_since(t0))
+		times[i] = dt * 1e3  // ms
+	}
+	// sort
+	for i in 1..<n_iters {
+		v := times[i]
+		j := i
+		for j > 0 && times[j - 1] > v {
+			times[j] = times[j - 1]
+			j -= 1
+		}
+		times[j] = v
+	}
+	med := times[n_iters / 2]
+	fmt.printfln("  %-40s  best=%.3f ms  med=%.3f ms", label, times[0], med)
+}
+
+test_broadcast_simd_vs_scalar_perf :: proc() {
+	fmt.println("-- broadcast SIMD vs scalar perf --")
+	N := 1 << 20  // 1M elements
+
+	// Setup data once
+	a_data := make([]f32, N)
+	b_data := make([]f32, N)
+	scalar_data := []f32{0.5}
+	for i in 0..<N {
+		a_data[i] = f32(i) * 0.001
+		b_data[i] = f32(i) * 0.0005 + 1
+	}
+	defer delete(a_data)
+	defer delete(b_data)
+
+	// [N] + [1]: SIMD scalar broadcast
+	{
+		a := ml.from_data_copy(a_data, {i32(N)})
+		b := ml.from_data_copy(scalar_data, {1})
+		bench_ms("scalar add [N]+[1]  (SIMD path)", 30, proc(a, b: ^ml.Tensor) {
+			_ = ml.add(a, b)
+		}, a, b)
+	}
+
+	// [N] + [N]: same-shape SIMD add
+	{
+		a := ml.from_data_copy(a_data, {i32(N)})
+		b := ml.from_data_copy(b_data, {i32(N)})
+		bench_ms("same-shape add [N]+[N] (SIMD)", 30, proc(a, b: ^ml.Tensor) {
+			_ = ml.add(a, b)
+		}, a, b)
+	}
+
+	// [M,N] + [N]: row broadcast SIMD
+	{
+		M, N2 := 1024, 1024
+		row := make([]f32, M * N2)
+		col_vec := make([]f32, N2)
+		for i in 0..<M*N2 do row[i] = f32(i) * 0.001
+		for j in 0..<N2 do col_vec[j] = f32(j) * 0.01
+		defer delete(row)
+		defer delete(col_vec)
+
+		a := ml.from_data_copy(row, {i32(M), i32(N2)})
+		b := ml.from_data_copy(col_vec, {i32(N2)})
+		bench_ms("row broadcast add [1024,1024]+[1024]", 20, proc(a, b: ^ml.Tensor) {
+			_ = ml.add(a, b)
+		}, a, b)
+	}
+
+// [M,N] + [M,1]: column broadcast — SIMD path
+	{
+		M, N2 := 1024, 1024
+		big := make([]f32, M * N2)
+		col := make([]f32, M)
+		for i in 0..<M*N2 do big[i] = f32(i) * 0.001
+		for i in 0..<M do col[i] = f32(i) * 0.01
+		defer delete(big)
+		defer delete(col)
+
+		a := ml.from_data_copy(big, {i32(M), i32(N2)})
+		b := ml.from_data_copy(col, {i32(M), 1})
+		bench_ms("col broadcast add [1024,1024]+[1024,1] (SIMD)", 20, proc(a, b: ^ml.Tensor) {
+			_ = ml.add(a, b)
+		}, a, b)
+	}
 }
