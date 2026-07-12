@@ -45,6 +45,7 @@ Op :: enum {
 	MatMul,
 	Sum, Reshape, Transpose,
 	ReLU, Sigmoid,
+	CrossEntropy,
 }
 
 Context :: struct {
@@ -52,6 +53,7 @@ Context :: struct {
 	parents: [dynamic]^Tensor,
 	axis:    i32,          // Sum: which axis (-1 = all); Transpose: axis0
 	axis1:   i32,          // Transpose: axis1
+	cache:   ^Tensor,      // optional cached intermediate (CrossEntropy: softmax [B,C])
 }
 
 // ---- shape helpers --------------------------------------------------------

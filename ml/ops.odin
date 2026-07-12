@@ -506,3 +506,61 @@ matmul :: proc(a, b: ^Tensor) -> ^Tensor {
 	make_ctx(out, .MatMul, {a, b})
 	return out
 }
+
+// ---- loss ----------------------------------------------------------------
+
+// Sparse cross-entropy: logits [B, C] + integer labels [B] -> scalar loss [1].
+//
+// Forward:  softmax(logits) per row, then mean(-log(softmax[i, label[i]]))
+// Backward: (softmax - one_hot) / B  (fused in autograd)
+//
+// The softmax is cached in ctx.cache; the one-hot encoding of labels is stored
+// as a second parent (requires_grad = false). Both are arena-allocated when the
+// caller sets context.allocator to a Dynamic_Arena.
+cross_entropy :: proc(logits: ^Tensor, labels: []u8) -> ^Tensor {
+	B := logits.shape[0]
+	C := logits.shape[1]
+	assert(int(len(labels)) >= int(B), "cross_entropy: not enough labels for batch")
+
+	// softmax (numerically stable) — cached for backward
+	softmax := new_tensor({B, C})
+	for b in 0..<B {
+		row := b * C
+		max_val := logits.data[row]
+		for c in 1..<C {
+			if logits.data[row + c] > max_val do max_val = logits.data[row + c]
+		}
+		sum_exp: f32 = 0
+		for c in 0..<C {
+			e := math.exp(logits.data[row + c] - max_val)
+			softmax.data[row + c] = e
+			sum_exp += e
+		}
+		inv := 1.0 / sum_exp
+		for c in 0..<C do softmax.data[row + c] *= inv
+	}
+
+	// loss = mean( -ln( softmax[i, label[i]] ) )
+	loss := new_tensor({1})
+	total: f32 = 0
+	for b in 0..<B {
+		label := i32(labels[b])
+		assert(label < C, "cross_entropy: label out of range")
+		p := softmax.data[b*C + label]
+		total += -math.ln(p + 1e-12)
+	}
+	loss.data[0] = total / f32(B)
+
+	// one-hot as second parent (no grad needed)
+	one_hot := zeros({B, C})
+	for b in 0..<B do one_hot.data[b*C + i32(labels[b])] = 1.0
+
+	loss.ctx = new(Context)
+	loss.ctx.op = .CrossEntropy
+	loss.ctx.parents = make([dynamic]^Tensor, 0)
+	append(&loss.ctx.parents, logits)
+	append(&loss.ctx.parents, one_hot)
+	loss.ctx.cache = softmax
+	if logits.requires_grad do loss.requires_grad = true
+	return loss
+}

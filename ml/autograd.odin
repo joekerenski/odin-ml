@@ -207,5 +207,18 @@ backward_op :: proc(out: ^Tensor) {
 		ga := make([]f32, len(g))
 		for i in 0..<len(g) do ga[i] = g[i] * out.data[i] * (1.0 - out.data[i])
 		accum_grad(p[0], ga, out.shape[:])
+
+	case .CrossEntropy:
+		// Forward cached softmax (ctx.cache) and stored one-hot labels as p[1].
+		// dL/d(logits) = (softmax - one_hot) / B  *  upstream_grad
+		// upstream_grad for a scalar loss = 1.0 (seeded by backward()).
+		a := p[0]        // logits [B, C]
+		one_hot := p[1]  // one-hot labels [B, C] (requires_grad = false)
+		softmax := ctx.cache
+		B := a.shape[0]
+		ga := make([]f32, len(a.data))
+		scale := g[0] / f32(B)
+		for i in 0..<len(ga) do ga[i] = (softmax.data[i] - one_hot.data[i]) * scale
+		accum_grad(a, ga, a.shape[:])
 	}
 }
