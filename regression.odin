@@ -26,6 +26,7 @@ import "ml"
 main :: proc() {
 
 	fmt.println("=== Linear regression: y = w*x + b ===")
+	ml.debug_from_env()
 
 	true_w: f32 = 2.5
 	true_b: f32 = 1.0
@@ -59,25 +60,37 @@ main :: proc() {
 	defer mem.dynamic_arena_destroy(&arena)
 
 	epochs: int = 300
+	traced := false
 	for epoch in 0..<epochs {
 		// --- switch to arena allocator for this step's graph ---
 		old_alloc := context.allocator
 		context.allocator = mem.dynamic_arena_allocator(&arena)
 
-		// ---- forward ----
-		wx := ml.mul(X, w)        // [N] * [1] -> [N]  (broadcast)
-		pred := ml.add(wx, b)     // [N] + [1] -> [N]
-		resid := ml.sub(pred, Y)  // [N]
+		// ---- build lazy graph (no compute yet) ----
+		wx := ml.mul(X, w)         // [N] * [1] -> [N]
+		pred := ml.add(wx, b)      // [N] + [1] -> [N]
+		resid := ml.sub(pred, Y)   // [N]
 		sq := ml.mul(resid, resid) // [N]
-		loss := ml.mean(sq)       // [1]
+		loss := ml.mean(sq)        // [1]
 
-		// snapshot loss before freeing
-		loss_val := loss.data[0]
+		if ml.debug_level > 0 && !traced {
+			traced = true
+			fmt.println("-- first step trace --")
+			ml.counters_reset()
+			ml.print_graph(loss, "loss")
+		}
 
-		// ---- backward + step ----
+		// ---- realize sink + backward + step ----
 		ml.clear_grads(w, b)
-		ml.backward(loss)
+		ml.backward(loss) // realize(loss) then reverse-mode grads
+		loss_val := ml.item(loss) // already realized
 		ml.sgd_step(opt)
+
+		if ml.debug_level > 0 && epoch == 0 && traced {
+			ml.counters_print("first_step")
+			fmt.println("-- end trace --")
+			ml.debug_level = 0 // quiet for remaining epochs
+		}
 
 		// --- restore allocator and reclaim the whole graph ---
 		context.allocator = old_alloc

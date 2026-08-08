@@ -30,13 +30,14 @@ forward :: proc(x: ^ml.Tensor) -> ^ml.Tensor {
 
 main :: proc() {
 	fmt.println("=== MNIST MLP: 784 -> 128 -> 10 ===")
+	ml.debug_from_env() // ML_DEBUG=0|1|2|3
 
 	// ---- load data (persistent allocator) ----
-	X_train := ml.load_idx_images("data/train-images.idx3-ubyte", flatten = true)
-	Y_train := ml.load_idx_labels("data/train-labels.idx1-ubyte")
-	X_test := ml.load_idx_images("data/t10k-images.idx3-ubyte", flatten = true)
-	Y_test := ml.load_idx_labels("data/t10k-labels.idx1-ubyte")
-	fmt.printfln("train: %v  test: %v", X_train.shape, X_test.shape)
+	X_train := ml.load_idx_images("data/mnist/train-images.idx3-ubyte", flatten = true)
+	Y_train := ml.load_idx_labels("data/mnist/train-labels.idx1-ubyte")
+	X_test := ml.load_idx_images("data/mnist/t10k-images.idx3-ubyte", flatten = true)
+	Y_test := ml.load_idx_labels("data/mnist/t10k-labels.idx1-ubyte")
+	fmt.printfln("train: %v  test: %v  ML_DEBUG=%d", X_train.shape, X_test.shape, ml.debug_level)
 
 	// ---- model parameters (persistent) ----
 	l1 = ml.linear(784, 128, .He)
@@ -52,6 +53,7 @@ main :: proc() {
 	EPOCHS: int = 20
 	N := int(X_train.shape[0])
 	batches := N / BS
+	traced_first := false
 
 	for epoch in 0..<EPOCHS {
 		// Shuffle training indices each epoch (persistent allocator — outside arena).
@@ -66,11 +68,26 @@ main :: proc() {
 			Xb, Yb := ml.minibatch(X_train, Y_train, b, BS, perm)
 			logits := forward(Xb)
 			loss := ml.cross_entropy(logits, Yb)
-			last_loss = loss.data[0]
+
+			// First batch: dump lazy graph + timed kernels (if ML_DEBUG>=1).
+			trace := ml.debug_level > 0 && !traced_first
+			if trace {
+				traced_first = true
+				fmt.println("-- first step trace --")
+				ml.counters_reset()
+				ml.print_graph(loss, "loss")
+			}
 
 			ml.clear_grads(l1.W, l1.b, l2.W, l2.b)
-			ml.backward(loss)
+			ml.backward(loss) // realize + reverse-mode
+			last_loss = ml.item(loss)
 			ml.sgd_step(opt)
+
+			if trace {
+				ml.counters_print("first_step")
+				fmt.println("-- end trace --")
+				ml.debug_level = 0 // quiet for remaining steps
+			}
 
 			context.allocator = old_alloc
 			mem.dynamic_arena_free_all(&arena)

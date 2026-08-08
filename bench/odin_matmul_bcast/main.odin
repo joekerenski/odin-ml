@@ -37,12 +37,12 @@ g_which: PAT = .SameN
 
 body_proc :: proc() {
 	switch g_which {
-	case .SameN:    _ = ml.add(g_tensors.a, g_tensors.b_)
-	case .Scalar1:  _ = ml.add(g_tensors.a, g_tensors.c)
-	case .Row1024:  _ = ml.add(g_tensors.big, g_tensors.row)
-	case .Col1024:  _ = ml.add(g_tensors.big, g_tensors.col)
-	case .Scalar2D: _ = ml.add(g_tensors.big, g_tensors.scalar2d)
-	case .Row3D:    _ = ml.add(g_tensors.big3, g_tensors.row3)
+	case .SameN:    r := ml.add(g_tensors.a, g_tensors.b_); ml.realize(r)
+	case .Scalar1:  r := ml.add(g_tensors.a, g_tensors.c); ml.realize(r)
+	case .Row1024:  r := ml.add(g_tensors.big, g_tensors.row); ml.realize(r)
+	case .Col1024:  r := ml.add(g_tensors.big, g_tensors.col); ml.realize(r)
+	case .Scalar2D: r := ml.add(g_tensors.big, g_tensors.scalar2d); ml.realize(r)
+	case .Row3D:    r := ml.add(g_tensors.big3, g_tensors.row3); ml.realize(r)
 	}
 }
 

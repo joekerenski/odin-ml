@@ -28,8 +28,9 @@ main :: proc() {
 	fmt.printfln("a (Metal): %v", a.data)
 	fmt.printfln("b (Metal): %v", b.data)
 
-	// GPU add — dispatches a Metal compute shader
+	// GPU add — lazy graph; realize runs Metal kernel
 	c := ml.add(a, b)
+	ml.realize(c)
 
 	fmt.printfln("c = a + b (GPU): %v", c.data)
 	fmt.printfln("c.device = %v", c.device)
@@ -59,6 +60,7 @@ main :: proc() {
 	b2 := ml.from_data_copy(b2_data, {i32(n)}, false, .Metal)
 
 	c2 := ml.add(a2, b2)
+	ml.realize(c2)
 
 	// Verify
 	ok2 := true

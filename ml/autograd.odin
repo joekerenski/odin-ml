@@ -20,7 +20,9 @@ package ml
 // one free_all. No manual freeing needed.
 // ============================================================================
 
+import "core:fmt"
 import "core:math"
+import "core:time"
 
 // ---- reduce a gradient down to a smaller shape (broadcast reverse) --------
 
@@ -95,6 +97,7 @@ topo_sort :: proc(t: ^Tensor, topo, visited: ^[dynamic]^Tensor) {
 
 backward :: proc(t: ^Tensor) {
 	assert(t.requires_grad, "backward: tensor does not require grad")
+	realize(t) // forward must complete before grads
 	t.grad = ones(t.shape[:], false)
 
 	topo: [dynamic]^Tensor = make([dynamic]^Tensor, 0)
@@ -103,9 +106,35 @@ backward :: proc(t: ^Tensor) {
 	defer delete(visited)
 	topo_sort(t, &topo, &visited)
 
+	if debug_level >= 3 {
+		fmt.println("  [backward] reverse topo")
+	}
+
+	bwd_start: time.Tick
+	if debug_level >= 1 do bwd_start = time.tick_now()
+
+	bk := 0
 	for i := len(topo) - 1; i >= 0; i -= 1 {
 		node := topo[i]
-		if node.ctx != nil do backward_op(node)
+		if node.ctx == nil do continue
+		t0: time.Tick
+		if debug_level >= 2 do t0 = time.tick_now()
+		backward_op(node)
+		if debug_level >= 2 {
+			dt_ns := i64(time.tick_since(t0))
+			counters.time_ns += dt_ns
+			fmt.printfln(
+				"  bwd %3d %-14s shape=%v  %7.3f ms",
+				bk, op_name(node.ctx.op), node.shape, f64(dt_ns) / 1e6,
+			)
+		}
+		counters.bwd_ops += 1
+		bk += 1
+	}
+
+	if debug_level == 1 {
+		ms := f64(time.tick_since(bwd_start)) / 1e6
+		fmt.printfln("  backward: %d ops  %.3f ms", bk, ms)
 	}
 }
 

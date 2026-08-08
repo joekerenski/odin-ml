@@ -151,6 +151,7 @@ eval_accuracy :: proc(
 	for b in 0..<n / batch_size {
 		Xb, Yb := minibatch(X, Y, b, batch_size)
 		logits := forward(Xb)
+		realize(logits)
 
 		bs := int(logits.shape[0])
 		c := int(logits.shape[1])

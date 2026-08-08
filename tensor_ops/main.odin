@@ -141,6 +141,7 @@ test_unary :: proc() {
 	expect_close(r, ml.from_data_copy({0, 0, 0, 0.5, 3}, {5}), "relu")
 
 	s := ml.sigmoid(ml.from_data_copy({0}, {1}))
+	ml.realize(s)
 	// sigmoid(0) = 0.5
 	expect(s.data[0] > 0.499 && s.data[0] < 0.501, "sigmoid(0)≈0.5")
 }
@@ -149,15 +150,18 @@ test_reductions :: proc() {
 	fmt.println("-- reductions --")
 	t := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
 	all := ml.sum(t, -1)
+	ml.realize(all)
 	expect(all.shape[0] == 1 && all.data[0] == 21, "sum all")
 
 	// sum over cols → shape [2,1]
 	rows := ml.sum(t, 1)
+	ml.realize(rows)
 	expect(rows.shape[0] == 2 && rows.shape[1] == 1, "sum axis=1 shape")
 	expect(rows.data[0] == 6 && rows.data[1] == 15, "sum axis=1 values")
 
 	// mean of [1,2,3,4] = 2.5
 	m := ml.mean(ml.from_data_copy({1, 2, 3, 4}, {4}))
+	ml.realize(m)
 	expect(m.data[0] > 2.499 && m.data[0] < 2.501, "mean")
 }
 
@@ -165,6 +169,7 @@ test_reshape_transpose :: proc() {
 	fmt.println("-- reshape / transpose --")
 	t := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
 	r := ml.reshape(t, {3, 2})
+	ml.realize(r)
 	expect(r.shape[0] == 3 && r.shape[1] == 2, "reshape shape")
 	expect(r.data[0] == 1 && r.data[5] == 6, "reshape data (row-major flat)")
 
@@ -276,6 +281,7 @@ test_broadcast_simd_correctness :: proc() {
 		for i in 0..<N do b_data[i] = f32(i) * 0.01
 		b := ml.from_data_copy(b_data, {i32(N)})
 		out := ml.add(a, b)
+		ml.realize(out)
 		// verify
 		ok := true
 		for i in 0..<M {
@@ -298,6 +304,7 @@ test_broadcast_simd_correctness :: proc() {
 		for i in 0..<N do b_data[i] = f32(i) + 1
 		b := ml.from_data_copy(b_data, {i32(N)})
 		out := ml.mul(a, b)
+		ml.realize(out)
 		ok := true
 		for i in 0..<M {
 			for j in 0..<N {
@@ -317,6 +324,7 @@ test_broadcast_simd_correctness :: proc() {
 		a := ml.from_data_copy(a_data, {i32(n)})
 		b := ml.from_data_copy({1.5}, {1})
 		out := ml.sub(a, b)
+		ml.realize(out)
 		ok := true
 		for i in 0..<n {
 			expected := a_data[i] - 1.5
@@ -335,6 +343,7 @@ test_broadcast_simd_correctness :: proc() {
 		a := ml.from_data_copy(a_data, {i32(M), i32(N)})
 		b := ml.from_data_copy(col, {i32(M), 1})
 		out := ml.add(a, b)
+		ml.realize(out)
 		ok := true
 		for i in 0..<M {
 			for j in 0..<N {
@@ -356,6 +365,7 @@ test_broadcast_simd_correctness :: proc() {
 		a := ml.from_data_copy(a_data, {i32(M), i32(N)})
 		b := ml.from_data_copy(col, {i32(M), 1})
 		out := ml.mul(a, b)
+		ml.realize(out)
 		ok := true
 		for i in 0..<M {
 			for j in 0..<N {
@@ -418,7 +428,7 @@ test_broadcast_simd_vs_scalar_perf :: proc() {
 		a := ml.from_data_copy(a_data, {i32(N)})
 		b := ml.from_data_copy(scalar_data, {1})
 		bench_ms("scalar add [N]+[1]  (SIMD path)", 30, proc(a, b: ^ml.Tensor) {
-			_ = ml.add(a, b)
+			r := ml.add(a, b); ml.realize(r)
 		}, a, b)
 	}
 
@@ -427,7 +437,7 @@ test_broadcast_simd_vs_scalar_perf :: proc() {
 		a := ml.from_data_copy(a_data, {i32(N)})
 		b := ml.from_data_copy(b_data, {i32(N)})
 		bench_ms("same-shape add [N]+[N] (SIMD)", 30, proc(a, b: ^ml.Tensor) {
-			_ = ml.add(a, b)
+			r := ml.add(a, b); ml.realize(r)
 		}, a, b)
 	}
 
@@ -444,7 +454,7 @@ test_broadcast_simd_vs_scalar_perf :: proc() {
 		a := ml.from_data_copy(row, {i32(M), i32(N2)})
 		b := ml.from_data_copy(col_vec, {i32(N2)})
 		bench_ms("row broadcast add [1024,1024]+[1024]", 20, proc(a, b: ^ml.Tensor) {
-			_ = ml.add(a, b)
+			r := ml.add(a, b); ml.realize(r)
 		}, a, b)
 	}
 
@@ -461,7 +471,7 @@ test_broadcast_simd_vs_scalar_perf :: proc() {
 		a := ml.from_data_copy(big, {i32(M), i32(N2)})
 		b := ml.from_data_copy(col, {i32(M), 1})
 		bench_ms("col broadcast add [1024,1024]+[1024,1] (SIMD)", 20, proc(a, b: ^ml.Tensor) {
-			_ = ml.add(a, b)
+			r := ml.add(a, b); ml.realize(r)
 		}, a, b)
 	}
 }

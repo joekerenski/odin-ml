@@ -1,28 +1,19 @@
 package ml
 
 // ============================================================================
-// Tensor — the central type, modeled on tinygrad.
+// Tensor — central type (tinygrad-style).
 //
-// A Tensor is either a leaf (a weight or an input) or the result of an op.
-// It owns:
-//   data          flat f32 buffer, row-major
-//   shape         dimension sizes, e.g. [2, 3]
-//   strides       row-major strides, e.g. [3, 1] for shape [2, 3]
-//   requires_grad whether this tensor needs a gradient
-//   grad          accumulated gradient (nil until backward runs)
-//   ctx          the op that produced this tensor; nil for leaves
+// Leaves (sources): ctx == nil, data always allocated (weights, inputs).
+// Op nodes:         ctx set (LazyOp), data nil until realize().
 //
-// The compute graph is implicit: every non-leaf tensor points at a Context,
-// which references its parent tensors and the op kind. backward() walks that
-// graph in reverse and fills in .grad everywhere requires_grad is set.
+//   data           flat f32 (nil if unrealized op)
+//   shape/strides  known at graph-build time
+//   requires_grad  whether this needs a gradient
+//   grad           filled by backward()
+//   ctx            LazyOp (Op + parents + meta); nil for leaves
+//   device         CPU / Metal / …
 //
-// ALLOCATION: all tensors are created through `context.allocator`. The intended
-// usage is to set `context.allocator` to a `Dynamic_Arena` for each training
-// step, build the forward+backward graph inside it, read out the loss and
-// apply gradients, then call `dynamic_arena_free_all` to reclaim everything at
-// once. Parameters (weights) are allocated with the persistent allocator
-// (before the arena is set) so they survive across steps. After `free_all`,
-// call `clear_grads(params...)` to nil out dangling `.grad` pointers.
+// Flow: build graph with ops → realize(sink) → backward(sink) → optimizer.
 // ============================================================================
 
 import "core:fmt"
@@ -48,12 +39,14 @@ Op :: enum {
 	CrossEntropy,
 }
 
+// Context == LazyOp: unrealized computation node (kind + parents + meta).
+// Same structure is used for backward after realize.
 Context :: struct {
 	op:      Op,
-	parents: [dynamic]^Tensor,
-	axis:    i32,          // Sum: which axis (-1 = all); Transpose: axis0
-	axis1:   i32,          // Transpose: axis1
-	cache:   ^Tensor,      // optional cached intermediate (CrossEntropy: softmax [B,C])
+	parents: [dynamic]^Tensor, // edges to sources / other ops
+	axis:    i32,              // Sum axis (-1 = all); Transpose axis0
+	axis1:   i32,              // Transpose axis1
+	cache:   ^Tensor,          // optional intermediate (CrossEntropy softmax)
 }
 
 // ---- shape helpers --------------------------------------------------------
@@ -162,7 +155,10 @@ is_contiguous :: proc(t: ^Tensor) -> bool {
 }
 
 // Elementwise close: |a-b| <= atol + rtol*|b| for every element. Same numel required.
+// Realizes both tensors first.
 allclose :: proc(a, b: ^Tensor, rtol: f32 = 1e-5, atol: f32 = 1e-6) -> bool {
+	realize(a)
+	realize(b)
 	if len(a.data) != len(b.data) do return false
 	for i in 0..<len(a.data) {
 		diff := a.data[i] - b.data[i]

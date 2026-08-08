@@ -1,2 +1,41 @@
+# OS
+.DS_Store
+
+# Datasets (large binaries)
 data/
 
+# Python / uv
+**/.venv/
+.venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+uv.lock
+**/.uv/
+*.egg-info/
+.eggs/
+
+# PDFs and other heavy docs
+*.pdf
+
+# Odin build artifacts / local binaries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.dSYM/
+mnist/main
+mnist/mnist
+/main
+/regression
+/tensor_ops/tensor_ops
+bench/**/main
+!bench/**/main.odin
+
+# Local asm / IR dumps from benches
+**/study.s
+**/study_ir/
+**/probe_bin
