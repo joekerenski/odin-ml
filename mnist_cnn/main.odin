@@ -1,46 +1,57 @@
 package main
 
 // ============================================================================
-// MNIST MLP — 784 -> 128 (ReLU) -> 10 (softmax cross-entropy)
+// MNIST CNN — tiny LeNet-ish stack to exercise Conv2d + MaxPool + Linear.
 //
-//   odin run mnist -o:speed
-//   ML_DEBUG=2 odin run mnist -o:speed
+//   odin run mnist_cnn -o:speed
+//   ML_DEBUG=2 odin run mnist_cnn -o:speed
 // ============================================================================
 
 import "core:fmt"
 import ml "../ml"
 
-l1: ml.Linear
-l2: ml.Linear
+c1: ml.Conv2d
+c2: ml.Conv2d
+fc: ml.Linear
 
 forward :: proc(x: ^ml.Tensor) -> ^ml.Tensor {
-	h := ml.relu(ml.linear_forward(&l1, x))
-	return ml.linear_forward(&l2, h)
+	img := x
+	if len(x.shape) == 2 {
+		img = ml.reshape(x, {x.shape[0], 1, 28, 28})
+	}
+	h := ml.relu(ml.conv2d_forward(&c1, img))
+	h = ml.max_pool2d(h, 2)
+	h = ml.relu(ml.conv2d_forward(&c2, h))
+	h = ml.max_pool2d(h, 2)
+	return ml.linear_forward(&fc, ml.flatten(h))
 }
 
 main :: proc() {
-	fmt.println("=== MNIST MLP: 784 -> 128 -> 10 ===")
+	fmt.println("=== MNIST CNN: conv→pool→conv→pool→fc ===")
 	ml.debug_from_env()
 	ml.seed(42)
 
-	X_train := ml.load_idx_images("data/mnist/train-images.idx3-ubyte", flatten = true)
+	X_train := ml.load_idx_images("data/mnist/train-images.idx3-ubyte", flatten = false)
 	Y_train := ml.load_idx_labels("data/mnist/train-labels.idx1-ubyte")
-	X_test := ml.load_idx_images("data/mnist/t10k-images.idx3-ubyte", flatten = true)
+	X_test := ml.load_idx_images("data/mnist/t10k-images.idx3-ubyte", flatten = false)
 	Y_test := ml.load_idx_labels("data/mnist/t10k-labels.idx1-ubyte")
 	fmt.printfln("train: %v  test: %v  ML_DEBUG=%d", X_train.shape, X_test.shape, ml.debug_level)
 
-	l1 = ml.linear(784, 128, .He)
-	l2 = ml.linear(128, 10, .Xavier)
+	c1 = ml.conv2d_layer(1, 8, 3, stride = 1, padding = 1, init = .He)
+	c2 = ml.conv2d_layer(8, 16, 3, stride = 1, padding = 1, init = .He)
+	fc = ml.linear(16 * 7 * 7, 10, .Xavier)
+
 	params: [dynamic]^ml.Tensor
-	ml.linear_params(&params, l1)
-	ml.linear_params(&params, l2)
+	ml.conv_params(&params, c1)
+	ml.conv_params(&params, c2)
+	ml.linear_params(&params, fc)
 
 	tr: ml.Trainer
 	ml.trainer_init(&tr, params[:], lr = 0.05, momentum = 0.9, batch_size = 128)
 	defer ml.trainer_destroy(&tr)
+	fmt.printfln("params: %d tensors", len(params))
 
 	if ml.debug_level > 0 {
-		// context switch must be in THIS proc (Odin context is by-value).
 		old := context.allocator
 		context.allocator = ml.trainer_allocator(&tr)
 		Xb, Yb := ml.minibatch(X_train, Y_train, 0, tr.batch_size, nil)
@@ -54,11 +65,11 @@ main :: proc() {
 		ml.debug_level = 0
 	}
 
-	EPOCHS :: 20
+	EPOCHS :: 3
 	for epoch in 0..<EPOCHS {
 		loss := ml.trainer_epoch_ce(&tr, X_train, Y_train, forward)
-		acc := ml.eval_accuracy(forward, X_test, Y_test, 512)
-		fmt.printfln("epoch %2d  loss=%.4f  test_acc=%.2f%%", epoch, loss, acc)
+		acc := ml.eval_accuracy(forward, X_test, Y_test, 256)
+		fmt.printfln("epoch %d  loss=%.4f  test_acc=%.2f%%", epoch, loss, acc)
 	}
 	fmt.println("done.")
 }

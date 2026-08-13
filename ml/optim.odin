@@ -27,10 +27,20 @@ new_sgd :: proc(lr, momentum: f32, params: ..^Tensor) -> ^SGD {
 	opt.lr = lr
 	opt.momentum = momentum
 	for p in params {
+		if p == nil do continue
 		append(&opt.params, p)
 		append(&opt.velocities, make([]f32, len(p.data)))
 	}
 	return opt
+}
+
+// Build SGD from a collected param list (from collect_params).
+new_sgd_list :: proc(lr, momentum: f32, params: []^Tensor) -> ^SGD {
+	return new_sgd(lr, momentum, ..params)
+}
+
+clear_grad_list :: proc(params: []^Tensor) {
+	clear_grads(..params)
 }
 
 sgd_step :: proc(opt: ^SGD) {

@@ -21,6 +21,11 @@ import "core:math/rand"
 
 MAX_DIMS :: 8
 
+// Seed the global PRNG (creators, random_permutation, etc.).
+seed :: proc(s: u64) {
+	rand.reset(s)
+}
+
 Tensor :: struct {
 	data:          []f32,
 	shape:         [dynamic]i32,
@@ -37,6 +42,7 @@ Op :: enum {
 	Sum, Reshape, Transpose,
 	ReLU, Sigmoid,
 	CrossEntropy,
+	Conv2d, MaxPool2d,
 }
 
 // Context == LazyOp: unrealized computation node (kind + parents + meta).
@@ -47,6 +53,12 @@ Context :: struct {
 	axis:    i32,              // Sum axis (-1 = all); Transpose axis0
 	axis1:   i32,              // Transpose axis1
 	cache:   ^Tensor,          // optional intermediate (CrossEntropy softmax)
+	// Conv2d / MaxPool2d (NCHW)
+	kH, kW: i32,
+	sH, sW: i32,
+	pH, pW: i32,
+	indices: []i32, // MaxPool argmax flat indices into input
+	labels:  []u8,  // CrossEntropy class indices [B]
 }
 
 // ---- shape helpers --------------------------------------------------------
@@ -145,25 +157,62 @@ clone :: proc(t: ^Tensor, requires_grad := false) -> ^Tensor {
 
 // Contiguous layout: strides match dense row-major for the current shape.
 is_contiguous :: proc(t: ^Tensor) -> bool {
+	if t == nil || t.data == nil do return true
 	expected: i32 = 1
 	for i := len(t.shape) - 1; i >= 0; i -= 1 {
 		if t.shape[i] == 0 do return true
+		// dim-1 can have any stride; skip (numpy-compatible)
+		if t.shape[i] == 1 do continue
 		if t.strides[i] != expected do return false
 		expected *= t.shape[i]
 	}
 	return true
 }
 
+// Pack t into dense row-major dst (len == numel). Uses t.strides.
+materialize_to :: proc(dst: []f32, t: ^Tensor) {
+	n := int(numel(t.shape[:]))
+	assert(len(dst) >= n, "materialize_to: dst too small")
+	if is_contiguous(t) {
+		copy(dst[:n], t.data[:n])
+		return
+	}
+	idx: [MAX_DIMS]i32
+	for flat in 0..<n {
+		unravel_index(i32(flat), t.shape[:], idx[:])
+		off: i32 = 0
+		for d in 0..<len(t.shape) do off += idx[d] * t.strides[d]
+		dst[flat] = t.data[off]
+	}
+}
+
+// Data pointer safe for dense kernels. Contiguous → t.data; else arena temp copy.
+contig_data :: proc(t: ^Tensor) -> []f32 {
+	if is_contiguous(t) do return t.data
+	buf := make([]f32, numel(t.shape[:]))
+	materialize_to(buf, t)
+	return buf
+}
+
+// Tensor guaranteed contiguous (view of self, or fresh dense leaf).
+ensure_contig :: proc(t: ^Tensor) -> ^Tensor {
+	if is_contiguous(t) do return t
+	out := new_tensor(t.shape[:], false, t.device)
+	materialize_to(out.data, t)
+	return out
+}
+
 // Elementwise close: |a-b| <= atol + rtol*|b| for every element. Same numel required.
-// Realizes both tensors first.
+// Realizes both tensors first. Compares in dense shape order (handles views).
 allclose :: proc(a, b: ^Tensor, rtol: f32 = 1e-5, atol: f32 = 1e-6) -> bool {
 	realize(a)
 	realize(b)
-	if len(a.data) != len(b.data) do return false
-	for i in 0..<len(a.data) {
-		diff := a.data[i] - b.data[i]
+	if numel(a.shape[:]) != numel(b.shape[:]) do return false
+	ad, bd := contig_data(a), contig_data(b)
+	for i in 0..<len(ad) {
+		diff := ad[i] - bd[i]
 		if diff < 0 do diff = -diff
-		bound := atol + rtol * (b.data[i] < 0 ? -b.data[i] : b.data[i])
+		bound := atol + rtol * (bd[i] < 0 ? -bd[i] : bd[i])
 		if diff > bound do return false
 	}
 	return true

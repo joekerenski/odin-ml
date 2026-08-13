@@ -4,8 +4,7 @@ package ml
 // Metal backend — Apple Silicon GPU compute.
 //
 // Darwin-only file (suffix _darwin). On Linux this file is simply not
-// compiled. The `metal_add` stub in backend_metal_stub.odin provides a
-// panic fallback for non-Darwin builds.
+// compiled. backend_metal_stub.odin provides metal_add → CPU fallback.
 //
 // Architecture:
 //   - metal_ctx holds the device, command queue, and a shader cache.
@@ -137,6 +136,7 @@ metal_buffer_to_f32 :: proc(buf: ^MTL.Buffer) -> []f32 {
 }
 
 // ---- elementwise add shader -----------------------------------------------
+// Dispatch exactly n threads; no n-buffer needed (avoids the old f32→uint bit-hack).
 
 metal_add_source :: `
 #include <metal_stdlib>
@@ -146,18 +146,15 @@ kernel void elem_add(
     device const float* a    [[buffer(0)]],
     device const float* b    [[buffer(1)]],
     device float*       out  [[buffer(2)]],
-    constant uint&      n    [[buffer(3)]],
     uint                tid  [[thread_position_in_grid]]
 ) {
-    if (tid >= n) return;
     out[tid] = a[tid] + b[tid];
 }
 `
 
-// GPU elementwise add: out = a + b (same shape, contiguous).
+// GPU elementwise add: out = a + b (same shape, contiguous). Prototype only.
 metal_add :: proc(out, a, b: []f32) {
 	if !metal_init() {
-		fmt.println("Metal: no device available, falling back to CPU")
 		add_f32_contiguous(out, a, b)
 		return
 	}
@@ -171,15 +168,13 @@ metal_add :: proc(out, a, b: []f32) {
 	n := len(a)
 	buf_a := metal_new_buffer(a)
 	buf_b := metal_new_buffer(b)
-	buf_out := metal_new_buffer_empty(n * 4)
+	buf_out := metal_new_buffer_empty(n * size_of(f32))
+	defer buf_a->release()
+	defer buf_b->release()
+	defer buf_out->release()
 
-	// Pack n as a float buffer (reuse the f32 path)
-	n_data := []f32{f32(n)}
-	buf_n := metal_new_buffer(n_data)
+	metal_run_kernel(pipeline, {buf_a, buf_b, buf_out}, n)
 
-	metal_run_kernel(pipeline, {buf_a, buf_b, buf_out, buf_n}, n)
-
-	// Copy results back (zero-copy read on unified memory)
 	result := metal_buffer_to_f32(buf_out)
-	for i in 0..<n do out[i] = result[i]
+	copy(out, result)
 }

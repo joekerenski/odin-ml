@@ -27,6 +27,7 @@ main :: proc() {
 
 	fmt.println("=== Linear regression: y = w*x + b ===")
 	ml.debug_from_env()
+	ml.seed(0)
 
 	true_w: f32 = 2.5
 	true_b: f32 = 1.0

@@ -78,6 +78,27 @@ def tiny_results() -> dict[str, np.ndarray]:
     loss = (xw * pw).square().mean()
     loss.backward()
     out["grad_w"] = pw.grad.numpy().reshape(-1)
+
+    # conv2d NCHW
+    cx = Tensor([[[ [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0] ]]])
+    cw = Tensor([[[ [1.0, 1.0], [1.0, 1.0] ]]])
+    out["conv2d_k2"] = cx.conv2d(cw, stride=1, padding=0).numpy().reshape(-1)
+
+    px = Tensor([[[
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        [9.0, 10.0, 11.0, 12.0],
+        [13.0, 14.0, 15.0, 16.0],
+    ]]])
+    out["maxpool2d"] = px.max_pool2d(kernel_size=2).numpy().reshape(-1)
+
+    gx = Tensor([[[ [1.0, 2.0], [3.0, 4.0] ]]])
+    gw = Tensor([[[ [0.5, 0.5], [0.5, 0.5] ]]])
+    gx.requires_grad = True
+    gw.requires_grad = True
+    gy = gx.conv2d(gw, stride=1, padding=0).sum()
+    gy.backward()
+    out["conv_dW"] = gw.grad.numpy().reshape(-1)
     return out
 
 

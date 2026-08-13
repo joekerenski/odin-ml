@@ -68,6 +68,8 @@ op_name :: proc(op: Op) -> string {
 	case .ReLU: return "ReLU"
 	case .Sigmoid: return "Sigmoid"
 	case .CrossEntropy: return "CrossEntropy"
+	case .Conv2d: return "Conv2d"
+	case .MaxPool2d: return "MaxPool2d"
 	}
 	return "?"
 }
@@ -79,7 +81,7 @@ print_graph :: proc(sink: ^Tensor, label := "graph") {
 		return
 	}
 	topo: [dynamic]^Tensor
-	visited: [dynamic]^Tensor
+	visited: map[^Tensor]bool
 	defer delete(topo)
 	defer delete(visited)
 	topo_sort(sink, &topo, &visited)

@@ -24,6 +24,17 @@ import "core:fmt"
 import "core:math"
 import "core:time"
 
+// ---- topo sort (post-order DFS) -------------------------------------------
+
+topo_sort :: proc(t: ^Tensor, topo: ^[dynamic]^Tensor, visited: ^map[^Tensor]bool) {
+	if t in visited^ do return
+	visited^[t] = true
+	if t.ctx != nil {
+		for p in t.ctx.parents do topo_sort(p, topo, visited)
+	}
+	append(topo, t)
+}
+
 // ---- reduce a gradient down to a smaller shape (broadcast reverse) --------
 
 // grad has grad_shape; sum it down to target_shape. Any dim where target is 1
@@ -32,6 +43,37 @@ import "core:time"
 sum_to_shape :: proc(grad: []f32, grad_shape, target_shape: []i32) -> []f32 {
 	out := make([]f32, numel(target_shape))
 	for i in 0..<len(out) do out[i] = 0
+
+	// Fast path: NCHW grad → [1,C,1,1] or [C] channel bias reduce
+	if len(grad_shape) == 4 {
+		N, C, H, W := grad_shape[0], grad_shape[1], grad_shape[2], grad_shape[3]
+		HW := H * W
+		if len(target_shape) == 4 &&
+			target_shape[0] == 1 && target_shape[1] == C &&
+			target_shape[2] == 1 && target_shape[3] == 1 {
+			for n in 0..<N {
+				for c in 0..<C {
+					base := (n * C + c) * HW
+					s: f32 = 0
+					for i in 0..<HW do s += grad[base + i]
+					out[c] += s
+				}
+			}
+			return out
+		}
+		if len(target_shape) == 1 && target_shape[0] == C {
+			for n in 0..<N {
+				for c in 0..<C {
+					base := (n * C + c) * HW
+					s: f32 = 0
+					for i in 0..<HW do s += grad[base + i]
+					out[c] += s
+				}
+			}
+			return out
+		}
+	}
+
 	gg := len(grad_shape)
 	tg := len(target_shape)
 	idx_buf: [MAX_DIMS]i32
@@ -55,6 +97,11 @@ accum_grad :: proc(parent: ^Tensor, contribution: []f32, contrib_shape: []i32) {
 	if !parent.requires_grad do return
 	if parent.grad == nil {
 		parent.grad = new_tensor(parent.shape[:], false)
+	}
+	// Same shape: just += (no alloc / reduce)
+	if shapes_equal(contrib_shape, parent.shape[:]) {
+		for i in 0..<len(parent.grad.data) do parent.grad.data[i] += contribution[i]
+		return
 	}
 	reduced := sum_to_shape(contribution, contrib_shape, parent.shape[:])
 	for i in 0..<len(parent.grad.data) do parent.grad.data[i] += reduced[i]
@@ -82,17 +129,6 @@ transpose_raw :: proc(data: []f32, shape: []i32, axis0, axis1: int, out_shape: [
 	return out
 }
 
-// ---- topo sort (post-order DFS) -------------------------------------------
-
-topo_sort :: proc(t: ^Tensor, topo, visited: ^[dynamic]^Tensor) {
-	for v in visited^ do if v == t do return
-	append(visited, t)
-	if t.ctx != nil {
-		for p in t.ctx.parents do topo_sort(p, topo, visited)
-	}
-	append(topo, t)
-}
-
 // ---- entry point -----------------------------------------------------------
 
 backward :: proc(t: ^Tensor) {
@@ -101,7 +137,7 @@ backward :: proc(t: ^Tensor) {
 	t.grad = ones(t.shape[:], false)
 
 	topo: [dynamic]^Tensor = make([dynamic]^Tensor, 0)
-	visited: [dynamic]^Tensor = make([dynamic]^Tensor, 0)
+	visited: map[^Tensor]bool
 	defer delete(topo)
 	defer delete(visited)
 	topo_sort(t, &topo, &visited)
@@ -116,7 +152,8 @@ backward :: proc(t: ^Tensor) {
 	bk := 0
 	for i := len(topo) - 1; i >= 0; i -= 1 {
 		node := topo[i]
-		if node.ctx == nil do continue
+		// Skip leaves and nodes that never needed grad (e.g. reshape of input).
+		if node.ctx == nil || node.grad == nil do continue
 		t0: time.Tick
 		if debug_level >= 2 do t0 = time.tick_now()
 		backward_op(node)
@@ -158,22 +195,27 @@ backward_op :: proc(out: ^Tensor) {
 
 	case .Mul:
 		a, b := p[0], p[1]
+		ad, bd := contig_data(a), contig_data(b)
 		ga := make([]f32, len(g))
 		gb := make([]f32, len(g))
-		mul_broadcast_into(ga, out.shape[:], g, out.shape[:], b.data, b.shape[:])
-		mul_broadcast_into(gb, out.shape[:], g, out.shape[:], a.data, a.shape[:])
+		mul_broadcast_into(ga, out.shape[:], g, out.shape[:], bd, b.shape[:])
+		mul_broadcast_into(gb, out.shape[:], g, out.shape[:], ad, a.shape[:])
 		accum_grad(a, ga, out.shape[:])
 		accum_grad(b, gb, out.shape[:])
 
 	case .Div:
+		// d/da (a/b) = 1/b ; d/db (a/b) = -a/b²  (with broadcast)
 		a, b := p[0], p[1]
+		ad, bd := contig_data(a), contig_data(b)
 		ga := make([]f32, len(g))
 		gb := make([]f32, len(g))
-		for i in 0..<len(g) {
-			bv := b.data[i]
-			ga[i] = g[i] / bv
-			gb[i] = -g[i] * a.data[i] / (bv * bv)
-		}
+		div_broadcast_into(ga, out.shape[:], g, out.shape[:], bd, b.shape[:])
+		ab := make([]f32, len(g))
+		mul_broadcast_into(ab, out.shape[:], ad, a.shape[:], g, out.shape[:])
+		b2 := make([]f32, len(g))
+		mul_broadcast_into(b2, out.shape[:], bd, b.shape[:], bd, b.shape[:])
+		div_broadcast_into(gb, out.shape[:], ab, out.shape[:], b2, out.shape[:])
+		for i in 0..<len(gb) do gb[i] = -gb[i]
 		accum_grad(a, ga, out.shape[:])
 		accum_grad(b, gb, out.shape[:])
 
@@ -184,25 +226,27 @@ backward_op :: proc(out: ^Tensor) {
 
 	case .MatMul:
 		a, b := p[0], p[1]
+		ad, bd := contig_data(a), contig_data(b)
 		M, K, N := out.shape[0], a.shape[1], out.shape[1]
-		bT := transpose_raw(b.data, b.shape[:], 0, 1, {b.shape[1], b.shape[0]})
+		bT := transpose_raw(bd, b.shape[:], 0, 1, {b.shape[1], b.shape[0]})
 		da := matmul_raw(g, M, N, bT, N, K)
-		aT := transpose_raw(a.data, a.shape[:], 0, 1, {a.shape[1], a.shape[0]})
+		aT := transpose_raw(ad, a.shape[:], 0, 1, {a.shape[1], a.shape[0]})
 		db := matmul_raw(aT, K, M, g, M, N)
 		accum_grad(a, da, a.shape[:])
 		accum_grad(b, db, b.shape[:])
 
 	case .Sum:
 		a := p[0]
+		an := int(numel(a.shape[:]))
 		if ctx.axis == -1 {
-			ga := make([]f32, len(a.data))
-			for i in 0..<len(ga) do ga[i] = g[0]
+			ga := make([]f32, an)
+			for i in 0..<an do ga[i] = g[0]
 			accum_grad(a, ga, a.shape[:])
 		} else {
 			k := int(ctx.axis)
-			ga := make([]f32, len(a.data))
+			ga := make([]f32, an)
 			idx_buf: [MAX_DIMS]i32
-			for flat in 0..<len(a.data) {
+			for flat in 0..<an {
 				unravel_index(i32(flat), a.shape[:], idx_buf[:])
 				g_idx: i32 = 0
 				for d in 0..<len(out.shape) {
@@ -216,11 +260,14 @@ backward_op :: proc(out: ^Tensor) {
 		}
 
 	case .Reshape:
+		// Grad is dense in out shape; parent just needs same bytes, parent shape.
 		ga := make([]f32, len(g))
-		for i in 0..<len(g) do ga[i] = g[i]
+		copy(ga, g)
 		accum_grad(p[0], ga, p[0].shape[:])
 
 	case .Transpose:
+		// If out is a view, out.grad is still dense in out.shape order.
+		// Transpose grad back to parent shape (dense).
 		axis0 := int(ctx.axis)
 		axis1 := int(ctx.axis1)
 		ga := transpose_raw(g, out.shape[:], axis0, axis1, p[0].shape[:])
@@ -228,26 +275,59 @@ backward_op :: proc(out: ^Tensor) {
 
 	case .ReLU:
 		a := p[0]
+		ad := contig_data(a)
 		ga := make([]f32, len(g))
-		for i in 0..<len(g) do ga[i] = a.data[i] > 0 ? g[i] : 0.0
+		for i in 0..<len(g) do ga[i] = ad[i] > 0 ? g[i] : 0.0
 		accum_grad(a, ga, a.shape[:])
 
 	case .Sigmoid:
+		// out may be contig (sigmoid always writes dense out)
+		od := contig_data(out)
 		ga := make([]f32, len(g))
-		for i in 0..<len(g) do ga[i] = g[i] * out.data[i] * (1.0 - out.data[i])
+		for i in 0..<len(g) do ga[i] = g[i] * od[i] * (1.0 - od[i])
 		accum_grad(p[0], ga, out.shape[:])
 
 	case .CrossEntropy:
-		// Forward cached softmax (ctx.cache) and stored one-hot labels as p[1].
-		// dL/d(logits) = (softmax - one_hot) / B  *  upstream_grad
-		// upstream_grad for a scalar loss = 1.0 (seeded by backward()).
-		a := p[0]        // logits [B, C]
-		one_hot := p[1]  // one-hot labels [B, C] (requires_grad = false)
+		a := p[0]
 		softmax := ctx.cache
 		B := a.shape[0]
-		ga := make([]f32, len(a.data))
+		C := a.shape[1]
+		ga := make([]f32, int(B * C))
 		scale := g[0] / f32(B)
-		for i in 0..<len(ga) do ga[i] = (softmax.data[i] - one_hot.data[i]) * scale
+		for i in 0..<len(ga) do ga[i] = softmax.data[i] * scale
+		for b in 0..<B {
+			ga[b * C + i32(ctx.labels[b])] -= scale
+		}
 		accum_grad(a, ga, a.shape[:])
+
+	case .Conv2d:
+		x, w := p[0], p[1]
+		xd, wd := contig_data(x), contig_data(w)
+		N, Ci, H, Ww := x.shape[0], x.shape[1], x.shape[2], x.shape[3]
+		Co := w.shape[0]
+		if x.requires_grad {
+			dx := make([]f32, int(numel(x.shape[:])))
+			conv2d_backward_input(
+				dx, g, wd,
+				N, Ci, H, Ww, Co, ctx.kH, ctx.kW, ctx.sH, ctx.sW, ctx.pH, ctx.pW,
+			)
+			accum_grad(x, dx, x.shape[:])
+		}
+		if w.requires_grad {
+			dw := make([]f32, int(numel(w.shape[:])))
+			conv2d_backward_weight(
+				dw, g, xd,
+				N, Ci, H, Ww, Co, ctx.kH, ctx.kW, ctx.sH, ctx.sW, ctx.pH, ctx.pW,
+			)
+			accum_grad(w, dw, w.shape[:])
+		}
+
+	case .MaxPool2d:
+		x := p[0]
+		if x.requires_grad {
+			dx := make([]f32, int(numel(x.shape[:])))
+			maxpool2d_backward(dx, g, ctx.indices)
+			accum_grad(x, dx, x.shape[:])
+		}
 	}
 }

@@ -49,19 +49,17 @@ load_idx_images :: proc(path: string, flatten: bool = true) -> ^Tensor {
 	pixel_count := n * rows * cols
 	assert(len(data) >= 16 + int(pixel_count), "load_idx_images: data truncated")
 
+	shape: []i32
 	if flatten {
-		out := new_tensor({n, rows * cols}, requires_grad = false)
-		for i in 0..<int(pixel_count) {
-			out.data[i] = f32(data[16 + i]) / 255.0
-		}
-		return out
+		shape = {n, rows * cols}
 	} else {
-		out := new_tensor({n, 1, rows, cols}, requires_grad = false)
-		for i in 0..<int(pixel_count) {
-			out.data[i] = f32(data[16 + i]) / 255.0
-		}
-		return out
+		shape = {n, 1, rows, cols}
 	}
+	out := new_tensor(shape, requires_grad = false)
+	for i in 0..<int(pixel_count) {
+		out.data[i] = f32(data[16 + i]) / 255.0
+	}
+	return out
 }
 
 // Load IDX1 labels as a []u8 slice (persistent allocator).
@@ -83,30 +81,31 @@ load_idx_labels :: proc(path: string) -> []u8 {
 
 // ---- minibatching ---------------------------------------------------------
 
-// Extract a contiguous batch from X and Y. If perm is non-nil, uses perm[offset+i]
-// as the source index (for shuffled iteration). X can be any rank; the batch
-// dimension is axis 0. Uses context.allocator — in training this is the arena.
+// Extract a batch from X and Y. If perm is non-nil, uses perm[offset+i] as the
+// source index (shuffled iteration). X can be any rank; batch dim is axis 0.
+// Clamps to remaining samples near the end (shape[0] may be < batch_size).
+// Uses context.allocator — in training this is the arena.
 minibatch :: proc(
 	X: ^Tensor, Y: []u8, batch_idx: int, batch_size: int, perm: []i32 = nil,
 ) -> (Xb: ^Tensor, Yb: []u8) {
 	n := int(X.shape[0])
 	per_sample := len(X.data) / n
+	offset := batch_idx * batch_size
+	assert(offset < n, "minibatch: batch_idx past end of data")
+	actual := batch_size
+	if offset + actual > n do actual = n - offset
 
 	batch_shape: [MAX_DIMS]i32
-	batch_shape[0] = i32(batch_size)
+	batch_shape[0] = i32(actual)
 	for d in 1..<len(X.shape) do batch_shape[d] = X.shape[d]
 
 	Xb = new_tensor(batch_shape[:len(X.shape)], requires_grad = false)
-	Yb = make([]u8, batch_size)
+	Yb = make([]u8, actual)
 
-	offset := batch_idx * batch_size
-	for i in 0..<batch_size {
-		idx := offset + i
-		if idx >= n do break
-		src_idx := idx
-		if perm != nil do src_idx = int(perm[idx])
-		if src_idx >= n do continue
-
+	for i in 0..<actual {
+		src_idx := offset + i
+		if perm != nil do src_idx = int(perm[offset + i])
+		assert(src_idx >= 0 && src_idx < n, "minibatch: perm index out of range")
 		src_start := src_idx * per_sample
 		dst_start := i * per_sample
 		copy(Xb.data[dst_start:dst_start + per_sample], X.data[src_start:src_start + per_sample])
@@ -148,7 +147,9 @@ eval_accuracy :: proc(
 	old_alloc := context.allocator
 	context.allocator = mem.dynamic_arena_allocator(&arena)
 
-	for b in 0..<n / batch_size {
+	// Include remainder batch (minibatch clamps size near the end).
+	n_batches := (n + batch_size - 1) / batch_size
+	for b in 0..<n_batches {
 		Xb, Yb := minibatch(X, Y, b, batch_size)
 		logits := forward(Xb)
 		realize(logits)

@@ -1,36 +1,36 @@
 Objective
-Build a small CPU-first ML library in Odin (tinygrad-style Tensor + autograd), then harden tensors, SIMD, Metal backends, benches vs NumPy, and move toward lazy graph execution.
-Important Details
-Design: Tensor holds data/shape/strides/requires_grad/grad/ctx/device; Context = LazyOp (Op + parents + meta); reverse-mode autograd via topo sort.
-Memory: prefer arenas/context.allocator; params persistent; after arena free_all, clear_grads nils dangling grads.
-macOS M5: NumPy matmul ≈ Accelerate; library matmul defaults to Accelerate; pure tiled SIMD educational (~few % of BLAS).
-Device: .CPU / .Metal; Metal via vendor:darwin/Metal (_darwin file suffix); not MLX C; cross-platform goal (Linux later).
-Lazy path: ops should only build graph; realize(sink) topo-sorts sources→sink then runs kernels; backward should realize first.
-User wants to learn; UOps later; next priority is lazy + realize, not beam search yet.
-Broadcast SIMD worth it for scalar/row/col patterns; general strided stays scalar; eager per-op alloc made broadcast benches far below NumPy.
-Work State
-Completed
-Package ml/: tensor, ops, autograd, optim (SGD), f32 SIMD kernels, matmul (pure + Accelerate), Metal add path, device enum.
-Demos/tests: regression.odin, tensor_ops/, metal_probe/, metal_test/ (GPU add worked).
-Benches: bench/ with uv+NumPy, matmul/elem compare (~100% NumPy on Accelerate matmul/large elem), broadcast compare (Odin low % due to alloc).
-Broadcast SIMD: scalar/row/col paths; 41 tensor_ops tests passed at last full run.
-Started lazy: ml/realize.odin (new_tensor_lazy, realize, item, forward_op); ops header/docs lean lazy; regression edited toward lazy + item(loss).
-Active
-Inspectability in: debug_level / ML_DEBUG, Counters, print_graph, per-op fwd/bwd timing in realize/backward.
-Blocked
-(none)
+CPU-first ML library in Odin (tinygrad-inspired): Tensor + lazy graph + autograd.
+Breadth next (nn API, examples CNN→RNN→Transformer); deep opts (fusion/UOps) when limits bite.
+
+Stack (have)
+- Tensor: shape/strides, requires_grad, grad, ctx=LazyOp, device
+- Lazy ops: +−×÷, MatMul, Sum/mean, Reshape/T, ReLU/Sigmoid, CE, Conv2d, MaxPool2d, flatten
+- realize + item; backward skips nil-grad nodes; reverse-mode autograd
+- Kernels: SIMD ewise/bcast; matmul Accelerate; Conv = im2col+GEMM; NCHW bias fast path
+- nn: Linear, Conv2d, collect_params / linear_params / conv_params; SGD+mom
+- data: MNIST IDX, minibatch, eval_accuracy
+- debug: ML_DEBUG, Counters, print_graph
+- Tests: tensor_ops 51; tinygrad compare 11; regression; MNIST MLP~98%; MNIST CNN~98%
+
+Missing (breadth)
+- Embedding, LayerNorm/BN, Dropout, RNN/GRU, Adam
+- softmax, gather, cat/pad, free views, GELU
+- Metal beyond add; fusion/UOps
+
+Examples ladder
+1. regression ✓  2. MNIST MLP ✓  3. MNIST CNN ✓
+4. char RNN / seq  5. digit transformer  6. tiny GPT later
+
+Hygiene
+- Div bwd broadcast-safe; accum_grad same-shape fast path; topo_sort map
+- classify_binary; CE labels on ctx; minibatch remainder; Metal stub
+- **Views**: reshape/transpose share storage; contig_data/ensure_contig densify for kernels
+- **ml.seed**; **Trainer** (trainer_epoch_ce) — context switch must be same-proc (Odin by-value)
+- Tests: 68 unit + 11 tinygrad; MNIST MLP/CNN ~98%
+
 Next Move
-MNIST green with traces. Then ops MNIST needs; fusion later.
+Char RNN or digit transformer breadth. Optimize only if an example is too slow.
+
 Relevant Files
-/Users/joe/code/sketches/odin-ml/ml/tensor.odin — Tensor core, device, allclose/realize hooks
-/Users/joe/code/sketches/odin-ml/ml/ops.odin — graph builders (should be lazy)
-/Users/joe/code/sketches/odin-ml/ml/realize.odin — realize + forward_op
-/Users/joe/code/sketches/odin-ml/ml/autograd.odin — backward / topo_sort
-/Users/joe/code/sketches/odin-ml/ml/kernel_f32.odin — contiguous + broadcast SIMD
-/Users/joe/code/sketches/odin-ml/ml/kernel_matmul.odin / kernel_accelerate.odin — GEMM backends
-/Users/joe/code/sketches/odin-ml/ml/backend_metal_darwin.odin — Metal pipeline
-/Users/joe/code/sketches/odin-ml/ml/device.odin — Device enum
-/Users/joe/code/sketches/odin-ml/regression.odin — training loop
-/Users/joe/code/sketches/odin-ml/tensor_ops/ — correctness + broadcast microbench
-/Users/joe/code/sketches/odin-ml/bench/ — NumPy/Odin compare scripts
-/Users/joe/code/sketches/odin-ml/notes.txt — architecture notes
+ml/{tensor,ops,realize,autograd,nn,optim,data,debug,device,kernel_*}.odin
+regression.odin, mnist/, tensor_ops/, bench/, docs/tiny-inspo.md

@@ -54,6 +54,13 @@ main :: proc() {
 	test_broadcast_simd_correctness()
 	test_broadcast_simd_vs_scalar_perf()
 	test_chained()
+	test_conv_pool()
+	test_conv_grad()
+	test_params_helper()
+	test_div_broadcast_grad()
+	test_gradcheck()
+	test_cross_entropy()
+	test_views()
 
 	fmt.println()
 	fmt.printfln("=== %d passed, %d failed ===", passed, failed)
@@ -474,4 +481,193 @@ test_broadcast_simd_vs_scalar_perf :: proc() {
 			r := ml.add(a, b); ml.realize(r)
 		}, a, b)
 	}
+}
+
+// ---- conv / pool ----------------------------------------------------------
+
+test_conv_pool :: proc() {
+	fmt.println("-- conv2d / max_pool2d --")
+	// x: 1x1x3x3 identity-ish, w: 1x1x2x2 all ones, stride 1 pad 0 → 2x2 of window sums
+	// x = [[1,2,3],[4,5,6],[7,8,9]]
+	x := ml.from_data_copy({1, 2, 3, 4, 5, 6, 7, 8, 9}, {1, 1, 3, 3})
+	w := ml.from_data_copy({1, 1, 1, 1}, {1, 1, 2, 2})
+	y := ml.conv2d(x, w, stride = 1, padding = 0)
+	// windows: 1+2+4+5=12, 2+3+5+6=16, 4+5+7+8=24, 5+6+8+9=28
+	expect_close(y, ml.from_data_copy({12, 16, 24, 28}, {1, 1, 2, 2}), "conv2d 3x3 k=2")
+
+	// max pool 2x2 stride 2 on 1x1x4x4
+	// [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]
+	p_in := ml.from_data_copy({
+		1, 2, 3, 4,
+		5, 6, 7, 8,
+		9, 10, 11, 12,
+		13, 14, 15, 16,
+	}, {1, 1, 4, 4})
+	p := ml.max_pool2d(p_in, kernel_size = 2)
+	expect_close(p, ml.from_data_copy({6, 8, 14, 16}, {1, 1, 2, 2}), "max_pool2d 2x2")
+
+	flat := ml.flatten(p)
+	expect(flat.shape[0] == 1 && flat.shape[1] == 4, "flatten shape")
+	ml.realize(flat)
+	expect(flat.data[0] == 6 && flat.data[3] == 16, "flatten values")
+}
+
+test_conv_grad :: proc() {
+	fmt.println("-- conv2d backward --")
+	// Tiny: x 1x1x2x2, w 1x1x2x2, out 1x1x1x1 = sum(x*w)
+	// L = out, dL/dw = x, dL/dx = w
+	x := ml.from_data_copy({1, 2, 3, 4}, {1, 1, 2, 2}, requires_grad = true)
+	w := ml.from_data_copy({0.5, 0.5, 0.5, 0.5}, {1, 1, 2, 2}, requires_grad = true)
+	y := ml.conv2d(x, w, stride = 1, padding = 0)
+	loss := ml.sum(y, -1)
+	ml.backward(loss)
+	expect_close(w.grad, ml.from_data_copy({1, 2, 3, 4}, {1, 1, 2, 2}), "conv dW = x")
+	expect_close(x.grad, ml.from_data_copy({0.5, 0.5, 0.5, 0.5}, {1, 1, 2, 2}), "conv dX = w")
+
+	// maxpool backward: gradient routes to argmax only
+	t := ml.from_data_copy({1, 3, 2, 0}, {1, 1, 2, 2}, requires_grad = true)
+	m := ml.max_pool2d(t, kernel_size = 2)
+	loss2 := ml.sum(m, -1)
+	ml.backward(loss2)
+	// max is 3 at index 1
+	expect_close(t.grad, ml.from_data_copy({0, 1, 0, 0}, {1, 1, 2, 2}), "maxpool grad to argmax")
+}
+
+test_params_helper :: proc() {
+	fmt.println("-- collect_params --")
+	l := ml.linear(4, 2, .Zeros)
+	c := ml.conv2d_layer(1, 3, 3, stride = 1, padding = 1, init = .Zeros)
+	params: [dynamic]^ml.Tensor
+	ml.linear_params(&params, l)
+	ml.conv_params(&params, c)
+	expect(len(params) == 4, "linear+conv → 4 params")
+	expect(params[0] == l.W && params[1] == l.b, "linear params order")
+	expect(params[2] == c.W && params[3] == c.b, "conv params order")
+}
+
+// Div with broadcast: a[2,3] / b[1] and a[2,3] / b[3]
+test_div_broadcast_grad :: proc() {
+	fmt.println("-- div broadcast grad --")
+	// a / scalar: dL/da = 1/s, dL/ds = -sum(a)/s²  for L=sum(a/s)
+	a := ml.from_data_copy({2, 4, 6, 8, 10, 12}, {2, 3}, requires_grad = true)
+	s := ml.from_data_copy({2}, {1}, requires_grad = true)
+	y := ml.div(a, s)
+	loss := ml.sum(y, -1)
+	ml.backward(loss)
+	// y = [1,2,3,4,5,6], dL/da = 0.5 each, dL/ds = -sum(a)/4 = -42/4 = -10.5
+	expect_close(a.grad, ml.from_data_copy({0.5, 0.5, 0.5, 0.5, 0.5, 0.5}, {2, 3}), "div scalar dA")
+	expect_close(s.grad, ml.from_data_copy({-10.5}, {1}), "div scalar dS")
+
+	// a / row: b = [1,2,3], a = [[1,2,3],[4,5,6]]
+	a2 := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3}, requires_grad = true)
+	b2 := ml.from_data_copy({1, 2, 3}, {3}, requires_grad = true)
+	y2 := ml.div(a2, b2)
+	loss2 := ml.sum(y2, -1)
+	ml.backward(loss2)
+	// dL/da = 1/b = [1, 0.5, 1/3] per row
+	expect_close(a2.grad, ml.from_data_copy({1, 0.5, 1.0 / 3, 1, 0.5, 1.0 / 3}, {2, 3}), "div row dA")
+	// dL/db_j = sum_i (-a_ij / b_j²) = - (a0j+a1j)/b_j²
+	// j0: -(1+4)/1 = -5; j1: -(2+5)/4 = -1.75; j2: -(3+6)/9 = -1
+	expect_close(b2.grad, ml.from_data_copy({-5, -1.75, -1}, {3}), "div row dB")
+}
+
+// Numerical gradient check: L = sum(relu(x @ w + b))
+test_gradcheck :: proc() {
+	fmt.println("-- numerical gradcheck --")
+	eps: f32 = 1e-3
+	x_d := [4]f32{0.5, -0.3, 0.8, 0.1}
+	w_d := [6]f32{0.2, -0.4, 0.6, 0.1, -0.2, 0.3}
+	b_d := [3]f32{0.1, -0.1, 0.05}
+	x_sh := []i32{2, 2}
+	w_sh := []i32{2, 3}
+	b_sh := []i32{3}
+
+	fwd :: proc(xd, wd, bd: []f32, x_sh, w_sh, b_sh: []i32) -> f32 {
+		return ml.item(ml.sum(ml.relu(ml.add(
+			ml.matmul(ml.from_data_copy(xd, x_sh), ml.from_data_copy(wd, w_sh)),
+			ml.from_data_copy(bd, b_sh),
+		)), -1))
+	}
+
+	// analytic
+	x := ml.from_data_copy(x_d[:], x_sh, requires_grad = true)
+	w := ml.from_data_copy(w_d[:], w_sh, requires_grad = true)
+	b := ml.from_data_copy(b_d[:], b_sh, requires_grad = true)
+	ml.backward(ml.sum(ml.relu(ml.add(ml.matmul(x, w), b)), -1))
+
+	// numerical dW
+	ok_w := true
+	for i in 0..<6 {
+		wp := w_d
+		wm := w_d
+		wp[i] += eps
+		wm[i] -= eps
+		num := (fwd(x_d[:], wp[:], b_d[:], x_sh, w_sh, b_sh) - fwd(x_d[:], wm[:], b_d[:], x_sh, w_sh, b_sh)) / (2 * eps)
+		d := w.grad.data[i] - num
+		if d < 0 do d = -d
+		if d > 2e-2 do ok_w = false
+	}
+	expect(ok_w, "gradcheck dW vs numerical")
+
+	// numerical dB
+	ok_b := true
+	for i in 0..<3 {
+		bp := b_d
+		bm := b_d
+		bp[i] += eps
+		bm[i] -= eps
+		num := (fwd(x_d[:], w_d[:], bp[:], x_sh, w_sh, b_sh) - fwd(x_d[:], w_d[:], bm[:], x_sh, w_sh, b_sh)) / (2 * eps)
+		d := b.grad.data[i] - num
+		if d < 0 do d = -d
+		if d > 2e-2 do ok_b = false
+	}
+	expect(ok_b, "gradcheck dB vs numerical")
+}
+
+test_cross_entropy :: proc() {
+	fmt.println("-- cross_entropy --")
+	// logits that put all mass on class 1 after softmax-ish: large on idx 1
+	logits := ml.from_data_copy({0, 10, 0, 0, 10, 0}, {2, 3}, requires_grad = true)
+	labels := []u8{1, 1}
+	loss := ml.cross_entropy(logits, labels)
+	// near-zero loss
+	v := ml.item(loss)
+	expect(v < 0.01, "CE low when correct class dominates")
+	ml.backward(loss)
+	expect(logits.grad != nil, "CE produces logit grads")
+	// grad at correct class should be negative-ish (softmax-1)/B < 0
+	expect(logits.grad.data[1] < 0 && logits.grad.data[4] < 0, "CE grad negative on true class")
+}
+
+// Reshape/Transpose are views (share storage); matmul densifies as needed.
+test_views :: proc() {
+	fmt.println("-- views (reshape/transpose) --")
+	a := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
+	r := ml.reshape(a, {3, 2})
+	ml.realize(r)
+	expect(raw_data(r.data) == raw_data(a.data), "reshape shares storage")
+	expect(ml.is_contiguous(r), "reshape of contig stays contig")
+	expect_close(r, ml.from_data_copy({1, 2, 3, 4, 5, 6}, {3, 2}), "reshape values")
+
+	t := ml.transpose(a, 0, 1) // [3,2]
+	ml.realize(t)
+	expect(raw_data(t.data) == raw_data(a.data), "transpose shares storage")
+	expect(!ml.is_contiguous(t), "transpose is non-contig")
+	// dense values of T: [[1,4],[2,5],[3,6]]
+	expect_close(t, ml.from_data_copy({1, 4, 2, 5, 3, 6}, {3, 2}), "transpose values")
+
+	// matmul with transposed right factor densifies under the hood
+	// a [2,3] @ t[3,2] but t is view of a^T... a @ a.T → [2,2]
+	aT := ml.T(a)
+	y := ml.matmul(a, aT)
+	// a @ a.T = [[1+4+9, 4+10+18],[4+10+18, 16+25+36]] = [[14,32],[32,77]]
+	expect_close(y, ml.from_data_copy({14, 32, 32, 77}, {2, 2}), "matmul with T view")
+
+	// grad through transpose view
+	x := ml.from_data_copy({1, 2, 3, 4}, {2, 2}, requires_grad = true)
+	xt := ml.T(x)
+	loss := ml.sum(xt, -1)
+	ml.backward(loss)
+	// dL/dx = ones (transpose of ones)
+	expect_close(x.grad, ml.from_data_copy({1, 1, 1, 1}, {2, 2}), "grad through T")
 }

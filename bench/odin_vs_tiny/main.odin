@@ -61,6 +61,27 @@ main :: proc() {
 	ml.backward(loss)
 	fmt.printf("RESULT grad_w\n%.8g\n", pw.grad.data[0])
 
+	// conv2d: 1x1x3x3 * 1x1x2x2 ones → window sums
+	cx := ml.from_data_copy({1, 2, 3, 4, 5, 6, 7, 8, 9}, {1, 1, 3, 3})
+	cw := ml.from_data_copy({1, 1, 1, 1}, {1, 1, 2, 2})
+	print_result("conv2d_k2", ml.conv2d(cx, cw, stride = 1, padding = 0))
+
+	// max_pool2d 2x2 stride 2
+	px := ml.from_data_copy({
+		1, 2, 3, 4,
+		5, 6, 7, 8,
+		9, 10, 11, 12,
+		13, 14, 15, 16,
+	}, {1, 1, 4, 4})
+	print_result("maxpool2d", ml.max_pool2d(px, kernel_size = 2))
+
+	// conv backward: dW
+	gx := ml.from_data_copy({1, 2, 3, 4}, {1, 1, 2, 2}, requires_grad = true)
+	gw := ml.from_data_copy({0.5, 0.5, 0.5, 0.5}, {1, 1, 2, 2}, requires_grad = true)
+	gy := ml.conv2d(gx, gw, 1, 0)
+	ml.backward(ml.sum(gy, -1))
+	print_result("conv_dW", gw.grad)
+
 	// --- speed (pre-allocated leaves; time realize of single op) ---
 	bench_matmul(256)
 	bench_matmul(512)
