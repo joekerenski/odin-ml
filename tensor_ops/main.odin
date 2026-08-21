@@ -61,6 +61,7 @@ main :: proc() {
 	test_gradcheck()
 	test_cross_entropy()
 	test_views()
+	test_uop()
 
 	fmt.println()
 	fmt.printfln("=== %d passed, %d failed ===", passed, failed)
@@ -670,4 +671,38 @@ test_views :: proc() {
 	ml.backward(loss)
 	// dL/dx = ones (transpose of ones)
 	expect_close(x.grad, ml.from_data_copy({1, 1, 1, 1}, {2, 2}), "grad through T")
+}
+
+test_uop :: proc() {
+	fmt.println("-- uop --")
+	a := ml.from_data_copy({1, 2, 3, 4}, {2, 2})
+	b := ml.from_data_copy({5, 6, 7, 8}, {2, 2})
+	ua := ml.uop_input(a.data, a.shape[:])
+	ub := ml.uop_input(b.data, b.shape[:])
+
+	uc := ml.uop_realize(ml.uop_add(ua, ub))
+	expect_close(ml.from_data_copy(uc.data, uc.shape[:]), ml.add(a, b), "uop add == ml.add")
+
+	um := ml.uop_realize(ml.uop_mul(ua, ub))
+	expect_close(ml.from_data_copy(um.data, um.shape[:]), ml.mul(a, b), "uop mul == ml.mul")
+
+	row := ml.uop_input({10, 100, 1000}, {3})
+	A := ml.uop_input({1, 2, 3, 4, 5, 6}, {2, 3})
+	br := ml.uop_realize(ml.uop_mul(A, row))
+	expect_close(ml.from_data_copy(br.data, br.shape[:]), ml.mul(
+		ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3}),
+		ml.from_data_copy({10, 100, 1000}, {3}),
+	), "uop mul broadcast [2,3]*[3]")
+
+	ur := ml.uop_realize(ml.uop_reshape(ua, {4}))
+	expect(raw_data(ur.data) == raw_data(ua.data), "uop reshape shares storage")
+	expect(ur.shape[0] == 4, "uop reshape shape")
+
+	umm := ml.uop_realize(ml.uop_matmul(ua, ub))
+	expect(umm.shape[0] == 2 && umm.shape[1] == 2, "uop matmul shape")
+	expect_close(ml.from_data_copy(umm.data, umm.shape[:]), ml.matmul(a, b), "uop matmul == ml.matmul")
+	expect_close(ml.from_data_copy(umm.data, umm.shape[:]), ml.from_data_copy({19, 22, 43, 50}, {2, 2}), "uop matmul golden")
+
+	us := ml.uop_realize(ml.uop_sum(ua, -1))
+	expect(us.data[0] == 10, "uop sum all")
 }

@@ -45,8 +45,8 @@ new_tensor_lazy :: proc(shape: []i32, requires_grad := false, device := default_
 // Ensure t holds data. Leaves are no-ops. Op nodes run the whole subgraph.
 // debug_level >= 2 logs each kernel; >= 3 prints the graph first; >= 1 step summary.
 // this checks for CE specifically, this is too literal. How do we realize in a general way??
-realize :: proc(t: ^Tensor) {
-	if t == nil || is_realized(t) do return
+realize :: proc(t: ^Tensor) -> ^Tensor {
+	if t == nil || is_realized(t) do return t
 
 	topo: [dynamic]^Tensor = make([dynamic]^Tensor, 0)
 	visited: map[^Tensor]bool
@@ -107,6 +107,7 @@ realize :: proc(t: ^Tensor) {
 		ms := f64(time.tick_since(step_start)) / 1e6
 		fmt.printfln("  realize: %d kernels  %.3f ms", k, ms)
 	}
+	return t
 }
 
 // Read a scalar after realizing (handy for loss logging).
