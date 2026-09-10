@@ -60,19 +60,6 @@ matmul_f32 :: proc(C, A, B: []f32, M, K, N: i32) {
 	matmul_f32_accum_pure(C, A, B, M, K, N)
 }
 
-// C += A @ B
-matmul_f32_accum :: proc(C, A, B: []f32, M, K, N: i32) {
-	switch matmul_backend {
-	case .Accelerate:
-		when ODIN_OS == .Darwin {
-			accelerate_sgemm(C, A, B, M, K, N, 1, 1)
-			return
-		}
-	case .Pure:
-	}
-	matmul_f32_accum_pure(C, A, B, M, K, N)
-}
-
 // ============================================================================
 // Pure tiled SIMD backend
 // ============================================================================
@@ -182,17 +169,6 @@ matmul_tile_f32_mr4 :: proc(
 				s += A[i * k + p] * B[p * n + j]
 			}
 			C[i * n + j] = s
-		}
-	}
-}
-
-// Naive triple loop — reference.
-matmul_f32_naive :: proc(C, A, B: []f32, M, K, N: i32) {
-	for i in 0..<M {
-		for j in 0..<N {
-			s: f32 = 0
-			for p in 0..<K do s += A[i * K + p] * B[p * N + j]
-			C[i * N + j] = s
 		}
 	}
 }

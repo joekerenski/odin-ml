@@ -34,6 +34,7 @@ Tensor :: struct {
 	grad:          ^Tensor,
 	ctx:           ^Context,
 	device:        Device,
+	done:          bool, // realized (possibly with data elided by fusion)
 }
 
 Op :: enum {

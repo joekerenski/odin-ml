@@ -168,7 +168,7 @@ eval_accuracy :: proc(
 			if best == int(Yb[i]) do correct += 1
 			total += 1
 		}
-		mem.dynamic_arena_free_all(&arena)
+		mem.dynamic_arena_reset(&arena)
 	}
 
 	context.allocator = old_alloc

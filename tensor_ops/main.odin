@@ -62,6 +62,7 @@ main :: proc() {
 	test_cross_entropy()
 	test_views()
 	test_uop()
+	test_fusion()
 
 	fmt.println()
 	fmt.printfln("=== %d passed, %d failed ===", passed, failed)
@@ -705,4 +706,45 @@ test_uop :: proc() {
 
 	us := ml.uop_realize(ml.uop_sum(ua, -1))
 	expect(us.data[0] == 10, "uop sum all")
+}
+
+test_fusion :: proc() {
+	fmt.println("-- fusion --")
+
+	a := ml.from_data_copy({1, -2, 3, -4}, {2, 2})
+	b := ml.from_data_copy({10, 20, 30, 40}, {2, 2})
+	ml.counters_reset()
+	y := ml.relu(ml.add(a, b))
+	ml.realize(y)
+	expect(ml.counters.kernels == 1, "relu(a+b) is 1 kernel")
+	expect(ml.counters.fused_ops >= 1, "relu(a+b) fused at least one extra op")
+	expect(ml.counters.bytes_alloc == 4 * size_of(f32), "relu(a+b) stores only the sink")
+	expect_close(y, ml.from_data_copy({11, 18, 33, 36}, {2, 2}), "relu(a+b) values")
+
+	X := ml.from_data_copy({1, 0, 0, 1, -1, 2}, {3, 2})
+	w := ml.from_data_copy({1, -1}, {2, 1})
+	bias := ml.from_data_copy({0.5}, {1, 1})
+	ml.counters_reset()
+	h := ml.relu(ml.add(ml.matmul(X, w), bias))
+	ml.realize(h)
+	expect(ml.counters.kernels == 2, "relu(Xw+b) is matmul + fused ewise")
+	expect_close(h, ml.from_data_copy({1.5, 0, 0}, {3, 1}), "relu(Xw+b) fused values")
+
+	// sigmoid composition fuses to one kernel
+	x := ml.from_data_copy({0, 1, -1}, {3})
+	ml.counters_reset()
+	s := ml.sigmoid(x)
+	ml.realize(s)
+	expect(ml.counters.kernels == 1, "sigmoid is 1 fused kernel")
+	// 1/(1+e^0)=0.5, 1/(1+e^-1)≈0.731, 1/(1+e^1)≈0.269
+	expect(s.data[0] > 0.49 && s.data[0] < 0.51, "sigmoid(0)≈0.5")
+	expect(s.data[1] > s.data[0] && s.data[0] > s.data[2], "sigmoid monotonic")
+
+	// Elided Add still receives grad: relu(a+b) all positive → da=db=1
+	ga := ml.from_data_copy({1, -2, 3, -4}, {2, 2}, requires_grad = true)
+	gb := ml.from_data_copy({10, 20, 30, 40}, {2, 2}, requires_grad = true)
+	loss := ml.sum(ml.relu(ml.add(ga, gb)), -1)
+	ml.backward(loss)
+	expect_close(ga.grad, ml.ones({2, 2}), "fused relu(a+b) dA")
+	expect_close(gb.grad, ml.ones({2, 2}), "fused relu(a+b) dB")
 }

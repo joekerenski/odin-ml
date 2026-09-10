@@ -3,17 +3,10 @@ package ml
 // ============================================================================
 // Lazy evaluation — build the graph, then realize.
 //
-// Op          — what kind of computation (Add, MatMul, …)
-// Context     — a LazyOp: Op + parents + meta (axis, cache, …)
-// Tensor.ctx  — nil for leaves (sources); set for op nodes
-// Tensor.data — nil until realized (except leaves, which always have data)
-//
-// Sources → intermediates → sink
-//   zeros/from_data     add/mul/…      loss you realize()
-//
 // realize(sink):
-//   1. topo-sort the DAG ending at sink (parents before children)
-//   2. for each unrealized node: allocate data, run forward kernel
+//   1. lower Tensor DAG → UOp DAG (ReLU/Sigmoid are compositions)
+//   2. fuse same-shape ewise chains into one kernel
+//   3. run fused ewise / views / primitives (MatMul, Conv, CE, Sum)
 //
 // backward() calls realize() first so grads see actual values.
 // ============================================================================
@@ -27,7 +20,7 @@ import "core:time"
 is_realized :: proc(t: ^Tensor) -> bool {
 	if t == nil do return true
 	if t.ctx == nil do return true // leaf
-	return t.data != nil
+	return t.data != nil || t.done
 }
 
 // Shape-only tensor: no data yet. Used by ops when building the graph.
@@ -42,17 +35,11 @@ new_tensor_lazy :: proc(shape: []i32, requires_grad := false, device := default_
 	return t
 }
 
-// Ensure t holds data. Leaves are no-ops. Op nodes run the whole subgraph.
-// debug_level >= 2 logs each kernel; >= 3 prints the graph first; >= 1 step summary.
-// this checks for CE specifically, this is too literal. How do we realize in a general way??
+// Ensure t holds data. Leaves are no-ops. Op nodes lower to UOps, fuse ewise
+// chains, and run. debug_level >= 2 logs each kernel; >= 3 prints the graph
+// first; >= 1 step summary.
 realize :: proc(t: ^Tensor) -> ^Tensor {
 	if t == nil || is_realized(t) do return t
-
-	topo: [dynamic]^Tensor = make([dynamic]^Tensor, 0)
-	visited: map[^Tensor]bool
-	defer delete(topo)
-	defer delete(visited)
-	topo_sort(t, &topo, &visited)
 
 	if debug_level >= 3 {
 		print_graph(t, "realize")
@@ -61,46 +48,13 @@ realize :: proc(t: ^Tensor) -> ^Tensor {
 	step_start: time.Tick
 	if debug_level >= 1 do step_start = time.tick_now()
 
-	k := 0
-	for node in topo {
-		if node.ctx == nil do continue // leaf — already has data
-		if node.data != nil do continue // already realized (shared subgraph)
-		for p in node.ctx.parents {
-			assert(is_realized(p), "realize: parent not realized")
-		}
-		n := numel(node.shape[:])
-		// Movement ops (Reshape/Transpose) are views — no buffer alloc.
-		is_view := node.ctx.op == .Reshape || node.ctx.op == .Transpose
-		nbytes: i64 = 0
-		if !is_view {
-			nbytes = i64(n) * size_of(f32)
-			node.data = make([]f32, n)
-			counters.bytes_alloc += nbytes
-		}
+	k0 := counters.kernels
+	memo: map[^Tensor]^UOp
+	defer delete(memo)
+	root := lower_tensor(t, &memo)
+	execute_uop_graph(root)
 
-		t0: time.Tick
-		if debug_level >= 2 do t0 = time.tick_now()
-		// CrossEntropy softmax cache is an extra buffer
-		if node.ctx.op == .CrossEntropy && node.ctx.cache != nil && node.ctx.cache.data == nil {
-			cn := numel(node.ctx.cache.shape[:])
-			counters.bytes_alloc += i64(cn) * size_of(f32)
-		}
-		forward_op(node)
-		if debug_level >= 2 {
-			dt_ns := i64(time.tick_since(t0))
-			counters.time_ns += dt_ns
-			tag := is_view ? "view" : (node.device == .Metal ? "Metal" : "CPU")
-			fmt.printfln(
-				"  fwd %3d %-14s shape=%v  %6.1f KB  %7.3f ms  %s",
-				k, op_name(node.ctx.op), node.shape,
-				f64(nbytes) / 1024.0,
-				f64(dt_ns) / 1e6,
-				tag,
-			)
-		}
-		counters.kernels += 1
-		k += 1
-	}
+	k := counters.kernels - k0
 	counters.nodes += k
 
 	if debug_level == 1 {
@@ -108,6 +62,45 @@ realize :: proc(t: ^Tensor) -> ^Tensor {
 		fmt.printfln("  realize: %d kernels  %.3f ms", k, ms)
 	}
 	return t
+}
+
+// Run one Tensor node with the existing kernel (heavy ops, views, unfused ewise).
+realize_one :: proc(t: ^Tensor) {
+	if t == nil || is_realized(t) do return
+	assert(t.ctx != nil)
+	for p in t.ctx.parents {
+		assert(is_realized(p), "realize_one: parent not realized")
+	}
+	n := numel(t.shape[:])
+	is_view := t.ctx.op == .Reshape || t.ctx.op == .Transpose
+	nbytes: i64 = 0
+	if !is_view && t.data == nil {
+		nbytes = i64(n) * size_of(f32)
+		t.data = make([]f32, n)
+		counters.bytes_alloc += nbytes
+	}
+	if t.ctx.op == .CrossEntropy && t.ctx.cache != nil && t.ctx.cache.data == nil {
+		cn := numel(t.ctx.cache.shape[:])
+		counters.bytes_alloc += i64(cn) * size_of(f32)
+	}
+
+	t0: time.Tick
+	if debug_level >= 2 do t0 = time.tick_now()
+	forward_op(t)
+	t.done = true
+	if debug_level >= 2 {
+		dt_ns := i64(time.tick_since(t0))
+		counters.time_ns += dt_ns
+		tag := is_view ? "view" : (t.device == .Metal ? "Metal" : "CPU")
+		fmt.printfln(
+			"  fwd     %-14s shape=%v  %6.1f KB  %7.3f ms  %s",
+			op_name(t.ctx.op), t.shape,
+			f64(nbytes) / 1024.0,
+			f64(dt_ns) / 1e6,
+			tag,
+		)
+	}
+	if !is_view do counters.kernels += 1
 }
 
 // Read a scalar after realizing (handy for loss logging).
@@ -118,7 +111,6 @@ item :: proc(t: ^Tensor) -> f32 {
 }
 
 // Run the forward kernel for one already-allocated op node.
-// NOTE: this has to be done better, we cannot rely on enumerating all these cases??
 forward_op :: proc(out: ^Tensor) {
 	ctx := out.ctx
 	assert(ctx != nil)

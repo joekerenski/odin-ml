@@ -22,11 +22,12 @@ import "core:strconv"
 debug_level: int = 0
 
 Counters :: struct {
-	kernels:     int, // forward kernels run
+	kernels:     int, // forward kernel launches (fused group = 1; views = 0)
 	bwd_ops:     int, // backward_op dispatches
 	bytes_alloc: i64, // output buffers allocated in realize
 	time_ns:     i64, // sum of timed kernel / bwd wall time
 	nodes:       int, // op nodes seen in last print_graph / realize topo
+	fused_ops:   int, // extra ewise ops absorbed into fused kernels (n-1 per group)
 }
 
 counters: Counters
@@ -39,8 +40,8 @@ counters_print :: proc(label := "step") {
 	ms := f64(counters.time_ns) / 1e6
 	kb := f64(counters.bytes_alloc) / 1024.0
 	fmt.printfln(
-		"  [%s] kernels=%d bwd=%d alloc=%.1f KB time=%.3f ms nodes=%d",
-		label, counters.kernels, counters.bwd_ops, kb, ms, counters.nodes,
+		"  [%s] kernels=%d fused=%d bwd=%d alloc=%.1f KB time=%.3f ms nodes=%d",
+		label, counters.kernels, counters.fused_ops, counters.bwd_ops, kb, ms, counters.nodes,
 	)
 }
 

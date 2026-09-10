@@ -274,11 +274,11 @@ backward_op :: proc(out: ^Tensor) {
 		accum_grad(p[0], ga, p[0].shape[:])
 
 	case .ReLU:
-		a := p[0]
-		ad := contig_data(a)
+		// Use output: ReLU(x)>0 iff x>0, so we don't need the parent buffer.
+		od := contig_data(out)
 		ga := make([]f32, len(g))
-		for i in 0..<len(g) do ga[i] = ad[i] > 0 ? g[i] : 0.0
-		accum_grad(a, ga, a.shape[:])
+		for i in 0..<len(g) do ga[i] = od[i] > 0 ? g[i] : 0.0
+		accum_grad(p[0], ga, out.shape[:])
 
 	case .Sigmoid:
 		// out may be contig (sigmoid always writes dense out)

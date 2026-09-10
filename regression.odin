@@ -12,9 +12,9 @@ package main
 //
 // ARENA PATTERN: each training step builds a forward+backward graph inside a
 // Dynamic_Arena. After reading the loss and applying gradients, we call
-// dynamic_arena_free_all to reclaim everything at once. Parameters (w, b) live
-// in the persistent allocator and survive across steps; we nil their .grad
-// pointers after free_all since that memory was just reclaimed.
+// dynamic_arena_reset to reclaim everything at once (blocks stay warm).
+// Parameters (w, b) live in the persistent allocator and survive across steps;
+// we nil their .grad pointers after reset since that memory was just reclaimed.
 // ============================================================================
 
 import "core:fmt"
@@ -95,7 +95,7 @@ main :: proc() {
 
 		// --- restore allocator and reclaim the whole graph ---
 		context.allocator = old_alloc
-		mem.dynamic_arena_free_all(&arena)
+		mem.dynamic_arena_reset(&arena)
 		ml.clear_grads(w, b)  // nil out dangling grad pointers
 
 		if epoch % 30 == 0 || epoch == epochs - 1 {

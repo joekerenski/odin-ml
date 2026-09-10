@@ -66,9 +66,10 @@ trainer_backward_step :: proc(tr: ^Trainer, loss: ^Tensor) -> f32 {
 	return v
 }
 
-// free_all arena + nil dangling param grads. Call after restoring heap allocator.
+// Reset arena (keep warm blocks) + nil dangling param grads.
+// Call after restoring the heap allocator.
 trainer_reclaim :: proc(tr: ^Trainer) {
-	mem.dynamic_arena_free_all(&tr.arena)
+	mem.dynamic_arena_reset(&tr.arena)
 	clear_grad_list(tr.params)
 }
 

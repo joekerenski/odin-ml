@@ -29,6 +29,7 @@ uv.lock
 *.dSYM/
 mnist/main
 mnist/mnist
+tok/tok
 /main
 /regression
 /tensor_ops/tensor_ops
