@@ -5,14 +5,14 @@ package main
 // shape ops, matmul, activations, and a tiny SIMD kernel check.
 //
 // Run from repo root:
-//   odin run tensor_ops
+//   odin run tests/tensor_ops
 // ============================================================================
 
 import "core:fmt"
 import "core:simd"
 import "core:time"
 import "core:math"
-import ml "../ml"
+import ml "../../ml"
 
 failed: int
 passed: int
@@ -62,6 +62,7 @@ main :: proc() {
 	test_cross_entropy()
 	test_views()
 	test_uop()
+	test_grad_rules()
 	test_fusion()
 
 	fmt.println()
@@ -76,8 +77,7 @@ test_create_and_shape :: proc() {
 	z := ml.zeros({2, 3})
 	expect(len(z.data) == 6, "zeros numel")
 	expect(z.shape[0] == 2 && z.shape[1] == 3, "zeros shape")
-	expect(ml.is_contiguous(z), "zeros contiguous")
-	expect(z.strides[0] == 3 && z.strides[1] == 1, "zeros strides row-major")
+	expect(z.op == .Input && z.data != nil, "zeros is a realized Input leaf")
 
 	o := ml.ones({4})
 	expect(o.data[0] == 1 && o.data[3] == 1, "ones fill")
@@ -99,7 +99,7 @@ test_from_data_roundtrip :: proc() {
 
 	owned := ml.from_data_copy({10, 20, 30}, {3})
 	expect(owned.data[0] == 10 && owned.data[2] == 30, "from_data_copy values")
-	expect(ml.is_contiguous(owned), "from_data_copy contiguous")
+	expect(owned.op == .Input && raw_data(owned.data) != nil, "from_data_copy is an Input leaf")
 }
 
 test_elementwise_same_shape :: proc() {
@@ -206,48 +206,32 @@ test_matmul :: proc() {
 	expect_close(y, ml.from_data_copy({12, 34, 56}, {3, 1}), "matmul [3,2]@[2,1]")
 }
 
-// Kernel path vs explicit scalar: same result.
+// Fused kernel (SIMD body + scalar tail) vs explicit scalar math.
 test_simd_kernels_match_scalar :: proc() {
-	fmt.println("-- simd kernels == scalar --")
+	fmt.println("-- fused kernel simd == scalar --")
 	n := 17 // not a multiple of 4 → exercises the tail
 	a := make([]f32, n)
 	b := make([]f32, n)
-	out_simd := make([]f32, n)
-	out_scalar := make([]f32, n)
 	for i in 0..<n {
 		a[i] = f32(i) * 0.5 - 3
 		b[i] = f32(i) * 0.25 + 1
 	}
-
-	ml.add_f32_contiguous(out_simd, a, b)
-	for i in 0..<n do out_scalar[i] = a[i] + b[i]
-	ok := true
-	for i in 0..<n {
-		d := out_simd[i] - out_scalar[i]
-		if d < 0 do d = -d
-		if d > 1e-6 do ok = false
+	ta := ml.from_data(a, {i32(n)})
+	tb := ml.from_data(b, {i32(n)})
+	check :: proc(t: ^ml.Tensor, want: []f32) -> bool {
+		ml.realize(t)
+		for i in 0..<len(want) do if abs(t.data[i] - want[i]) > 1e-6 do return false
+		return true
 	}
-	expect(ok, "add_f32_contiguous matches scalar (n=17)")
-
-	ml.mul_f32_contiguous(out_simd, a, b)
-	for i in 0..<n do out_scalar[i] = a[i] * b[i]
-	ok = true
-	for i in 0..<n {
-		d := out_simd[i] - out_scalar[i]
-		if d < 0 do d = -d
-		if d > 1e-6 do ok = false
-	}
-	expect(ok, "mul_f32_contiguous matches scalar (n=17)")
-
-	ml.relu_f32_contiguous(out_simd, a)
-	for i in 0..<n do out_scalar[i] = a[i] > 0 ? a[i] : 0
-	ok = true
-	for i in 0..<n {
-		d := out_simd[i] - out_scalar[i]
-		if d < 0 do d = -d
-		if d > 1e-6 do ok = false
-	}
-	expect(ok, "relu_f32_contiguous matches scalar (n=17)")
+	want := make([]f32, n)
+	for i in 0..<n do want[i] = a[i] + b[i]
+	expect(check(ml.add(ta, tb), want), "fused add matches scalar (n=17)")
+	for i in 0..<n do want[i] = a[i] * b[i]
+	expect(check(ml.mul(ta, tb), want), "fused mul matches scalar (n=17)")
+	for i in 0..<n do want[i] = a[i] > 0 ? a[i] : 0
+	expect(check(ml.relu(ta), want), "fused relu matches scalar (n=17)")
+	for i in 0..<n do want[i] = a[i] < b[i] ? 1 : 0
+	expect(check(ml.cmplt(ta, tb), want), "fused cmplt matches scalar (n=17)")
 }
 
 test_chained :: proc() {
@@ -641,71 +625,92 @@ test_cross_entropy :: proc() {
 	expect(logits.grad.data[1] < 0 && logits.grad.data[4] < 0, "CE grad negative on true class")
 }
 
-// Reshape/Transpose are views (share storage); matmul densifies as needed.
+// Reshape is a view (same buffer). Permute realizes dense, or folds into GEMM.
 test_views :: proc() {
 	fmt.println("-- views (reshape/transpose) --")
 	a := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
 	r := ml.reshape(a, {3, 2})
+	ml.counters_reset()
 	ml.realize(r)
 	expect(raw_data(r.data) == raw_data(a.data), "reshape shares storage")
-	expect(ml.is_contiguous(r), "reshape of contig stays contig")
+	expect(ml.counters.kernels == 0, "reshape runs no kernel")
 	expect_close(r, ml.from_data_copy({1, 2, 3, 4, 5, 6}, {3, 2}), "reshape values")
 
 	t := ml.transpose(a, 0, 1) // [3,2]
 	ml.realize(t)
-	expect(raw_data(t.data) == raw_data(a.data), "transpose shares storage")
-	expect(!ml.is_contiguous(t), "transpose is non-contig")
 	// dense values of T: [[1,4],[2,5],[3,6]]
 	expect_close(t, ml.from_data_copy({1, 4, 2, 5, 3, 6}, {3, 2}), "transpose values")
 
-	// matmul with transposed right factor densifies under the hood
-	// a [2,3] @ t[3,2] but t is view of a^T... a @ a.T → [2,2]
-	aT := ml.T(a)
-	y := ml.matmul(a, aT)
-	// a @ a.T = [[1+4+9, 4+10+18],[4+10+18, 16+25+36]] = [[14,32],[32,77]]
-	expect_close(y, ml.from_data_copy({14, 32, 32, 77}, {2, 2}), "matmul with T view")
+	// a @ a.T: the transpose folds into the GEMM (no permute kernel)
+	ml.counters_reset()
+	y := ml.matmul(a, ml.T(a))
+	ml.realize(y)
+	expect(ml.counters.kernels == 1, "T folds into matmul (1 kernel)")
+	// [[1+4+9, 4+10+18],[4+10+18, 16+25+36]] = [[14,32],[32,77]]
+	expect_close(y, ml.from_data_copy({14, 32, 32, 77}, {2, 2}), "matmul with folded T")
+	y2 := ml.matmul(ml.T(a), a) // [3,3]
+	expect_close(y2, ml.from_data_copy({17, 22, 27, 22, 29, 36, 27, 36, 45}, {3, 3}), "matmul with folded T on A")
 
-	// grad through transpose view
+	// 3D permute
+	p := ml.permute(ml.from_data_copy({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, {2, 3, 2}), {2, 0, 1})
+	expect(p.shape[0] == 2 && p.shape[1] == 2 && p.shape[2] == 3, "permute shape")
+	expect_close(p, ml.from_data_copy({0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11}, {2, 2, 3}), "permute values")
+
+	// grad through transpose
 	x := ml.from_data_copy({1, 2, 3, 4}, {2, 2}, requires_grad = true)
-	xt := ml.T(x)
-	loss := ml.sum(xt, -1)
+	loss := ml.sum(ml.mul(ml.T(x), ml.from_data_copy({1, 2, 3, 4}, {2, 2})), -1)
 	ml.backward(loss)
-	// dL/dx = ones (transpose of ones)
-	expect_close(x.grad, ml.from_data_copy({1, 1, 1, 1}, {2, 2}), "grad through T")
+	// d/dx sum(x^T * c) = c^T
+	expect_close(x.grad, ml.from_data_copy({1, 3, 2, 4}, {2, 2}), "grad through T")
 }
 
+// A Tensor IS a UOp: ops build graph nodes, compositions are visible.
 test_uop :: proc() {
-	fmt.println("-- uop --")
-	a := ml.from_data_copy({1, 2, 3, 4}, {2, 2})
-	b := ml.from_data_copy({5, 6, 7, 8}, {2, 2})
-	ua := ml.uop_input(a.data, a.shape[:])
-	ub := ml.uop_input(b.data, b.shape[:])
+	fmt.println("-- uop graph --")
+	x := ml.from_data_copy({-1, 2, -3, 4}, {4})
+	r := ml.relu(x)
+	expect(r.op == .Max && r.src[0] == x && r.src[1].op == .Const, "relu = Max(x, Const 0)")
+	s := ml.sigmoid(x)
+	expect(s.op == .Div && s.src[1].op == .Add && s.src[1].src[1].op == .Exp, "sigmoid = 1/(1+exp(-x))")
+	expect(r.data == nil, "ops are lazy")
+	expect_close(r, ml.from_data_copy({0, 2, 0, 4}, {4}), "relu values")
 
-	uc := ml.uop_realize(ml.uop_add(ua, ub))
-	expect_close(ml.from_data_copy(uc.data, uc.shape[:]), ml.add(a, b), "uop add == ml.add")
+	m := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
+	e := ml.expand(ml.from_data_copy({10, 20}, {2, 1}), {2, 3})
+	expect_close(e, ml.from_data_copy({10, 10, 10, 20, 20, 20}, {2, 3}), "expand [2,1]→[2,3]")
+	s01 := ml.sum_axes(ml.reshape(m, {1, 2, 3}), {0, 2})
+	expect(s01.shape[0] == 1 && s01.shape[1] == 2 && s01.shape[2] == 1, "sum_axes keeps dims")
+	expect_close(s01, ml.from_data_copy({6, 15}, {1, 2, 1}), "sum_axes values")
+	c := ml.sum_axes(ml.from_data_copy({1, 2, 3, 4, 5, 6, 7, 8}, {2, 2, 2, 1}), {0, 2})
+	expect_close(c, ml.from_data_copy({1 + 2 + 5 + 6, 3 + 4 + 7 + 8}, {1, 2, 1, 1}), "sum_axes non-adjacent")
+}
 
-	um := ml.uop_realize(ml.uop_mul(ua, ub))
-	expect_close(ml.from_data_copy(um.data, um.shape[:]), ml.mul(a, b), "uop mul == ml.mul")
+// Grad rules of the newer ops, checked against closed forms.
+test_grad_rules :: proc() {
+	fmt.println("-- grad rules --")
+	a := ml.from_data_copy({1, -2, 3, 0.5}, {4}, requires_grad = true)
+	b := ml.from_data_copy({0, 0, 5, 0.5}, {4}, requires_grad = true)
+	ml.backward(ml.sum(ml.maximum(a, b), -1))
+	expect_close(a.grad, ml.from_data_copy({1, 0, 0, 0}, {4}), "max dA (ties → b)")
+	expect_close(b.grad, ml.from_data_copy({0, 1, 1, 1}, {4}), "max dB")
 
-	row := ml.uop_input({10, 100, 1000}, {3})
-	A := ml.uop_input({1, 2, 3, 4, 5, 6}, {2, 3})
-	br := ml.uop_realize(ml.uop_mul(A, row))
-	expect_close(ml.from_data_copy(br.data, br.shape[:]), ml.mul(
-		ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3}),
-		ml.from_data_copy({10, 100, 1000}, {3}),
-	), "uop mul broadcast [2,3]*[3]")
+	x := ml.from_data_copy({0, 1, -1}, {3}, requires_grad = true)
+	ml.backward(ml.sum(ml.exp(x), -1))
+	expect_close(x.grad, ml.from_data_copy({1, math.E, 1 / math.E}, {3}), "exp grad = exp(x)")
 
-	ur := ml.uop_realize(ml.uop_reshape(ua, {4}))
-	expect(raw_data(ur.data) == raw_data(ua.data), "uop reshape shares storage")
-	expect(ur.shape[0] == 4, "uop reshape shape")
+	m := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3}, requires_grad = true)
+	v := ml.from_data_copy({1, 1, 1}, {3}, requires_grad = true)
+	ml.backward(ml.sum(ml.mul(ml.sub(m, v), ml.from_data_copy({1, 2}, {2, 1})), -1))
+	expect_close(m.grad, ml.from_data_copy({1, 1, 1, 2, 2, 2}, {2, 3}), "sub/mul broadcast dM")
+	expect_close(v.grad, ml.from_data_copy({-3, -3, -3}, {3}), "sub broadcast dV (unbroadcast)")
 
-	umm := ml.uop_realize(ml.uop_matmul(ua, ub))
-	expect(umm.shape[0] == 2 && umm.shape[1] == 2, "uop matmul shape")
-	expect_close(ml.from_data_copy(umm.data, umm.shape[:]), ml.matmul(a, b), "uop matmul == ml.matmul")
-	expect_close(ml.from_data_copy(umm.data, umm.shape[:]), ml.from_data_copy({19, 22, 43, 50}, {2, 2}), "uop matmul golden")
-
-	us := ml.uop_realize(ml.uop_sum(ua, -1))
-	expect(us.data[0] == 10, "uop sum all")
+	// grads accumulate across backward calls until cleared
+	w := ml.from_data_copy({2}, {1}, requires_grad = true)
+	ml.backward(ml.mul(w, ml.scalar(3)))
+	ml.backward(ml.mul(w, ml.scalar(3)))
+	expect_close(w.grad, ml.from_data_copy({6}, {1}), "grads accumulate")
+	ml.clear_grads(w)
+	expect(w.grad == nil, "clear_grads")
 }
 
 test_fusion :: proc() {
@@ -739,6 +744,14 @@ test_fusion :: proc() {
 	// 1/(1+e^0)=0.5, 1/(1+e^-1)≈0.731, 1/(1+e^1)≈0.269
 	expect(s.data[0] > 0.49 && s.data[0] < 0.51, "sigmoid(0)≈0.5")
 	expect(s.data[1] > s.data[0] && s.data[0] > s.data[2], "sigmoid monotonic")
+
+	// Longer than one fused kernel's budget (16 insns / 8 inputs): still correct
+	v := ml.from_data_copy({1, 2, 3, 4, 5}, {5})
+	acc := v
+	for i in 0 ..< 20 do acc = ml.add(acc, ml.from_data_copy({1, 1, 1, 1, 1}, {5}))
+	ml.counters_reset()
+	expect_close(acc, ml.from_data_copy({21, 22, 23, 24, 25}, {5}), "20-op chain past fused budget")
+	expect(ml.counters.kernels == 20, "over-budget group runs op by op")
 
 	// Elided Add still receives grad: relu(a+b) all positive → da=db=1
 	ga := ml.from_data_copy({1, -2, 3, -4}, {2, 2}, requires_grad = true)

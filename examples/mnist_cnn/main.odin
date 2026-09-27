@@ -3,12 +3,12 @@ package main
 // ============================================================================
 // MNIST CNN — tiny LeNet-ish stack to exercise Conv2d + MaxPool + Linear.
 //
-//   odin run mnist_cnn -o:speed
-//   ML_DEBUG=2 odin run mnist_cnn -o:speed
+//   odin run examples/mnist_cnn -o:speed
+//   ML_DEBUG=2 odin run examples/mnist_cnn -o:speed
 // ============================================================================
 
 import "core:fmt"
-import ml "../ml"
+import ml "../../ml"
 
 c1: ml.Conv2d
 c2: ml.Conv2d

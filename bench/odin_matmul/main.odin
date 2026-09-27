@@ -129,33 +129,32 @@ bench_matmul :: proc(M, K, N: i32, repeats: int, warmup: int, batch: int = 1) ->
 bench_elem :: proc(n: int, op: string, repeats: int, warmup: int) -> Bench_Result {
 	a := make([]f32, n)
 	b := make([]f32, n)
-	out := make([]f32, n)
 	defer delete(a)
 	defer delete(b)
-	defer delete(out)
 	fill_rand(a, 3)
 	fill_rand(b, 4)
+	ta := ml.from_data(a, {i32(n)})
+	tb := ml.from_data(b, {i32(n)})
 
-	run :: proc(op: string, out, a, b: []f32) {
-		switch op {
-		case "add":
-			ml.add_f32_contiguous(out, a, b)
-		case "mul":
-			ml.mul_f32_contiguous(out, a, b)
-		}
+	// The library path: build the node, realize (alloc + fused SIMD kernel).
+	run :: proc(op: string, ta, tb: ^ml.Tensor) -> f32 {
+		t := op == "add" ? ml.add(ta, tb) : ml.mul(ta, tb)
+		ml.realize(t)
+		v := t.data[0]
+		delete(t.data)
+		free(t)
+		return v
 	}
 
-	for _ in 0..<warmup do run(op, out, a, b)
-	sink := out[0]
+	sink: f32 = 0
+	for _ in 0..<warmup do sink += run(op, ta, tb)
 
 	times := make([]f64, repeats)
 	defer delete(times)
 	for r in 0..<repeats {
 		t0 := time.tick_now()
-		run(op, out, a, b)
-		dt := time.duration_seconds(time.tick_since(t0))
-		times[r] = dt
-		sink += out[0]
+		sink += run(op, ta, tb)
+		times[r] = time.duration_seconds(time.tick_since(t0))
 	}
 	sort_f64(times)
 	best := times[0]

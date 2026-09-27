@@ -39,17 +39,16 @@ cd odin_matrix && sh build_asm.sh   # writes study.s + study_ir/, greps study pr
 |----|----------|-------|
 | `matmul` large | **Accelerate** `cblas_sgemm` (default on Darwin) | Same BLAS NumPy uses |
 | `matmul` | Pure tiled `#simd` (4×8 microkernel) | Educational; ~3–8% of Accel |
-| `add`/`mul` same-shape | Pure portable SIMD | ~40–50% of NumPy (allocation-bound) |
-| `add`/`mul` broadcast | Scalar / row / col SIMD kernels | ~2–45% of NumPy |
+| `add`/`mul` same-shape | Fused ewise kernel, single-op SIMD path | allocation-bound |
+| `add`/`mul` broadcast | Fused ewise kernel, row / col / block loads | allocation-bound |
 
 ## Why broadcast looks slow
 
 The Odin broadcast bench **runs `ml.add(a, b)` per iteration**, which includes:
 
-- `make([]f32, numel)` for the output tensor
-- `new(Tensor)` for the autograd context
-- `make([dynamic]^Tensor)` for parents list
-- Then runs the SIMD kernel
+- `new(UOp)` + shape/src slices for the graph node
+- `make([]f32, numel)` for the output buffer
+- Then runs the fused SIMD kernel
 
 For a 128 MB output (the 3D case), this allocator round-trip costs more than the kernel itself. NumPy uses pre-allocated scratch buffers + memory pools; it doesn't re-allocate per op.
 
@@ -58,9 +57,9 @@ This is the **eager-vs-lazy** issue you flagged in your lessons. A lazy tensor t
 ## Files
 
 - `numpy_bench.py` / `numpy_bench_bcast.py` — NumPy timings
-- `odin_matmul/` — matmul + elementwise kernels
-- `odin_matmul_bcast/` — broadcast SIMD kernels (scalar/row/col)
-- `odin_matrix/` — **native `matrix[M,N]T` vs our #simd kernels**, plus an
+- `odin_matmul/` — matmul kernels + elementwise via `ml.add`/`ml.mul` + realize
+- `odin_matmul_bcast/` — broadcast adds (scalar/row/col) through the graph
+- `odin_matrix/` — **native `matrix[M,N]T` vs plain loops vs explicit #simd**, plus an
   asm / LLVM-IR study (`build_asm.sh`) showing what the compiler emits
 - `compare.py` — matmul gate
 - `compare_bcast.py` — broadcast gate

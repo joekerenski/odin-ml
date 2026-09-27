@@ -1,225 +1,126 @@
 package ml
 
 // ============================================================================
-// Contiguous f32 kernels.
-//
-// Portable Odin #simd vectors (`#simd[4]f32`) lower to ARM NEON on Apple
-// Silicon (and SSE/AVX on x86). This is the right first step — write portable
-// SIMD, measure, only drop to core:simd/arm/neon if you need instructions the
-// portable layer does not expose.
-//
-// Scope today:
-//   - same-length contiguous elementwise add/mul (the bulk of tensor math)
-//   - scalar tail for leftovers
-//
-// Broadcast, strided, and matmul microkernels come later.
+// CPU kernels for non-fused primitives: reduce, permute, cross-entropy.
+// All buffers dense row-major. Elementwise math lives in fuse.odin.
 // ============================================================================
 
-import "base:intrinsics"
-import "core:simd"
+import "core:math"
 
-// Contiguous out[i] = a[i] + b[i] for len(a) == len(b) == len(out).
-add_f32_contiguous :: proc(out, a, b: []f32) {
-	assert(len(out) == len(a) && len(a) == len(b))
-	n := len(out)
-	i := 0
-	for i + 4 <= n {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.add(va, vb))
-		i += 4
+// ---- reduce ---------------------------------------------------------------
+
+// dst[o, k] = Σ_r src[o, r, k]   (src viewed as [outer, red, inner])
+reduce_block :: proc(dst, src: []f32, outer, red, inner: int) {
+	for i in 0 ..< outer * inner do dst[i] = 0
+	if inner == 1 {
+		for o in 0 ..< outer {
+			s: f32 = 0
+			for v in src[o * red:(o + 1) * red] do s += v
+			dst[o] = s
+		}
+		return
 	}
-	for ; i < n; i += 1 do out[i] = a[i] + b[i]
-}
-
-// Contiguous out[i] = a[i] * b[i].
-mul_f32_contiguous :: proc(out, a, b: []f32) {
-	assert(len(out) == len(a) && len(a) == len(b))
-	n := len(out)
-	i := 0
-	for i + 4 <= n {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.mul(va, vb))
-		i += 4
-	}
-	for ; i < n; i += 1 do out[i] = a[i] * b[i]
-}
-
-// Contiguous out[i] = a[i] - b[i].
-sub_f32_contiguous :: proc(out, a, b: []f32) {
-	assert(len(out) == len(a) && len(a) == len(b))
-	n := len(out)
-	i := 0
-	for i + 4 <= n {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.sub(va, vb))
-		i += 4
-	}
-	for ; i < n; i += 1 do out[i] = a[i] - b[i]
-}
-
-// Contiguous out[i] = a[i] / b[i].
-div_f32_contiguous :: proc(out, a, b: []f32) {
-	assert(len(out) == len(a) && len(a) == len(b))
-	n := len(out)
-	i := 0
-	for i + 4 <= n {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.div(va, vb))
-		i += 4
-	}
-	for ; i < n; i += 1 do out[i] = a[i] / b[i]
-}
-
-// Contiguous out[i] = -a[i].
-neg_f32_contiguous :: proc(out, a: []f32) {
-	assert(len(out) == len(a))
-	n := len(out)
-	i := 0
-	for i + 4 <= n {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.neg(va))
-		i += 4
-	}
-	for ; i < n; i += 1 do out[i] = -a[i]
-}
-
-// Contiguous out[i] = max(a[i], 0).
-relu_f32_contiguous :: proc(out, a: []f32) {
-	assert(len(out) == len(a))
-	n := len(out)
-	zero: simd.f32x4 = 0
-	i := 0
-	for i + 4 <= n {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.max(va, zero))
-		i += 4
-	}
-	for ; i < n; i += 1 do out[i] = a[i] > 0 ? a[i] : 0
-}
-
-// ============================================================================
-// Broadcast SIMD kernels — fast paths for common NumPy patterns.
-//
-// Why SIMD helps broadcasting: adjacent output elements read adjacent operand
-// elements ONLY when broadcasted dims are outer. These are the most common
-// patterns in ML: bias terms ([M,N]+[N]), row-wise scaling ([M,N]+[M,1] → no,
-// that one's stride access into b; covered by the scalar path), and full
-// scalar broadcasts ([M,N]+[1,1]).
-// ============================================================================
-
-// Pattern A: full scalar broadcast.
-//   out[i] = a[i] + s   (s read once, broadcast in vector)
-// Covers [N]+[1], [M,N]+[1,1], [1]+anything, etc.
-add_scalar_contiguous :: proc(out, a: []f32, s: f32) {
-	n := len(out)
-	sv: simd.f32x4 = s
-	i := 0
-	for ; i + 4 <= n; i += 4 {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.add(va, sv))
-	}
-	for ; i < n; i += 1 do out[i] = a[i] + s
-}
-
-mul_scalar_contiguous :: proc(out, a: []f32, s: f32) {
-	n := len(out)
-	sv: simd.f32x4 = s
-	i := 0
-	for ; i + 4 <= n; i += 4 {
-		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
-		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.mul(va, sv))
-	}
-	for ; i < n; i += 1 do out[i] = a[i] * s
-}
-
-// Pattern B: row broadcast — b is the inner-dim vector, repeats for each outer row.
-//   For each row m:  out[m, 0..N] = a[m, 0..N] + b[0..N]
-// Covers [M,N]+[N], [B,M,N]+[1,N], [M,N]+[1,N], etc.
-// `inner_n` = the matching inner dimension (length of b).
-add_row_broadcast :: proc(out, a, b: []f32, outer_rows: i32, inner_n: i32) {
-	bv_aligned := inner_n % 4 == 0
-	or := int(outer_rows)
-	inn := int(inner_n)
-	for row in 0..<or {
-		a_off := row * inn
-		o_off := a_off
-		if bv_aligned {
-			i := 0
-			for ; i + 4 <= inn; i += 4 {
-				va := intrinsics.unaligned_load((^simd.f32x4)(&a[a_off + i]))
-				vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
-				intrinsics.unaligned_store((^simd.f32x4)(&out[o_off + i]), simd.add(va, vb))
-			}
-			for ; i < inn; i += 1 do out[o_off + i] = a[a_off + i] + b[i]
-		} else {
-			for i in 0..<inn do out[o_off + i] = a[a_off + i] + b[i]
+	for o in 0 ..< outer {
+		d := dst[o * inner:(o + 1) * inner]
+		for r in 0 ..< red {
+			row := src[(o * red + r) * inner:][:inner]
+			for k in 0 ..< inner do d[k] += row[k]
 		}
 	}
 }
 
-mul_row_broadcast :: proc(out, a, b: []f32, outer_rows: i32, inner_n: i32) {
-	bv_aligned := inner_n % 4 == 0
-	or := int(outer_rows)
-	inn := int(inner_n)
-	for row in 0..<or {
-		a_off := row * inn
-		o_off := a_off
-		if bv_aligned {
-			i := 0
-			for ; i + 4 <= inn; i += 4 {
-				va := intrinsics.unaligned_load((^simd.f32x4)(&a[a_off + i]))
-				vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
-				intrinsics.unaligned_store((^simd.f32x4)(&out[o_off + i]), simd.mul(va, vb))
-			}
-			for ; i < inn; i += 1 do out[o_off + i] = a[a_off + i] * b[i]
-		} else {
-			for i in 0..<inn do out[o_off + i] = a[a_off + i] * b[i]
+// Sum over `axes` (kept as size 1). Each maximal run of adjacent reduced axes
+// is one reduce_block pass, rightmost run first.
+sum_kernel :: proc(out, a: []f32, shape: []i32, axes: []i32) {
+	red: [MAX_DIMS]bool
+	for ax in axes do red[ax] = true
+	cur := a
+	cur_shape: [MAX_DIMS]i32
+	copy(cur_shape[:], shape)
+	nd := len(shape)
+
+	d := nd - 1
+	for d >= 0 {
+		if !red[d] || cur_shape[d] == 1 {
+			d -= 1
+			continue
 		}
+		hi := d + 1
+		for d >= 0 && red[d] do d -= 1
+		lo := d + 1
+		outer := int(numel(cur_shape[:lo]))
+		r := int(numel(cur_shape[lo:hi]))
+		inner := int(numel(cur_shape[hi:nd]))
+		for k in lo ..< hi do cur_shape[k] = 1
+		// more runs to the left? reduce into a temp, else straight into out
+		more := false
+		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
+		dst := more ? make([]f32, outer * inner) : out
+		reduce_block(dst, cur, outer, r, inner)
+		cur = dst
+	}
+	if raw_data(cur) != raw_data(out) do copy(out, cur)
+}
+
+// ---- permute --------------------------------------------------------------
+
+// out.shape[i] = shape[order[i]]
+permute_kernel :: proc(out, a: []f32, shape: []i32, order: []i32) {
+	nd := len(shape)
+	if nd == 2 && order[0] == 1 {
+		M, N := int(shape[0]), int(shape[1])
+		for i in 0 ..< M do for j in 0 ..< N do out[j * M + i] = a[i * N + j]
+		return
+	}
+	out_shape, src_stride: [MAX_DIMS]i32
+	for o, i in order {
+		out_shape[i] = shape[o]
+		src_stride[i] = stride_of(shape, int(o))
+	}
+	idx: [MAX_DIMS]i32
+	for f in 0 ..< len(out) {
+		unravel_index(i32(f), out_shape[:nd], idx[:])
+		off: i32 = 0
+		for i in 0 ..< nd do off += idx[i] * src_stride[i]
+		out[f] = a[off]
 	}
 }
 
-add_col_broadcast :: proc(out, a, b: []f32, outer_rows: i32, inner_n: i32) {
-	bv_aligned := inner_n % 4 == 0
-	or := int(outer_rows)
-	inn := int(inner_n)
-	for row in 0..<or {
-		a_off := row * inn
-		o_off := a_off
-		bv: simd.f32x4 = b[row]
-		if bv_aligned {
-			i := 0
-			for ; i + 4 <= inn; i += 4 {
-				va := intrinsics.unaligned_load((^simd.f32x4)(&a[a_off + i]))
-				intrinsics.unaligned_store((^simd.f32x4)(&out[o_off + i]), simd.add(va, bv))
-			}
-			for ; i < inn; i += 1 do out[o_off + i] = a[a_off + i] + b[row]
-		} else {
-			for i in 0..<inn do out[o_off + i] = a[a_off + i] + b[row]
-		}
+// ---- cross-entropy --------------------------------------------------------
+
+// Softmax of one row into p, returns log Σ exp(row).
+softmax_row :: proc(p, row: []f32) -> f32 {
+	m := row[0]
+	for v in row do m = max(m, v)
+	s: f32 = 0
+	for v, c in row {
+		p[c] = math.exp(v - m)
+		s += p[c]
 	}
+	for c in 0 ..< len(p) do p[c] /= s
+	return m + math.ln(s)
 }
 
-mul_col_broadcast :: proc(out, a, b: []f32, outer_rows: i32, inner_n: i32) {
-	bv_aligned := inner_n % 4 == 0
-	or := int(outer_rows)
-	inn := int(inner_n)
-	for row in 0..<or {
-		a_off := row * inn
-		o_off := a_off
-		bv: simd.f32x4 = b[row]
-		if bv_aligned {
-			i := 0
-			for ; i + 4 <= inn; i += 4 {
-				va := intrinsics.unaligned_load((^simd.f32x4)(&a[a_off + i]))
-				intrinsics.unaligned_store((^simd.f32x4)(&out[o_off + i]), simd.mul(va, bv))
-			}
-			for ; i < inn; i += 1 do out[o_off + i] = a[a_off + i] * b[row]
-		} else {
-			for i in 0..<inn do out[o_off + i] = a[a_off + i] * b[row]
-		}
+// mean_b( logsumexp(logits[b]) - logits[b, label_b] )
+cross_entropy_f32 :: proc(logits: []f32, B, C: i32, labels: []u8) -> f32 {
+	p := make([]f32, C)
+	defer delete(p)
+	total: f32 = 0
+	for b in 0 ..< int(B) {
+		row := logits[b * int(C):][:C]
+		total += softmax_row(p, row) - row[labels[b]]
+	}
+	return total / f32(B)
+}
+
+// dlogits = g/B * (softmax - onehot)
+cross_entropy_backward :: proc(dx: []f32, g: f32, logits: []f32, B, C: i32, labels: []u8) {
+	scale := g / f32(B)
+	for b in 0 ..< int(B) {
+		row := logits[b * int(C):][:C]
+		d := dx[b * int(C):][:C]
+		softmax_row(d, row)
+		d[labels[b]] -= 1
+		for c in 0 ..< int(C) do d[c] *= scale
 	}
 }

@@ -10,6 +10,7 @@ when ODIN_OS == .Darwin {
 	// cblas.h enums (partial)
 	CblasRowMajor :: 101
 	CblasNoTrans  :: 111
+	CblasTrans    :: 112
 
 	foreign import accelerate "system:Accelerate.framework"
 
@@ -32,25 +33,24 @@ when ODIN_OS == .Darwin {
 		) ---
 	}
 
-	// C (M×N) = alpha * A(M×K) @ B(K×N) + beta * C
-	// All row-major contiguous.
-	accelerate_sgemm :: proc(C, A, B: []f32, M, K, N: i32, alpha, beta: f32) {
+	// C[M,N] = op(A) @ op(B), row-major. Leading dims are the stored row lengths.
+	accelerate_sgemm :: proc(C, A, B: []f32, M, K, N: i32, trans_a, trans_b: bool) {
 		cblas_sgemm(
 			CblasRowMajor,
-			CblasNoTrans,
-			CblasNoTrans,
+			trans_a ? CblasTrans : CblasNoTrans,
+			trans_b ? CblasTrans : CblasNoTrans,
 			M, N, K,
-			alpha,
-			raw_data(A), K, // lda = K (row-major A is M×K)
-			raw_data(B), N, // ldb = N
-			beta,
-			raw_data(C), N, // ldc = N
+			1,
+			raw_data(A), trans_a ? M : K,
+			raw_data(B), trans_b ? K : N,
+			0,
+			raw_data(C), N,
 		)
 	}
 
 } else {
 
-	accelerate_sgemm :: proc(C, A, B: []f32, M, K, N: i32, alpha, beta: f32) {
+	accelerate_sgemm :: proc(C, A, B: []f32, M, K, N: i32, trans_a, trans_b: bool) {
 		panic("Accelerate only available on Darwin")
 	}
 

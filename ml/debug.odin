@@ -22,9 +22,9 @@ import "core:strconv"
 debug_level: int = 0
 
 Counters :: struct {
-	kernels:     int, // forward kernel launches (fused group = 1; views = 0)
-	bwd_ops:     int, // backward_op dispatches
-	bytes_alloc: i64, // output buffers allocated in realize
+	kernels:     int, // kernel launches (fused group = 1; views = 0)
+	bwd_ops:     int, // grad rules applied by backward()
+	bytes_alloc: i64, // node buffers allocated by realize
 	time_ns:     i64, // sum of timed kernel / bwd wall time
 	nodes:       int, // op nodes seen in last print_graph / realize topo
 	fused_ops:   int, // extra ewise ops absorbed into fused kernels (n-1 per group)
@@ -55,60 +55,34 @@ debug_from_env :: proc() {
 	}
 }
 
-op_name :: proc(op: Op) -> string {
-	switch op {
-	case .Add: return "Add"
-	case .Sub: return "Sub"
-	case .Mul: return "Mul"
-	case .Div: return "Div"
-	case .Neg: return "Neg"
-	case .MatMul: return "MatMul"
-	case .Sum: return "Sum"
-	case .Reshape: return "Reshape"
-	case .Transpose: return "Transpose"
-	case .ReLU: return "ReLU"
-	case .Sigmoid: return "Sigmoid"
-	case .CrossEntropy: return "CrossEntropy"
-	case .Conv2d: return "Conv2d"
-	case .MaxPool2d: return "MaxPool2d"
-	}
-	return "?"
-}
-
-// Print the lazy DAG ending at sink (no execution). Sources-first topo order.
+// Print the DAG ending at sink (no execution). Sources-first topo order.
 print_graph :: proc(sink: ^Tensor, label := "graph") {
-	if sink == nil {
-		fmt.printfln("  [%s] (nil)", label)
-		return
-	}
-	topo: [dynamic]^Tensor
-	visited: map[^Tensor]bool
+	topo: [dynamic]^UOp
+	visited: map[^UOp]bool
 	defer delete(topo)
 	defer delete(visited)
-	topo_sort(sink, &topo, &visited)
+	toposort(sink, &topo, &visited)
 
-	index_of :: proc(topo: []^Tensor, t: ^Tensor) -> int {
-		for n, i in topo do if n == t do return i
-		return -1
-	}
+	index: map[^UOp]int
+	defer delete(index)
+	for u, i in topo do index[u] = i
 
 	op_nodes := 0
-	fmt.printfln("  [%s] %d tensors (sources → sink)", label, len(topo))
-	for node, i in topo {
-		if node.ctx == nil {
-			fmt.printfln("  %3d leaf  %-14s shape=%v  n=%d  data=%v  requires_grad=%v",
-				i, "Leaf", node.shape, numel(node.shape[:]), node.data != nil, node.requires_grad)
-			continue
-		}
-		op_nodes += 1
-		// parent topo indices
-		pids: [8]int
-		np := len(node.ctx.parents)
-		assert(np <= 8)
-		for j in 0..<np do pids[j] = index_of(topo[:], node.ctx.parents[j])
-		fmt.printfln("  %3d op    %-14s shape=%v  <- %v  realized=%v",
-			i, op_name(node.ctx.op), node.shape, pids[:np], node.data != nil)
+	fmt.printfln("  [%s] %d nodes (sources → sink)", label, len(topo))
+	for u, i in topo {
+		srcs: [8]int
+		for x, j in u.src do srcs[j] = index[x]
+		if u.op != .Input && u.op != .Const do op_nodes += 1
+		fmt.printfln("  %3d %-16v shape=%-14s <- %-10s realized=%v grad=%v",
+			i, u.op, fmt.tprint(u.shape), fmt.tprint(srcs[:len(u.src)]), u.data != nil, u.requires_grad)
 	}
 	counters.nodes = op_nodes
-	fmt.printfln("  [%s] %d op nodes", label, op_nodes)
+}
+
+// What realize_all is about to run: unrealized nodes + their fusion group.
+print_schedule :: proc(s: ^Schedule) {
+	fmt.printfln("  [schedule] %d nodes", len(s.topo))
+	for u, i in s.topo {
+		fmt.printfln("  %3d %-16v shape=%v%s", i, u.op, u.shape, u in s.sinks ? "  (sink)" : "")
+	}
 }

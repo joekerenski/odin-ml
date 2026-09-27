@@ -17,7 +17,6 @@ package ml
 // ============================================================================
 
 import "core:fmt"
-import "core:mem"
 import NS "core:sys/darwin/Foundation"
 import MTL "vendor:darwin/Metal"
 
@@ -152,16 +151,17 @@ kernel void elem_add(
 }
 `
 
-// GPU elementwise add: out = a + b (same shape, contiguous). Prototype only.
+// GPU elementwise add: out = a + b (same length). Prototype only — not yet
+// wired into the scheduler; Metal kernels come after the UOp pipeline settles.
 metal_add :: proc(out, a, b: []f32) {
 	if !metal_init() {
-		add_f32_contiguous(out, a, b)
+		for i in 0 ..< len(out) do out[i] = a[i] + b[i]
 		return
 	}
 
 	pipeline := metal_get_kernel(metal_add_source, "elem_add")
 	if pipeline == nil {
-		add_f32_contiguous(out, a, b)
+		for i in 0 ..< len(out) do out[i] = a[i] + b[i]
 		return
 	}
 

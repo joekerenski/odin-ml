@@ -3,12 +3,12 @@ package main
 // ============================================================================
 // MNIST MLP — 784 -> 128 (ReLU) -> 10 (softmax cross-entropy)
 //
-//   odin run mnist -o:speed
-//   ML_DEBUG=2 odin run mnist -o:speed
+//   odin run examples/mnist -o:speed
+//   ML_DEBUG=2 odin run examples/mnist -o:speed
 // ============================================================================
 
 import "core:fmt"
-import ml "../ml"
+import ml "../../ml"
 
 l1: ml.Linear
 l2: ml.Linear

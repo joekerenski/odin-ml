@@ -17,7 +17,8 @@ package main
 import "core:fmt"
 import "core:math/linalg"
 import "core:time"
-import ml "../../ml"
+import "base:intrinsics"
+import "core:simd"
 
 // Largest allowed square matrix: 8x8 = 64 elements.
 Mat :: matrix[8, 8]f32
@@ -42,12 +43,24 @@ plain_mul :: proc(out, a, b: []f32) {
 	for i in 0..<len(out) do out[i] = a[i] * b[i]
 }
 
-// 3. our kernels: explicit f32x4 SIMD
+// 3. explicit f32x4 SIMD (what ml's fused kernel does per vector)
 slice_add :: proc(out, a, b: []f32) {
-	ml.add_f32_contiguous(out, a, b)
+	i := 0
+	for ; i + 4 <= len(out); i += 4 {
+		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
+		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
+		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.add(va, vb))
+	}
+	for ; i < len(out); i += 1 do out[i] = a[i] + b[i]
 }
 slice_mul :: proc(out, a, b: []f32) {
-	ml.mul_f32_contiguous(out, a, b)
+	i := 0
+	for ; i + 4 <= len(out); i += 4 {
+		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
+		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
+		intrinsics.unaligned_store((^simd.f32x4)(&out[i]), simd.mul(va, vb))
+	}
+	for ; i < len(out); i += 1 do out[i] = a[i] * b[i]
 }
 
 // ---- asm / IR study procs (grep these out of study.s / study_ir/.ll) ------
@@ -71,11 +84,11 @@ study_plain_mul :: proc(out, a, b: []f32) {
 }
 @(export)
 study_slice_add :: proc(out, a, b: []f32) {
-	ml.add_f32_contiguous(out, a, b)
+	slice_add(out, a, b)
 }
 @(export)
 study_slice_mul :: proc(out, a, b: []f32) {
-	ml.mul_f32_contiguous(out, a, b)
+	slice_mul(out, a, b)
 }
 
 // ---- helpers -------------------------------------------------------------
@@ -113,13 +126,13 @@ check :: proc() {
 	a_sl := (^[64]f32)(&a)[:]
 	b_sl := (^[64]f32)(&b)[:]
 	c_sl := (^[64]f32)(&c_slice)[:]
-	ml.add_f32_contiguous(c_sl, a_sl, b_sl)
+	slice_add(c_sl, a_sl, b_sl)
 	ok := true
 	for i in 0..<len(a_sl) do if c_sl[i] != (^[64]f32)(&c_mat)[i] do ok = false
 	fmt.println("matrix +  == #simd slice add: ", ok)
 
 	mat_hadamard(&c_mat, &a, &b)
-	ml.mul_f32_contiguous(c_sl, a_sl, b_sl)
+	slice_mul(c_sl, a_sl, b_sl)
 	ok = true
 	for i in 0..<len(a_sl) do if c_sl[i] != (^[64]f32)(&c_mat)[i] do ok = false
 	fmt.println("hadamard == #simd slice mul: ", ok)

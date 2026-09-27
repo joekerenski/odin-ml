@@ -4,10 +4,6 @@ package ml
 // Spatial kernels — Conv2d (im2col + matmul_f32 / Accelerate) + MaxPool2d.
 // ============================================================================
 
-out_spatial :: proc(in_size, k, stride, pad: i32) -> i32 {
-	return (in_size + 2 * pad - k) / stride + 1
-}
-
 // col is [K, P] row-major, K=Ci*kH*kW, P=N*Ho*Wo
 im2col :: proc(
 	col, x: []f32,
@@ -100,20 +96,9 @@ gather_mat_from_nchw :: proc(mat, dout: []f32, N, Co, Ho, Wo: i32) {
 	}
 }
 
-// Transpose row-major A[M,N] → AT[N,M]
-transpose_mn :: proc(AT, A: []f32, M, N: i32) {
-	for i in 0..<M {
-		for j in 0..<N {
-			AT[j * M + i] = A[i * N + j]
-		}
-	}
-}
-
-// out [N,Co,Ho,Wo] = conv(x, w) via im2col + matmul_f32 (Accelerate on Darwin)
-conv2d_f32 :: proc(
-	out, x, w: []f32,
-	N, Ci, H, W, Co, kH, kW, sH, sW, pH, pW: i32,
-) {
+// out [N,Co,Ho,Wo] = conv(x, w) via im2col + GEMM
+conv2d_f32 :: proc(out, x, w: []f32, N, Ci, H, W, Co: i32, win: Window) {
+	kH, kW, sH, sW, pH, pW := win.kH, win.kW, win.sH, win.sW, win.pH, win.pW
 	Ho := out_spatial(H, kH, sH, pH)
 	Wo := out_spatial(W, kW, sW, pW)
 	K := Ci * kH * kW
@@ -128,12 +113,10 @@ conv2d_f32 :: proc(
 	scatter_nchw_from_mat(out, out_mat, N, Co, Ho, Wo)
 }
 
-// dX via W^T @ dout_mat then col2im
-conv2d_backward_input :: proc(
-	dx, dout, w: []f32,
-	N, Ci, H, W, Co, kH, kW, sH, sW, pH, pW: i32,
-) {
-	for i in 0..<len(dx) do dx[i] = 0
+// dx [N,Ci,H,W]: dcol[K,P] = W^T @ dout_mat, then col2im
+conv2d_backward_input :: proc(dx, dout, w: []f32, N, Ci, H, W, Co: i32, win: Window) {
+	kH, kW, sH, sW, pH, pW := win.kH, win.kW, win.sH, win.sW, win.pH, win.pW
+	for i in 0 ..< len(dx) do dx[i] = 0
 	Ho := out_spatial(H, kH, sH, pH)
 	Wo := out_spatial(W, kW, sW, pW)
 	K := Ci * kH * kW
@@ -141,20 +124,14 @@ conv2d_backward_input :: proc(
 
 	dout_mat := make([]f32, Co * P)
 	gather_mat_from_nchw(dout_mat, dout, N, Co, Ho, Wo)
-
-	// dcol[K,P] = W^T[K,Co] @ dout[Co,P]
-	wT := make([]f32, K * Co)
-	transpose_mn(wT, w, Co, K)
 	dcol := make([]f32, K * P)
-	matmul_f32(dcol, wT, dout_mat, K, Co, P)
+	matmul_f32(dcol, w, dout_mat, K, Co, P, trans_a = true)
 	col2im(dx, dcol, N, Ci, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo)
 }
 
-// dW = dout_mat @ col^T
-conv2d_backward_weight :: proc(
-	dw, dout, x: []f32,
-	N, Ci, H, W, Co, kH, kW, sH, sW, pH, pW: i32,
-) {
+// dw [Co,Ci,kH,kW] = dout_mat[Co,P] @ col^T
+conv2d_backward_weight :: proc(dw, dout, x: []f32, N, Ci, H, W, Co: i32, win: Window) {
+	kH, kW, sH, sW, pH, pW := win.kH, win.kW, win.sH, win.sW, win.pH, win.pW
 	Ho := out_spatial(H, kH, sH, pH)
 	Wo := out_spatial(W, kW, sW, pW)
 	K := Ci * kH * kW
@@ -162,69 +139,48 @@ conv2d_backward_weight :: proc(
 
 	col := make([]f32, K * P)
 	im2col(col, x, N, Ci, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo)
-
 	dout_mat := make([]f32, Co * P)
 	gather_mat_from_nchw(dout_mat, dout, N, Co, Ho, Wo)
-
-	// dw[Co,K] = dout[Co,P] @ col^T[P,K]
-	colT := make([]f32, P * K)
-	transpose_mn(colT, col, K, P)
-	matmul_f32(dw, dout_mat, colT, Co, P, K)
+	matmul_f32(dw, dout_mat, col, Co, P, K, trans_b = true)
 }
 
-// out[n,c,h,w] += bias[c]  — fast NCHW channel bias
-bias_add_nchw :: proc(out, bias: []f32, N, C, H, W: i32) {
-	HW := H * W
-	for n in 0..<N {
-		for c in 0..<C {
-			b := bias[c]
-			base := (n * C + c) * HW
-			for i in 0..<HW do out[base + i] += b
-		}
-	}
-}
-
-// MaxPool2d forward; indices[out_i] = flat index into x (same NCHW layout).
-maxpool2d_f32 :: proc(
-	out, x: []f32, indices: []i32,
-	N, C, H, W, kH, kW, sH, sW, pH, pW: i32,
-) {
-	Ho := out_spatial(H, kH, sH, pH)
-	Wo := out_spatial(W, kW, sW, pW)
-	for n in 0..<N {
-		for c in 0..<C {
-			for ho in 0..<Ho {
-				for wo in 0..<Wo {
-					best: f32 = -3.4e38
-					best_idx: i32 = 0
-					in_h0 := ho * sH - pH
-					in_w0 := wo * sW - pW
-					for kh in 0..<kH {
-						ih := in_h0 + kh
-						if ih < 0 || ih >= H do continue
-						for kw in 0..<kW {
-							iw := in_w0 + kw
-							if iw < 0 || iw >= W do continue
-							xi := ((n * C + c) * H + ih) * W + iw
-							v := x[xi]
-							if v > best {
-								best = v
-								best_idx = xi
-							}
-						}
-					}
-					oi := ((n * C + c) * Ho + ho) * Wo + wo
-					out[oi] = best
-					indices[oi] = best_idx
-				}
+// Flat index into x of the max in output window (n,c,ho,wo). First max wins.
+maxpool_argmax :: #force_inline proc(x: []f32, n, c, ho, wo, C, H, W: i32, win: Window) -> i32 {
+	kH, kW, sH, sW, pH, pW := win.kH, win.kW, win.sH, win.sW, win.pH, win.pW
+	best: f32 = -3.4e38
+	best_idx: i32 = 0
+	in_h0 := ho * sH - pH
+	in_w0 := wo * sW - pW
+	for kh in 0 ..< kH {
+		ih := in_h0 + kh
+		if ih < 0 || ih >= H do continue
+		for kw in 0 ..< kW {
+			iw := in_w0 + kw
+			if iw < 0 || iw >= W do continue
+			xi := ((n * C + c) * H + ih) * W + iw
+			if x[xi] > best {
+				best = x[xi]
+				best_idx = xi
 			}
 		}
 	}
+	return best_idx
 }
 
-maxpool2d_backward :: proc(dx, dout: []f32, indices: []i32) {
-	for i in 0..<len(dx) do dx[i] = 0
-	for i in 0..<len(dout) {
-		dx[indices[i]] += dout[i]
+maxpool2d_f32 :: proc(out, x: []f32, N, C, H, W: i32, win: Window) {
+	Ho := out_spatial(H, win.kH, win.sH, win.pH)
+	Wo := out_spatial(W, win.kW, win.sW, win.pW)
+	for n in 0 ..< N do for c in 0 ..< C do for ho in 0 ..< Ho do for wo in 0 ..< Wo {
+		out[((n * C + c) * Ho + ho) * Wo + wo] = x[maxpool_argmax(x, n, c, ho, wo, C, H, W, win)]
+	}
+}
+
+// Route each output grad to its window's argmax (recomputed from x).
+maxpool2d_backward :: proc(dx, dout, x: []f32, N, C, H, W: i32, win: Window) {
+	for i in 0 ..< len(dx) do dx[i] = 0
+	Ho := out_spatial(H, win.kH, win.sH, win.pH)
+	Wo := out_spatial(W, win.kW, win.sW, win.pW)
+	for n in 0 ..< N do for c in 0 ..< C do for ho in 0 ..< Ho do for wo in 0 ..< Wo {
+		dx[maxpool_argmax(x, n, c, ho, wo, C, H, W, win)] += dout[((n * C + c) * Ho + ho) * Wo + wo]
 	}
 }

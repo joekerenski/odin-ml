@@ -1,314 +1,264 @@
 package ml
 
 // ============================================================================
-// Lazy evaluation — build the graph, then realize.
+// realize — schedule and run the UOp graph. The only executor.
 //
-// realize(sink):
-//   1. lower Tensor DAG → UOp DAG (ReLU/Sigmoid are compositions)
-//   2. fuse same-shape ewise chains into one kernel
-//   3. run fused ewise / views / primitives (MatMul, Conv, CE, Sum)
+// realize_all(sinks):
+//   1. topo-sort unrealized nodes (realized nodes are buffers: stop there),
+//   2. fuse: an ewise node joins its ewise src when shapes match and the src
+//      has exactly one consumer → one loop, intermediates never stored,
+//   3. fold: a 2D Permute feeding only MatMuls becomes a GEMM transpose flag,
+//   4. run in topo order: fused groups (fuse.odin), views, primitive kernels.
 //
-// backward() calls realize() first so grads see actual values.
+// A node's .data is kept only if something outside its fused group (or the
+// caller) needs it. Anything elided is simply recomputed if asked for later.
+//
+// debug_level: 1 step summary, 2 one line per kernel, 3 print graph first.
 // ============================================================================
 
 import "core:fmt"
-import "core:math"
 import "core:time"
 
-// A leaf (source) has no ctx and always holds data.
-// An op tensor is realized once its data buffer exists.
-is_realized :: proc(t: ^Tensor) -> bool {
-	if t == nil do return true
-	if t.ctx == nil do return true // leaf
-	return t.data != nil || t.done
-}
-
-// Shape-only tensor: no data yet. Used by ops when building the graph.
-new_tensor_lazy :: proc(shape: []i32, requires_grad := false, device := default_device) -> ^Tensor {
-	assert(len(shape) <= MAX_DIMS, "new_tensor_lazy: too many dims")
-	t := new(Tensor)
-	t.data = nil
-	t.shape = copy_shape(shape)
-	t.strides = compute_strides(t.shape[:])
-	t.requires_grad = requires_grad
-	t.device = device
-	return t
-}
-
-// Ensure t holds data. Leaves are no-ops. Op nodes lower to UOps, fuse ewise
-// chains, and run. debug_level >= 2 logs each kernel; >= 3 prints the graph
-// first; >= 1 step summary.
 realize :: proc(t: ^Tensor) -> ^Tensor {
-	if t == nil || is_realized(t) do return t
-
-	if debug_level >= 3 {
-		print_graph(t, "realize")
-	}
-
-	step_start: time.Tick
-	if debug_level >= 1 do step_start = time.tick_now()
-
-	k0 := counters.kernels
-	memo: map[^Tensor]^UOp
-	defer delete(memo)
-	root := lower_tensor(t, &memo)
-	execute_uop_graph(root)
-
-	k := counters.kernels - k0
-	counters.nodes += k
-
-	if debug_level == 1 {
-		ms := f64(time.tick_since(step_start)) / 1e6
-		fmt.printfln("  realize: %d kernels  %.3f ms", k, ms)
-	}
+	if t.data == nil do realize_all({t})
 	return t
 }
 
-// Run one Tensor node with the existing kernel (heavy ops, views, unfused ewise).
-realize_one :: proc(t: ^Tensor) {
-	if t == nil || is_realized(t) do return
-	assert(t.ctx != nil)
-	for p in t.ctx.parents {
-		assert(is_realized(p), "realize_one: parent not realized")
-	}
-	n := numel(t.shape[:])
-	is_view := t.ctx.op == .Reshape || t.ctx.op == .Transpose
-	nbytes: i64 = 0
-	if !is_view && t.data == nil {
-		nbytes = i64(n) * size_of(f32)
-		t.data = make([]f32, n)
-		counters.bytes_alloc += nbytes
-	}
-	if t.ctx.op == .CrossEntropy && t.ctx.cache != nil && t.ctx.cache.data == nil {
-		cn := numel(t.ctx.cache.shape[:])
-		counters.bytes_alloc += i64(cn) * size_of(f32)
-	}
-
-	t0: time.Tick
-	if debug_level >= 2 do t0 = time.tick_now()
-	forward_op(t)
-	t.done = true
-	if debug_level >= 2 {
-		dt_ns := i64(time.tick_since(t0))
-		counters.time_ns += dt_ns
-		tag := is_view ? "view" : (t.device == .Metal ? "Metal" : "CPU")
-		fmt.printfln(
-			"  fwd     %-14s shape=%v  %6.1f KB  %7.3f ms  %s",
-			op_name(t.ctx.op), t.shape,
-			f64(nbytes) / 1024.0,
-			f64(dt_ns) / 1e6,
-			tag,
-		)
-	}
-	if !is_view do counters.kernels += 1
-}
-
-// Read a scalar after realizing (handy for loss logging).
 item :: proc(t: ^Tensor) -> f32 {
 	realize(t)
-	assert(len(t.data) >= 1, "item: empty tensor")
 	return t.data[0]
 }
 
-// Run the forward kernel for one already-allocated op node.
-forward_op :: proc(out: ^Tensor) {
-	ctx := out.ctx
-	assert(ctx != nil)
-	p := ctx.parents
+Schedule :: struct {
+	topo:        [dynamic]^UOp,
+	consumers:   map[^UOp]int, // distinct unrealized consumers
+	sinks:       map[^UOp]bool,
+	folded:      map[^UOp]bool, // Permutes absorbed into MatMul
+	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
+}
 
-	switch ctx.op {
-	case .Add:
-		a, b := ensure_contig(p[0]), ensure_contig(p[1])
-		cls := classify_binary(a, b, out.shape[:])
-		switch cls.kind {
-		case .Same:
-			if out.device == .Metal {
-				metal_add(out.data, a.data, b.data)
-			} else {
-				add_f32_contiguous(out.data, a.data, b.data)
-			}
-		case .Scalar_B:
-			add_scalar_contiguous(out.data, a.data, b.data[0])
-		case .Scalar_A:
-			add_scalar_contiguous(out.data, b.data, a.data[0])
-		case .Row_B:
-			add_row_broadcast(out.data, a.data, b.data, cls.outer, cls.inner)
-		case .Col_B:
-			add_col_broadcast(out.data, a.data, b.data, cls.outer, cls.inner)
-		case .Col_A:
-			add_col_broadcast(out.data, b.data, a.data, cls.outer, cls.inner)
-		case .NCHW_Bias_B:
-			copy(out.data, a.data)
-			bias_add_nchw(out.data, b.data, a.shape[0], a.shape[1], a.shape[2], a.shape[3])
-		case .NCHW_Bias_A:
-			copy(out.data, b.data)
-			bias_add_nchw(out.data, a.data, b.shape[0], b.shape[1], b.shape[2], b.shape[3])
-		case .Generic:
-			for i in 0..<len(out.data) do out.data[i] = 0
-			broadcast_add_into(out.data, out.shape[:], a.data, a.shape[:])
-			broadcast_add_into(out.data, out.shape[:], b.data, b.shape[:])
+schedule_destroy :: proc(s: ^Schedule) {
+	delete(s.topo)
+	delete(s.consumers)
+	delete(s.sinks)
+	delete(s.folded)
+	delete(s.uf)
+}
+
+// Post-order over unrealized nodes; realized nodes are leaves of the schedule.
+schedule_visit :: proc(s: ^Schedule, u: ^UOp, visited: ^map[^UOp]bool) {
+	if u in visited^ do return
+	visited^[u] = true
+	if u.data != nil do return
+	for x in u.src do schedule_visit(s, x, visited)
+	append(&s.topo, u)
+}
+
+uf_find :: proc(uf: ^map[^UOp]^UOp, x: ^UOp) -> ^UOp {
+	p := uf[x]
+	if p != x {
+		p = uf_find(uf, p)
+		uf[x] = p
+	}
+	return p
+}
+
+is_2d_swap :: proc(u: ^UOp) -> bool {
+	if u.op != .Permute || len(u.shape) != 2 do return false
+	o := u.arg.([]i32)
+	return o[0] == 1 && o[1] == 0
+}
+
+realize_all :: proc(sinks: []^UOp) {
+	s: Schedule
+	defer schedule_destroy(&s)
+
+	visited: map[^UOp]bool
+	defer delete(visited)
+	for u in sinks {
+		schedule_visit(&s, u, &visited)
+		s.sinks[u] = true
+	}
+	if len(s.topo) == 0 do return
+
+	if debug_level >= 3 do print_schedule(&s)
+
+	step_start: time.Tick
+	if debug_level >= 1 do step_start = time.tick_now()
+	k0 := counters.kernels
+
+	// consumers (each consumer counted once per distinct src)
+	matmul_uses: map[^UOp]int
+	defer delete(matmul_uses)
+	for u in s.topo {
+		for x, i in u.src {
+			if x.data != nil do continue
+			dup := false
+			for j in 0 ..< i do if u.src[j] == x do dup = true
+			if dup do continue
+			s.consumers[x] += 1
+			if u.op == .MatMul do matmul_uses[x] += 1
 		}
+	}
 
-	case .Sub:
-		a, b := ensure_contig(p[0]), ensure_contig(p[1])
-		cls := classify_binary(a, b, out.shape[:])
-		switch cls.kind {
-		case .Same:
-			sub_f32_contiguous(out.data, a.data, b.data)
-		case .Scalar_B:
-			add_scalar_contiguous(out.data, a.data, -b.data[0])
-		case .Scalar_A:
-			neg_f32_contiguous(out.data, b.data)
-			add_scalar_contiguous(out.data, out.data, a.data[0])
-		case .Row_B, .Col_B, .Col_A, .NCHW_Bias_B, .NCHW_Bias_A, .Generic:
-			for i in 0..<len(out.data) do out.data[i] = 0
-			broadcast_add_into(out.data, out.shape[:], a.data, a.shape[:])
-			neg_b := make([]f32, len(b.data))
-			for i in 0..<len(b.data) do neg_b[i] = -b.data[i]
-			broadcast_add_into(out.data, out.shape[:], neg_b, b.shape[:])
+	// fold transposes into GEMM
+	for u in s.topo {
+		if is_2d_swap(u) && !(u in s.sinks) && matmul_uses[u] == s.consumers[u] {
+			s.folded[u] = true
 		}
+	}
 
-	case .Mul:
-		a, b := ensure_contig(p[0]), ensure_contig(p[1])
-		cls := classify_binary(a, b, out.shape[:])
-		switch cls.kind {
-		case .Same:
-			mul_f32_contiguous(out.data, a.data, b.data)
-		case .Scalar_B:
-			mul_scalar_contiguous(out.data, a.data, b.data[0])
-		case .Scalar_A:
-			mul_scalar_contiguous(out.data, b.data, a.data[0])
-		case .Row_B:
-			mul_row_broadcast(out.data, a.data, b.data, cls.outer, cls.inner)
-		case .Col_B:
-			mul_col_broadcast(out.data, a.data, b.data, cls.outer, cls.inner)
-		case .Col_A:
-			mul_col_broadcast(out.data, b.data, a.data, cls.outer, cls.inner)
-		case .NCHW_Bias_B, .NCHW_Bias_A, .Generic:
-			mul_broadcast_into(out.data, out.shape[:], a.data, a.shape[:], b.data, b.shape[:])
+	// fusion groups
+	for u in s.topo do if op_is_ewise(u.op) do s.uf[u] = u
+	for u in s.topo {
+		if !op_is_ewise(u.op) do continue
+		for x in u.src {
+			if !(x in s.uf) || s.consumers[x] != 1 do continue
+			if !shapes_equal(x.shape, u.shape) do continue
+			ra, rb := uf_find(&s.uf, x), uf_find(&s.uf, u)
+			if ra != rb do s.uf[ra] = rb
 		}
+	}
 
-	case .Div:
-		a, b := ensure_contig(p[0]), ensure_contig(p[1])
-		if shapes_equal(a.shape[:], b.shape[:]) {
-			div_f32_contiguous(out.data, a.data, b.data)
-		} else if is_scalar_shape(b.shape[:]) {
-			mul_scalar_contiguous(out.data, a.data, 1.0 / b.data[0])
-		} else {
-			div_broadcast_into(out.data, out.shape[:], a.data, a.shape[:], b.data, b.shape[:])
+	// last member (in topo order) of each group runs the group
+	last: map[^UOp]^UOp
+	defer delete(last)
+	for u in s.topo do if u in s.uf do last[uf_find(&s.uf, u)] = u
+
+	group: [dynamic]^UOp
+	defer delete(group)
+	for u in s.topo {
+		if u in s.folded do continue
+		if u in s.uf {
+			root := uf_find(&s.uf, u)
+			if last[root] != u do continue
+			clear(&group)
+			for v in s.topo do if v in s.uf && uf_find(&s.uf, v) == root do append(&group, v)
+			run_group(&s, group[:])
+			continue
 		}
+		run_node(&s, u)
+	}
 
-	case .Neg:
-		neg_f32_contiguous(out.data, contig_data(p[0]))
+	if debug_level == 1 {
+		ms := f64(time.tick_since(step_start)) / 1e6
+		fmt.printfln("  realize: %d kernels  %.3f ms", counters.kernels - k0, ms)
+	}
+}
 
-	case .ReLU:
-		relu_f32_contiguous(out.data, contig_data(p[0]))
-
-	case .Sigmoid:
-		ad := contig_data(p[0])
-		for i in 0..<len(out.data) {
-			out.data[i] = 1.0 / (1.0 + math.exp(-ad[i]))
+// Does anything outside `group` (or the caller) read u?
+needs_store :: proc(s: ^Schedule, u: ^UOp, group: []^UOp) -> bool {
+	if u in s.sinks do return true
+	inside := 0
+	for v in group {
+		for x, i in v.src {
+			if x != u do continue
+			dup := false
+			for j in 0 ..< i do if v.src[j] == x do dup = true
+			if !dup do inside += 1
 		}
+	}
+	return s.consumers[u] > inside
+}
 
+alloc_out :: proc(u: ^UOp) {
+	n := numel(u.shape)
+	u.data = make([]f32, n)
+	counters.bytes_alloc += i64(n) * size_of(f32)
+}
+
+run_group :: proc(s: ^Schedule, group: []^UOp) {
+	stores: [dynamic]^UOp
+	defer delete(stores)
+	for u in group do if needs_store(s, u, group) do append(&stores, u)
+	assert(len(stores) > 0, "fused group has no stores")
+
+	t0: time.Tick
+	if debug_level >= 2 do t0 = time.tick_now()
+
+	if !run_fused(group, stores[:]) {
+		// too big for one kernel: run each node on its own
+		for u in group {
+			single := []^UOp{u}
+			ok := run_fused(single, single)
+			assert(ok)
+			counters.kernels += 1
+		}
+	} else {
+		counters.kernels += 1
+		counters.fused_ops += len(group) - 1
+	}
+
+	if debug_level >= 2 {
+		dt := i64(time.tick_since(t0))
+		counters.time_ns += dt
+		fmt.printf("  kernel  fused[")
+		for u, i in group do fmt.printf("%s%v", i > 0 ? "," : "", u.op)
+		fmt.printfln("] shape=%v  %7.3f ms", group[len(group) - 1].shape, f64(dt) / 1e6)
+	}
+}
+
+// Operand for GEMM: a realized buffer, or a folded transpose of one.
+gemm_operand :: proc(u: ^UOp) -> (data: []f32, trans: bool) {
+	if u.data == nil && is_2d_swap(u) do return u.src[0].data, true
+	return u.data, false
+}
+
+run_node :: proc(s: ^Schedule, u: ^UOp) {
+	for x in u.src do assert(x.data != nil || is_2d_swap(x), "run_node: src not realized")
+
+	t0: time.Tick
+	if debug_level >= 2 do t0 = time.tick_now()
+
+	if u.op == .Reshape {
+		u.data = u.src[0].data // view: same dense buffer
+		return
+	}
+
+	alloc_out(u)
+	#partial switch u.op {
 	case .Sum:
-		a := ensure_contig(p[0])
-		axis := ctx.axis
-		if axis == -1 {
-			s: f32 = 0
-			for v in a.data do s += v
-			out.data[0] = s
-		} else {
-			for i in 0..<len(out.data) do out.data[i] = 0
-			idx_buf: [MAX_DIMS]i32
-			for flat in 0..<len(a.data) {
-				unravel_index(i32(flat), a.shape[:], idx_buf[:])
-				out_idx: i32 = 0
-				for d in 0..<len(a.shape) {
-					v := idx_buf[d]
-					if d == int(axis) do v = 0
-					out_idx += v * stride_of(out.shape[:], d)
-				}
-				out.data[out_idx] += a.data[flat]
-			}
-		}
-
-	case .Reshape:
-		// View when parent is contiguous (same numel → dense strides already set).
-		// Otherwise densify into a fresh buffer.
-		a := p[0]
-		if is_contiguous(a) {
-			out.data = a.data
-			// out.strides already dense from new_tensor_lazy
-		} else {
-			out.data = make([]f32, numel(out.shape[:]))
-			counters.bytes_alloc += i64(len(out.data)) * size_of(f32)
-			materialize_to(out.data, a)
-		}
-
-	case .Transpose:
-		// Zero-copy view: share data, swap strides.
-		a := p[0]
-		out.data = a.data
-		for i in 0..<len(a.strides) do out.strides[i] = a.strides[i]
-		ax0, ax1 := int(ctx.axis), int(ctx.axis1)
-		out.strides[ax0], out.strides[ax1] = out.strides[ax1], out.strides[ax0]
-
+		sum_kernel(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
+	case .Permute:
+		permute_kernel(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
 	case .MatMul:
-		a, b := contig_data(p[0]), contig_data(p[1])
-		M, K, N := p[0].shape[0], p[0].shape[1], p[1].shape[1]
-		matmul_f32(out.data, a, b, M, K, N)
-
-	case .CrossEntropy:
-		logits_t := ensure_contig(p[0])
-		logits := logits_t.data
-		B := p[0].shape[0]
-		C := p[0].shape[1]
-		if ctx.cache == nil {
-			ctx.cache = new_tensor_lazy({B, C})
-		}
-		softmax := ctx.cache
-		if softmax.data == nil {
-			softmax.data = make([]f32, numel(softmax.shape[:]))
-		}
-		for b in 0..<B {
-			row := b * C
-			max_val := logits[row]
-			for c in 1..<C {
-				if logits[row + c] > max_val do max_val = logits[row + c]
-			}
-			sum_exp: f32 = 0
-			for c in 0..<C {
-				e := math.exp(logits[row + c] - max_val)
-				softmax.data[row + c] = e
-				sum_exp += e
-			}
-			inv := 1.0 / sum_exp
-			for c in 0..<C do softmax.data[row + c] *= inv
-		}
-		total: f32 = 0
-		for b in 0..<B {
-			total += -math.ln(softmax.data[b * C + i32(ctx.labels[b])] + 1e-12)
-		}
-		out.data[0] = total / f32(B)
-
+		a, ta := gemm_operand(u.src[0])
+		b, tb := gemm_operand(u.src[1])
+		M, N := u.shape[0], u.shape[1]
+		K := u.src[0].shape[1]
+		matmul_f32(u.data, a, b, M, K, N, ta, tb)
 	case .Conv2d:
-		x, w := contig_data(p[0]), contig_data(p[1])
-		N, Ci, H, W := p[0].shape[0], p[0].shape[1], p[0].shape[2], p[0].shape[3]
-		Co := p[1].shape[0]
-		conv2d_f32(
-			out.data, x, w,
-			N, Ci, H, W, Co, ctx.kH, ctx.kW, ctx.sH, ctx.sW, ctx.pH, ctx.pW,
-		)
-
+		x, w := u.src[0], u.src[1]
+		win := u.arg.(Window)
+		conv2d_f32(u.data, x.data, w.data, x.shape[0], x.shape[1], x.shape[2], x.shape[3], w.shape[0], win)
+	case .Conv2dBwdInput:
+		g, w := u.src[0], u.src[1]
+		win := u.arg.(Window)
+		conv2d_backward_input(u.data, g.data, w.data, u.shape[0], u.shape[1], u.shape[2], u.shape[3], w.shape[0], win)
+	case .Conv2dBwdWeight:
+		g, x := u.src[0], u.src[1]
+		win := u.arg.(Window)
+		conv2d_backward_weight(u.data, g.data, x.data, x.shape[0], x.shape[1], x.shape[2], x.shape[3], u.shape[0], win)
 	case .MaxPool2d:
-		x := contig_data(p[0])
-		N, C, H, W := p[0].shape[0], p[0].shape[1], p[0].shape[2], p[0].shape[3]
-		if ctx.indices == nil {
-			ctx.indices = make([]i32, len(out.data))
-		}
-		maxpool2d_f32(
-			out.data, x, ctx.indices,
-			N, C, H, W, ctx.kH, ctx.kW, ctx.sH, ctx.sW, ctx.pH, ctx.pW,
-		)
+		x := u.src[0]
+		maxpool2d_f32(u.data, x.data, x.shape[0], x.shape[1], x.shape[2], x.shape[3], u.arg.(Window))
+	case .MaxPool2dBwd:
+		g, x := u.src[0], u.src[1]
+		maxpool2d_backward(u.data, g.data, x.data, x.shape[0], x.shape[1], x.shape[2], x.shape[3], u.arg.(Window))
+	case .CrossEntropy:
+		x := u.src[0]
+		u.data[0] = cross_entropy_f32(x.data, x.shape[0], x.shape[1], u.arg.([]u8))
+	case .CrossEntropyBwd:
+		g, x := u.src[0], u.src[1]
+		cross_entropy_backward(u.data, g.data[0], x.data, x.shape[0], x.shape[1], u.arg.([]u8))
+	case:
+		fmt.panicf("run_node: no kernel for %v", u.op)
+	}
+	counters.kernels += 1
+
+	if debug_level >= 2 {
+		dt := i64(time.tick_since(t0))
+		counters.time_ns += dt
+		fmt.printfln("  kernel  %-16v shape=%v  %7.3f ms", u.op, u.shape, f64(dt) / 1e6)
 	}
 }

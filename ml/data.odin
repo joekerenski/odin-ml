@@ -19,7 +19,6 @@ package ml
 // with the persistent allocator (call before setting the per-step arena).
 // ============================================================================
 
-import "core:fmt"
 import "core:math/rand"
 import "core:mem"
 import "core:os"

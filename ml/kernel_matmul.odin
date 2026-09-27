@@ -40,24 +40,31 @@ matmul_get_backend :: proc() -> Matmul_Backend {
 
 // --- public entry ----------------------------------------------------------
 
-// C = A @ B with C zeroed first. All row-major contiguous.
-matmul_f32 :: proc(C, A, B: []f32, M, K, N: i32) {
+// C[M,N] = op(A) @ op(B), C overwritten. op(X) = X^T when trans_*:
+// A stored [M,K] (or [K,M] if trans_a), B stored [K,N] (or [N,K] if trans_b).
+matmul_f32 :: proc(C, A, B: []f32, M, K, N: i32, trans_a := false, trans_b := false) {
 	assert(len(A) >= int(M * K))
 	assert(len(B) >= int(K * N))
 	assert(len(C) >= int(M * N))
 	switch matmul_backend {
 	case .Accelerate:
 		when ODIN_OS == .Darwin {
-			// C := 1*A*B + 0*C
-			accelerate_sgemm(C, A, B, M, K, N, 1, 0)
+			accelerate_sgemm(C, A, B, M, K, N, trans_a, trans_b)
 			return
-		} else {
-			// fall through
 		}
 	case .Pure:
 	}
+	a, b := A, B
+	if trans_a {
+		a = make([]f32, M * K)
+		permute_kernel(a, A, {K, M}, {1, 0})
+	}
+	if trans_b {
+		b = make([]f32, K * N)
+		permute_kernel(b, B, {N, K}, {1, 0})
+	}
 	for i in 0..<int(M * N) do C[i] = 0
-	matmul_f32_accum_pure(C, A, B, M, K, N)
+	matmul_f32_accum_pure(C, a, b, M, K, N)
 }
 
 // ============================================================================

@@ -1,32 +1,61 @@
 Objective
-CPU-first ML library in Odin (tinygrad-inspired): Tensor + UOp IR + autograd.
-Local accelerator: CPU now, Metal/CUDA later. Keep the IR small; compose new ops.
+Small-model training lib in Odin (tinygrad as inspiration + oracle): Tensor → UOp IR → kernels.
+North star: reimplement Distribution Transformers (arXiv 2502.02463) — amortised Bayesian
+inference, prior GMM + observations → posterior GMM, ~0.43M params. Refine the lib on the way.
+UI (odin-ui-v2) comes after the strategy fits.
 
-Stack (have)
-- Tensor: shape/strides, requires_grad, grad, ctx=LazyOp, device
-- Realize: Tensor DAG → UOp → fuse same-shape ewise → kernels
-- ReLU = max(x,0), sigmoid = 1/(1+exp(-x)); MatMul/Conv/CE stay primitives
-- Reverse-mode autograd on Tensor (not UOp)
-- Kernels: SIMD ewise/bcast + fused ewise loop; matmul Accelerate; Conv = im2col+GEMM
-- nn: Linear, Conv2d, collect_params; SGD+mom; Trainer (arena reset per step)
-- data: MNIST IDX, minibatch, eval_accuracy
-- debug: ML_DEBUG, Counters (kernels/fused_ops/alloc), print_graph
-- Tests: tensor_ops 88; tinygrad compare 11; regression; MNIST MLP/CNN ~98%
-- Bench: `odin run bench/loop -o:speed -no-bounds-check -disable-assert`
+Decisions
+- One flow: Tensor (lazy) → UOp DAG → fuse → kernels. No second IR, no sketches.
+- MatMul stays a primitive. No mul+sum → GEMM recovery pass.
+- Performance comes from hand-written kernels per primitive / fused group
+  (Accelerate on CPU now, handwritten Metal once the rest settles), not from a
+  codegen pipeline.
+- ReLU/Sigmoid/softmax/LayerNorm etc. are UOp compositions, not primitives.
 
-Missing
-- Embedding, LayerNorm/BN, Dropout, RNN/GRU, Adam
-- softmax, gather, cat/pad, GELU (as UOp compositions)
-- Fused backward; Metal as fused-kernel renderer (add prototype only)
+Layout
+  ml/                 the library
+  examples/tour/      the API at every level (01 tensor … 05 nn), always runnable
+  examples/           regression, mnist (MLP), mnist_cnn
+  tests/              tensor_ops (98 checks), metal (GPU smoke test)
+  bench/              loop bench, matmul benches, tinygrad/numpy compare
+  docs/, studies/     notes
+  Run from repo root: `odin run tests/tensor_ops`, `odin run examples/mnist -o:speed`
 
-Examples ladder
-1. regression ✓  2. MNIST MLP ✓  3. MNIST CNN ✓
-4. char RNN / seq  5. digit transformer  6. tiny GPT later
+The UOp model (ml/uop.odin)
+- `Tensor :: UOp`. One node type: op, src, arg, shape, data, requires_grad, grad.
+- Buffers are always dense row-major. No strides; Reshape is a view (same buffer),
+  Permute realizes a copy or folds into GEMM (sgemm transpose flags).
+- ops.odin builds nodes; compositions (relu, sigmoid, mean) are just ops of ops.
+- autograd.odin: grad rules emit UOps; backward realizes loss + all leaf grads
+  in ONE schedule, so backward is fused like forward.
+- realize.odin is the only executor: topo → fuse same-shape ewise chains
+  (single consumer) → fold transposes → run fused kernels / primitive kernels.
+- IR ops: Input Const | Add Sub Mul Div Max CmpLt Neg Exp Expand | Sum |
+  Reshape Permute | MatMul Conv2d MaxPool2d CrossEntropy (+ backward prims)
 
-Next Move
-Fuse backward ewise, or Metal renderer of fused groups — not more forward_op cases.
-Breadth (RNN/transformer) once those ops are compositions on the existing IR.
+Numbers (M5, after unification; before in parens)
+- MNIST MLP 20 epochs 4.1 s (14.0 s), 98.0%. MNIST CNN 3 epochs 27.8 s (49.4 s), 98.2%.
+- bench/loop mlp_step 0.15 ms (0.87 ms). 11/11 match tinygrad.
 
-Relevant Files
-ml/{tensor,ops,uop,fuse,realize,autograd,nn,optim,data,debug,device,kernel_*}.odin
-regression.odin, mnist/, tensor_ops/, bench/loop/, docs/tiny-inspo.md
+Known debt
+- Multi-consumer nodes break fusion (x feeding relu AND its grad = own kernel).
+- Over-budget fused groups (>16 ops / >8 inputs) fall back to op-by-op.
+- SGD updates raw buffers outside the graph (fine for now; lazy optim later).
+- CrossEntropy is a primitive with labels in arg; becomes a composition
+  (logsumexp − gather) once Log / reduce-max exist.
+- Metal: metal_add prototype only, not wired into the scheduler.
+
+Milestones
+0. Cleanup ✓  One UOp model: one executor, autograd emits UOps ✓
+1. Ops: Log, Sqrt, reduce Max; softmax/logsumexp/LayerNorm as compositions;
+   batched matmul; Adam; cosine LR + warmup. Each checked vs tinygrad.
+2. Conjugate toy with an MLP: (prior params, data) → posterior params,
+   diagonal-cov GMM NLL loss, synthetic meta-prior sampler. Check vs closed form.
+3. Attention + 6-layer decoder (d=64, 8 heads, MLP 2048). Reproduce Table 1 (KL ≈ 4e-4).
+4. Full-covariance GMM (Cholesky param) + sequential sensor fusion. First UI hook.
+5. Handwritten Metal kernels for the hot primitives (MatMul, fused ewise, reduce).
+
+References
+- Paper: https://arxiv.org/html/2502.02463v3
+- Reference impl (PyTorch, MIT): https://github.com/GWhittle110/distribution-transformers
+- docs/tiny-inspo.md

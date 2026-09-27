@@ -21,7 +21,7 @@ import "core:fmt"
 import "core:math/rand"
 import "core:mem"
 import "core:os"
-import "ml"
+import ml "../../ml"
 
 main :: proc() {
 
