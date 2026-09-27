@@ -41,7 +41,7 @@ main :: proc() {
 	a := ml.from_data_copy({1, -2, 3, -4}, {2, 2}, requires_grad = true)
 	bb := ml.from_data_copy({10, 20, 30, 40}, {2, 2}, requires_grad = true)
 	y := ml.relu(ml.add(a, bb))
-	s := ml.sum(y, -1)
+	s := ml.sum(y)
 	ml.backward(s)
 	fmt.printfln("  y = %v  (all > 0 → dA=dB=1)", y.data)
 	fmt.printfln("  dA = %v", a.grad.data)

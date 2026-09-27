@@ -52,10 +52,27 @@ main :: proc() {
 	fmt.printfln("%-16s shape=%v  shares_t=%v", "reshape(2,3→3,2)", r.shape, raw_data(r.data) == raw_data(t.data))
 	show("T(2x3)", ml.T(t))
 
-	// Reductions. axis=-1 sums everything to a scalar tensor of shape [1]
-	show("sum all", ml.sum(a, -1))
+	// Reductions keep the reduced dim as 1. No axis = everything → shape [1];
+	// negative axes count from the end (-1 = last), as in numpy.
+	show("sum all", ml.sum(a))
 	show("mean", ml.mean(a))
 	show("sum axis=1", ml.sum(a, 1)) // keeps dim as 1: [2,1]
+	show("sum axis=-2", ml.sum(a, -2)) // first axis of a 2D tensor: [1,2]
+
+	// log / sqrt / max over an axis (keepdim)
+	show("log(a)", ml.log(a))
+	show("sqrt(a)", ml.sqrt(a))
+	show("max axis=1", ml.max_axis(a, 1))
+
+	// Compositions of the above: softmax family, layer norm
+	z := ml.from_data_copy({1, 2, 3, 1, 1, 1}, {2, 3})
+	show("softmax axis=1", ml.softmax(z, 1))
+	show("logsumexp ax=1", ml.logsumexp(z, 1))
+	show("layer_norm", ml.layer_norm(z)) // last axis, mean 0 / var 1
+
+	// Batched matmul: [B,M,K] @ [B,K,N]; mT swaps the last two axes
+	q := ml.from_data_copy({1, 0, 0, 1, 1, 1, 0, 2}, {2, 2, 2})
+	show("q @ q^T (B=2)", ml.matmul(q, ml.mT(q)))
 
 	// Spatial, NCHW. conv: x[N,Ci,H,W]  w[Co,Ci,kH,kW]
 	img := ml.from_data_copy({1, 2, 3, 4, 5, 6, 7, 8, 9}, {1, 1, 3, 3})

@@ -104,6 +104,78 @@ def tiny_results() -> dict[str, np.ndarray]:
     return out
 
 
+def seq(shape, k, requires_grad=False) -> Tensor:
+    n = int(np.prod(shape))
+    t = Tensor(np.sin(np.arange(n) * 0.7 + k).astype(np.float32).reshape(shape))
+    if requires_grad:
+        t.requires_grad = True
+    return t
+
+
+def g(t: Tensor) -> np.ndarray:
+    return t.grad.numpy().reshape(-1)
+
+
+def milestone1() -> dict[str, np.ndarray]:
+    out = {}
+    x = seq((4,), 0) * 0.5 + 1
+    xl = Tensor(x.numpy())
+    xl.requires_grad = True
+    (xl.log() * xl.sqrt()).sum().backward()
+    out["log_sqrt_dx"] = g(xl)
+
+    mx = Tensor([[1.0, 5.0, 5.0], [2.0, 0.0, -1.0]])
+    mx.requires_grad = True
+    mm = mx.max(axis=1, keepdim=True)
+    out["max_axis"] = mm.numpy().reshape(-1)
+    (mm * Tensor([[1.0], [2.0]])).sum().backward()
+    out["max_axis_dx"] = g(mx)
+
+    s = seq((3, 4), 1, True)
+    out["softmax"] = s.softmax(1).numpy().reshape(-1)
+    out["log_softmax"] = s.log_softmax(1).numpy().reshape(-1)
+    out["logsumexp"] = s.logsumexp(1, keepdim=True).numpy().reshape(-1)
+    (s.softmax(1) * seq((3, 4), 2)).sum().backward()
+    out["softmax_dx"] = g(s)
+
+    ln = seq((2, 5), 3, True)
+    out["layernorm"] = ln.layernorm().numpy().reshape(-1)
+    (ln.layernorm() * seq((2, 5), 4)).sum().backward()
+    out["layernorm_dx"] = g(ln)
+
+    lg = seq((3, 4), 5, True)
+    ce = lg.sparse_categorical_crossentropy(Tensor([2, 0, 3]))
+    out["cross_entropy"] = ce.numpy().reshape(-1)
+    ce.backward()
+    out["cross_entropy_dx"] = g(lg)
+
+    ba, bb = seq((2, 2, 3), 6, True), seq((2, 3, 2), 7, True)
+    bw, bc = seq((3, 2), 8, True), seq((1, 3, 2), 9, True)
+    out["bmm"] = (ba @ bb).numpy().reshape(-1)
+    ((ba @ bb).sum() + ((ba @ bw) * 2).sum() + ((ba @ bc) * 3).sum()).backward()
+    out["bmm_da"], out["bmm_db"], out["bmm_dw"], out["bmm_dc"] = g(ba), g(bb), g(bw), g(bc)
+
+    q, k, v = seq((2, 3, 4), 10, True), seq((2, 3, 4), 11, True), seq((2, 3, 4), 12, True)
+    o = ((q @ k.transpose(-1, -2)) * 0.5).softmax(2) @ v
+    out["attention"] = o.numpy().reshape(-1)
+    (o * seq((2, 3, 4), 13)).sum().backward()
+    out["attention_dq"], out["attention_dk"], out["attention_dv"] = g(q), g(k), g(v)
+
+    from tinygrad.helpers import Context
+    from tinygrad.nn.optim import Adam, AdamW
+    for name, make in (("adam_w", lambda p: Adam(p, lr=0.1)), ("adamw_w", lambda p: AdamW(p, lr=0.1, weight_decay=0.1))):
+        w = seq((5,), 14, True)
+        t = seq((5,), 15)
+        opt = make([w])
+        with Context(TRAINING=1):
+            for _ in range(5):
+                opt.zero_grad()
+                (w - t).square().sum().backward()
+                opt.step()
+        out[name] = w.numpy().reshape(-1)
+    return out
+
+
 def bench_tiny() -> dict[str, float]:
     times = {}
     rng = np.random.default_rng(0)
@@ -138,7 +210,7 @@ def main() -> int:
         print(__doc__.strip(), file=sys.stderr)
         return 2
     odin_r, odin_t = parse_odin(sys.argv[1])
-    tiny_r = tiny_results()
+    tiny_r = tiny_results() | milestone1()
     tiny_t = bench_tiny()
 
     print("=== correctness (odin vs tinygrad) ===")

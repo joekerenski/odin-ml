@@ -7,7 +7,7 @@ package ml
 //   1. topo-sort unrealized nodes (realized nodes are buffers: stop there),
 //   2. fuse: an ewise node joins its ewise src when shapes match and the src
 //      has exactly one consumer → one loop, intermediates never stored,
-//   3. fold: a 2D Permute feeding only MatMuls becomes a GEMM transpose flag,
+//   3. fold: a last-two-axes Permute feeding only MatMuls → GEMM transpose flag,
 //   4. run in topo order: fused groups (fuse.odin), views, primitive kernels.
 //
 // A node's .data is kept only if something outside its fused group (or the
@@ -63,10 +63,13 @@ uf_find :: proc(uf: ^map[^UOp]^UOp, x: ^UOp) -> ^UOp {
 	return p
 }
 
-is_2d_swap :: proc(u: ^UOp) -> bool {
-	if u.op != .Permute || len(u.shape) != 2 do return false
+// Permute that only swaps the last two axes (a batched matrix transpose).
+is_mt :: proc(u: ^UOp) -> bool {
+	if u.op != .Permute do return false
 	o := u.arg.([]i32)
-	return o[0] == 1 && o[1] == 0
+	n := len(o)
+	for i in 0 ..< n - 2 do if o[i] != i32(i) do return false
+	return o[n - 2] == i32(n - 1) && o[n - 1] == i32(n - 2)
 }
 
 realize_all :: proc(sinks: []^UOp) {
@@ -103,7 +106,7 @@ realize_all :: proc(sinks: []^UOp) {
 
 	// fold transposes into GEMM
 	for u in s.topo {
-		if is_2d_swap(u) && !(u in s.sinks) && matmul_uses[u] == s.consumers[u] {
+		if is_mt(u) && !(u in s.sinks) && matmul_uses[u] == s.consumers[u] {
 			s.folded[u] = true
 		}
 	}
@@ -200,12 +203,12 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 
 // Operand for GEMM: a realized buffer, or a folded transpose of one.
 gemm_operand :: proc(u: ^UOp) -> (data: []f32, trans: bool) {
-	if u.data == nil && is_2d_swap(u) do return u.src[0].data, true
+	if u.data == nil && is_mt(u) do return u.src[0].data, true
 	return u.data, false
 }
 
 run_node :: proc(s: ^Schedule, u: ^UOp) {
-	for x in u.src do assert(x.data != nil || is_2d_swap(x), "run_node: src not realized")
+	for x in u.src do assert(x.data != nil || is_mt(x), "run_node: src not realized")
 
 	t0: time.Tick
 	if debug_level >= 2 do t0 = time.tick_now()
@@ -217,16 +220,18 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 
 	alloc_out(u)
 	#partial switch u.op {
-	case .Sum:
-		sum_kernel(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
+	case .Sum, .ReduceMax:
+		reduce_kernel(u.op, u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
 	case .Permute:
 		permute_kernel(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
 	case .MatMul:
 		a, ta := gemm_operand(u.src[0])
 		b, tb := gemm_operand(u.src[1])
-		M, N := u.shape[0], u.shape[1]
-		K := u.src[0].shape[1]
-		matmul_f32(u.data, a, b, M, K, N, ta, tb)
+		n := len(u.shape)
+		M, N, K := u.shape[n - 2], u.shape[n - 1], u.src[0].shape[n - 1]
+		for i in 0 ..< int(numel(u.shape[:n - 2])) {
+			matmul_f32(u.data[i * int(M * N):], a[i * int(M * K):], b[i * int(K * N):], M, K, N, ta, tb)
+		}
 	case .Conv2d:
 		x, w := u.src[0], u.src[1]
 		win := u.arg.(Window)
@@ -245,12 +250,6 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	case .MaxPool2dBwd:
 		g, x := u.src[0], u.src[1]
 		maxpool2d_backward(u.data, g.data, x.data, x.shape[0], x.shape[1], x.shape[2], x.shape[3], u.arg.(Window))
-	case .CrossEntropy:
-		x := u.src[0]
-		u.data[0] = cross_entropy_f32(x.data, x.shape[0], x.shape[1], u.arg.([]u8))
-	case .CrossEntropyBwd:
-		g, x := u.src[0], u.src[1]
-		cross_entropy_backward(u.data, g.data[0], x.data, x.shape[0], x.shape[1], u.arg.([]u8))
 	case:
 		fmt.panicf("run_node: no kernel for %v", u.op)
 	}

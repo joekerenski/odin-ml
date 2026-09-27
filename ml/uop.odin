@@ -13,10 +13,13 @@ package ml
 // nodes, realize (realize.odin) schedules and runs them. Nothing else.
 //
 // Compositions, not primitives:
-//   relu(x)    = max(x, 0)
-//   sigmoid(x) = 1 / (1 + exp(-x))
-//   mean(x)    = sum(x) * (1/n)
-// MatMul / Conv / Pool / CE stay primitives with hand-written kernels.
+//   relu(x)          = max(x, 0)
+//   sigmoid(x)       = 1 / (1 + exp(-x))
+//   mean(x)          = sum(x) * (1/n)
+//   log_softmax(x)   = x - max - log(sum(exp(x - max)))
+//   cross_entropy    = -mean(sum(onehot * log_softmax(logits)))
+//   layer_norm(x)    = (x - mean) / sqrt(var + eps)
+// MatMul / Conv / Pool stay primitives with hand-written kernels.
 // ============================================================================
 
 import "core:fmt"
@@ -37,24 +40,25 @@ Op :: enum {
 	CmpLt, // a < b ? 1 : 0
 	Neg,
 	Exp,
+	Log,
+	Sqrt,
 	Expand, // broadcast src to this shape (identity per element)
 
-	// reduce
-	Sum, // arg = []i32 axes; keeps reduced dims as 1
+	// reduce — arg = []i32 axes; reduced dims kept as 1
+	Sum,
+	ReduceMax,
 
 	// movement
 	Reshape, // same buffer, new shape
 	Permute, // arg = []i32 order
 
 	// primitives with hand-written kernels
-	MatMul,
+	MatMul,          // [..., M, K] @ [..., K, N], equal batch dims
 	Conv2d,          // src (x, w)
 	Conv2dBwdInput,  // src (g, w)  → x shape
 	Conv2dBwdWeight, // src (g, x)  → w shape
 	MaxPool2d,       // src (x)
 	MaxPool2dBwd,    // src (g, x)  → x shape
-	CrossEntropy,    // src (logits), arg = labels → {1}
-	CrossEntropyBwd, // src (g, logits), arg = labels → logits shape
 }
 
 // NCHW window geometry for Conv2d / MaxPool2d and their backward ops.
@@ -66,7 +70,6 @@ Arg :: union {
 	f32,
 	[]i32,
 	Window,
-	[]u8,
 }
 
 UOp :: struct {
@@ -83,7 +86,7 @@ Tensor :: UOp
 
 op_is_ewise :: proc(op: Op) -> bool {
 	#partial switch op {
-	case .Add, .Sub, .Mul, .Div, .Max, .CmpLt, .Neg, .Exp, .Expand:
+	case .Add, .Sub, .Mul, .Div, .Max, .CmpLt, .Neg, .Exp, .Log, .Sqrt, .Expand:
 		return true
 	}
 	return false

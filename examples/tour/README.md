@@ -19,14 +19,14 @@ you write this                  library does this
 02  the graph            →      op / src / arg / shape; compositions visible
 03  realize              →      fuse ewise, fold transposes into GEMM, run
 04  backward             →      grad rules emit UOps; fwd+bwd in one schedule
-05  nn + SGD             →      Linear / Conv2d / one training step
+05  nn + optimizers      →      Linear / Conv2d / LayerNorm, SGD, Adam + cosine LR
 ```
 
 What exists today
 
-- Tensor ops: `add sub mul div maximum cmplt neg exp relu sigmoid sum sum_axes mean reshape permute transpose T expand flatten matmul conv2d max_pool2d cross_entropy`
-- UOps: `Input Const | Add Sub Mul Div Max CmpLt Neg Exp Expand | Sum | Reshape Permute | MatMul Conv2d MaxPool2d CrossEntropy` (+ their backward primitives)
-- Compositions (not primitives): `relu = max(x,0)`, `sigmoid = 1/(1+exp(-x))`, `mean = sum * 1/n`
+- Tensor ops: `add sub mul div maximum cmplt neg exp log sqrt square detach relu sigmoid sum max_axis max_all sum_axes max_axes mean softmax log_softmax logsumexp layer_norm reshape permute transpose T mT expand flatten matmul (batched) conv2d max_pool2d one_hot cross_entropy`
+- UOps: `Input Const | Add Sub Mul Div Max CmpLt Neg Exp Log Sqrt Expand | Sum ReduceMax | Reshape Permute | MatMul Conv2d MaxPool2d` (+ conv/pool backward primitives)
+- Compositions (not primitives): `relu`, `sigmoid`, `mean`, `softmax`/`log_softmax`/`logsumexp`, `layer_norm`, `cross_entropy`
 - MatMul is a primitive (Accelerate GEMM). Conv is im2col + GEMM.
 - Fusion: same-shape ewise ops with one consumer become one kernel.
 

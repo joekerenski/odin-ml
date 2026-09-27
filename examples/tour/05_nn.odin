@@ -1,6 +1,6 @@
 package main
 
-// nn is tiny: plain structs, no Module. One Linear, one Conv, one SGD step.
+// nn is tiny: plain structs, no Module. Linear, Conv, LayerNorm; SGD and Adam.
 // The arena pattern: graph lives on a Dynamic_Arena, params live on the heap.
 //
 //   odin run examples/tour/05_nn.odin -file
@@ -10,7 +10,7 @@ import "core:mem"
 import ml "../../ml"
 
 main :: proc() {
-	fmt.println("=== 05 nn + one training step ===\n")
+	fmt.println("=== 05 nn + optimizers ===\n")
 	ml.seed(0)
 
 	// ---- Linear: out = x @ W + b ----
@@ -59,6 +59,34 @@ main :: proc() {
 	fmt.printfln("  loss = %.4f", v)
 	fmt.println("  params (W, b) live on the heap and were updated in place")
 	fmt.println("  graph + grads were on the arena and are gone")
+
+	// ---- Adam + cosine schedule: fit y = x² with a pre-LN residual block ----
+	// h = embed(x);  h = h + mlp(layer_norm(h));  y = head(h)   (transformer-style)
+	fmt.println("\n-- Adam + cosine LR (warmup 20, 200 steps), pre-LN residual MLP --")
+	embed, mlp, head := ml.linear(1, 16), ml.linear(16, 16), ml.linear(16, 1, .Xavier)
+	lnorm := ml.layer_norm_layer(16)
+	ps: [dynamic]^ml.Tensor
+	ml.linear_params(&ps, embed)
+	ml.linear_params(&ps, mlp)
+	ml.linear_params(&ps, head)
+	ml.layer_norm_params(&ps, lnorm)
+	adam := ml.new_adam(ps[:], lr = 0.03, weight_decay = 1e-4)
+	X := ml.uniform({32, 1}, -1, 1)
+	Y := ml.square(X)
+	ml.realize(Y)
+	for step in 0 ..< 200 {
+		context.allocator = mem.dynamic_arena_allocator(&arena)
+		ml.optimizer_set_lr(adam, ml.cosine_lr(step, 200, 20, 0.03))
+		h := ml.linear_forward(&embed, X)
+		h = ml.add(h, ml.relu(ml.linear_forward(&mlp, ml.layer_norm_forward(&lnorm, h))))
+		mse := ml.mean(ml.square(ml.sub(ml.linear_forward(&head, h), Y)))
+		ml.backward(mse)
+		if step % 50 == 0 || step == 199 do fmt.printfln("  step %3d  lr=%.5f  mse=%.5f", step, adam.lr, ml.item(mse))
+		ml.adam_step(adam)
+		context.allocator = old
+		mem.dynamic_arena_reset(&arena)
+		ml.clear_grads(..ps[:])
+	}
 
 	fmt.println("\nTrainer wraps this loop: trainer_epoch_ce in mnist/main.odin")
 }

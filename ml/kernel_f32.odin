@@ -1,22 +1,26 @@
 package ml
 
 // ============================================================================
-// CPU kernels for non-fused primitives: reduce, permute, cross-entropy.
+// CPU kernels for non-fused primitives: reduce, permute.
 // All buffers dense row-major. Elementwise math lives in fuse.odin.
 // ============================================================================
 
 import "core:math"
 
-// ---- reduce ---------------------------------------------------------------
+// ---- reduce (Sum / ReduceMax) --------------------------------------------
 
-// dst[o, k] = Σ_r src[o, r, k]   (src viewed as [outer, red, inner])
-reduce_block :: proc(dst, src: []f32, outer, red, inner: int) {
-	for i in 0 ..< outer * inner do dst[i] = 0
+// dst[o, k] = reduce_r src[o, r, k]   (src viewed as [outer, red, inner])
+reduce_block :: proc(dst, src: []f32, outer, red, inner: int, $op: Op) {
+	init: f32 = op == .Sum ? 0 : math.inf_f32(-1)
+	for i in 0 ..< outer * inner do dst[i] = init
 	if inner == 1 {
 		for o in 0 ..< outer {
-			s: f32 = 0
-			for v in src[o * red:(o + 1) * red] do s += v
-			dst[o] = s
+			acc := init
+			for v in src[o * red:(o + 1) * red] {
+				when op == .Sum do acc += v
+				else do acc = max(acc, v)
+			}
+			dst[o] = acc
 		}
 		return
 	}
@@ -24,14 +28,17 @@ reduce_block :: proc(dst, src: []f32, outer, red, inner: int) {
 		d := dst[o * inner:(o + 1) * inner]
 		for r in 0 ..< red {
 			row := src[(o * red + r) * inner:][:inner]
-			for k in 0 ..< inner do d[k] += row[k]
+			for k in 0 ..< inner {
+				when op == .Sum do d[k] += row[k]
+				else do d[k] = max(d[k], row[k])
+			}
 		}
 	}
 }
 
-// Sum over `axes` (kept as size 1). Each maximal run of adjacent reduced axes
-// is one reduce_block pass, rightmost run first.
-sum_kernel :: proc(out, a: []f32, shape: []i32, axes: []i32) {
+// Reduce over `axes` (kept as size 1). Each maximal run of adjacent reduced
+// axes is one reduce_block pass, rightmost run first.
+reduce_kernel :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
 	red: [MAX_DIMS]bool
 	for ax in axes do red[ax] = true
 	cur := a
@@ -56,7 +63,11 @@ sum_kernel :: proc(out, a: []f32, shape: []i32, axes: []i32) {
 		more := false
 		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
 		dst := more ? make([]f32, outer * inner) : out
-		reduce_block(dst, cur, outer, r, inner)
+		if op == .Sum {
+			reduce_block(dst, cur, outer, r, inner, .Sum)
+		} else {
+			reduce_block(dst, cur, outer, r, inner, .ReduceMax)
+		}
 		cur = dst
 	}
 	if raw_data(cur) != raw_data(out) do copy(out, cur)
@@ -83,44 +94,5 @@ permute_kernel :: proc(out, a: []f32, shape: []i32, order: []i32) {
 		off: i32 = 0
 		for i in 0 ..< nd do off += idx[i] * src_stride[i]
 		out[f] = a[off]
-	}
-}
-
-// ---- cross-entropy --------------------------------------------------------
-
-// Softmax of one row into p, returns log Σ exp(row).
-softmax_row :: proc(p, row: []f32) -> f32 {
-	m := row[0]
-	for v in row do m = max(m, v)
-	s: f32 = 0
-	for v, c in row {
-		p[c] = math.exp(v - m)
-		s += p[c]
-	}
-	for c in 0 ..< len(p) do p[c] /= s
-	return m + math.ln(s)
-}
-
-// mean_b( logsumexp(logits[b]) - logits[b, label_b] )
-cross_entropy_f32 :: proc(logits: []f32, B, C: i32, labels: []u8) -> f32 {
-	p := make([]f32, C)
-	defer delete(p)
-	total: f32 = 0
-	for b in 0 ..< int(B) {
-		row := logits[b * int(C):][:C]
-		total += softmax_row(p, row) - row[labels[b]]
-	}
-	return total / f32(B)
-}
-
-// dlogits = g/B * (softmax - onehot)
-cross_entropy_backward :: proc(dx: []f32, g: f32, logits: []f32, B, C: i32, labels: []u8) {
-	scale := g / f32(B)
-	for b in 0 ..< int(B) {
-		row := logits[b * int(C):][:C]
-		d := dx[b * int(C):][:C]
-		softmax_row(d, row)
-		d[labels[b]] -= 1
-		for c in 0 ..< int(C) do d[c] *= scale
 	}
 }

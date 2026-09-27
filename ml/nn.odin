@@ -1,7 +1,7 @@
 package ml
 
 // ============================================================================
-// nn — layer helpers (Linear, Conv2d) + param collection.
+// nn — layer helpers (Linear, Conv2d, LayerNorm) + param collection.
 //
 // No Module base class (tinygrad style): layers are plain structs holding
 // ^Tensor params. Train loops collect params into a list for the optimizer:
@@ -106,4 +106,24 @@ conv2d_forward :: proc(c: ^Conv2d, x: ^Tensor) -> ^Tensor {
 // Append Conv2d params into dst.
 conv_params :: proc(dst: ^[dynamic]^Tensor, c: Conv2d) {
 	collect_params(dst, c.W, c.b)
+}
+
+// ---- LayerNorm (last axis, learnable gain + bias) -------------------------
+
+LayerNorm :: struct {
+	g:   ^Tensor, // [dim], init 1
+	b:   ^Tensor, // [dim], init 0
+	eps: f32,
+}
+
+layer_norm_layer :: proc(dim: i32, eps: f32 = 1e-5) -> LayerNorm {
+	return LayerNorm{ones({dim}, requires_grad = true), zeros({dim}, requires_grad = true), eps}
+}
+
+layer_norm_forward :: proc(l: ^LayerNorm, x: ^Tensor) -> ^Tensor {
+	return add(mul(layer_norm(x, l.eps), l.g), l.b)
+}
+
+layer_norm_params :: proc(dst: ^[dynamic]^Tensor, l: LayerNorm) {
+	collect_params(dst, l.g, l.b)
 }

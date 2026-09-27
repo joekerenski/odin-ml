@@ -121,7 +121,7 @@ run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
 run_fused_kernel :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, out_shape: []i32) {
 	n := int(numel(out_shape))
 	simd_ok := true
-	for insn in insns do if insn.op == .Exp do simd_ok = false
+	for insn in insns do if insn.op == .Exp || insn.op == .Log do simd_ok = false
 	row_n, col_inner := 0, 0
 	for inp in inputs {
 		switch inp.mode {
@@ -165,6 +165,8 @@ fused_eval :: #force_inline proc(op: Op, a, b: f32) -> f32 {
 	case .CmpLt: return a < b ? 1 : 0
 	case .Neg: return -a
 	case .Exp: return math.exp(a)
+	case .Log: return math.ln(a)
+	case .Sqrt: return math.sqrt(a)
 	case .Expand: return a
 	}
 	panic("fused_eval: not ewise")
@@ -179,6 +181,7 @@ fused_eval_simd :: #force_inline proc(op: Op, a, b: simd.f32x4) -> simd.f32x4 {
 	case .Max: return simd.max(a, b)
 	case .CmpLt: return simd.select(simd.lanes_lt(a, b), simd.f32x4(1), simd.f32x4(0))
 	case .Neg: return simd.neg(a)
+	case .Sqrt: return simd.sqrt(a)
 	case .Expand: return a
 	}
 	panic("fused_eval_simd: not simd ewise")
@@ -247,9 +250,10 @@ run_single_simd :: proc(inputs: []Fused_In, insn: Fused_Insn, out: []f32, n: int
 	case .Max: single_loop(a, b, out, n, .Max)
 	case .CmpLt: single_loop(a, b, out, n, .CmpLt)
 	case .Neg: single_loop(a, b, out, n, .Neg)
+	case .Sqrt: single_loop(a, b, out, n, .Sqrt)
 	case .Expand: single_loop(a, b, out, n, .Expand)
-	case .Input, .Const, .Exp, .Sum, .Reshape, .Permute, .MatMul, .Conv2d, .Conv2dBwdInput,
-	     .Conv2dBwdWeight, .MaxPool2d, .MaxPool2dBwd, .CrossEntropy, .CrossEntropyBwd:
+	case .Input, .Const, .Exp, .Log, .Sum, .ReduceMax, .Reshape, .Permute, .MatMul, .Conv2d,
+	     .Conv2dBwdInput, .Conv2dBwdWeight, .MaxPool2d, .MaxPool2dBwd:
 		panic("run_single_simd: not a simd ewise op")
 	}
 }

@@ -63,6 +63,7 @@ main :: proc() {
 	test_views()
 	test_uop()
 	test_grad_rules()
+	test_milestone1()
 	test_fusion()
 
 	fmt.println()
@@ -158,7 +159,7 @@ test_unary :: proc() {
 test_reductions :: proc() {
 	fmt.println("-- reductions --")
 	t := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
-	all := ml.sum(t, -1)
+	all := ml.sum(t)
 	ml.realize(all)
 	expect(all.shape[0] == 1 && all.data[0] == 21, "sum all")
 
@@ -505,7 +506,7 @@ test_conv_grad :: proc() {
 	x := ml.from_data_copy({1, 2, 3, 4}, {1, 1, 2, 2}, requires_grad = true)
 	w := ml.from_data_copy({0.5, 0.5, 0.5, 0.5}, {1, 1, 2, 2}, requires_grad = true)
 	y := ml.conv2d(x, w, stride = 1, padding = 0)
-	loss := ml.sum(y, -1)
+	loss := ml.sum(y)
 	ml.backward(loss)
 	expect_close(w.grad, ml.from_data_copy({1, 2, 3, 4}, {1, 1, 2, 2}), "conv dW = x")
 	expect_close(x.grad, ml.from_data_copy({0.5, 0.5, 0.5, 0.5}, {1, 1, 2, 2}), "conv dX = w")
@@ -513,7 +514,7 @@ test_conv_grad :: proc() {
 	// maxpool backward: gradient routes to argmax only
 	t := ml.from_data_copy({1, 3, 2, 0}, {1, 1, 2, 2}, requires_grad = true)
 	m := ml.max_pool2d(t, kernel_size = 2)
-	loss2 := ml.sum(m, -1)
+	loss2 := ml.sum(m)
 	ml.backward(loss2)
 	// max is 3 at index 1
 	expect_close(t.grad, ml.from_data_copy({0, 1, 0, 0}, {1, 1, 2, 2}), "maxpool grad to argmax")
@@ -538,7 +539,7 @@ test_div_broadcast_grad :: proc() {
 	a := ml.from_data_copy({2, 4, 6, 8, 10, 12}, {2, 3}, requires_grad = true)
 	s := ml.from_data_copy({2}, {1}, requires_grad = true)
 	y := ml.div(a, s)
-	loss := ml.sum(y, -1)
+	loss := ml.sum(y)
 	ml.backward(loss)
 	// y = [1,2,3,4,5,6], dL/da = 0.5 each, dL/ds = -sum(a)/4 = -42/4 = -10.5
 	expect_close(a.grad, ml.from_data_copy({0.5, 0.5, 0.5, 0.5, 0.5, 0.5}, {2, 3}), "div scalar dA")
@@ -548,7 +549,7 @@ test_div_broadcast_grad :: proc() {
 	a2 := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3}, requires_grad = true)
 	b2 := ml.from_data_copy({1, 2, 3}, {3}, requires_grad = true)
 	y2 := ml.div(a2, b2)
-	loss2 := ml.sum(y2, -1)
+	loss2 := ml.sum(y2)
 	ml.backward(loss2)
 	// dL/da = 1/b = [1, 0.5, 1/3] per row
 	expect_close(a2.grad, ml.from_data_copy({1, 0.5, 1.0 / 3, 1, 0.5, 1.0 / 3}, {2, 3}), "div row dA")
@@ -572,14 +573,14 @@ test_gradcheck :: proc() {
 		return ml.item(ml.sum(ml.relu(ml.add(
 			ml.matmul(ml.from_data_copy(xd, x_sh), ml.from_data_copy(wd, w_sh)),
 			ml.from_data_copy(bd, b_sh),
-		)), -1))
+		))))
 	}
 
 	// analytic
 	x := ml.from_data_copy(x_d[:], x_sh, requires_grad = true)
 	w := ml.from_data_copy(w_d[:], w_sh, requires_grad = true)
 	b := ml.from_data_copy(b_d[:], b_sh, requires_grad = true)
-	ml.backward(ml.sum(ml.relu(ml.add(ml.matmul(x, w), b)), -1))
+	ml.backward(ml.sum(ml.relu(ml.add(ml.matmul(x, w), b))))
 
 	// numerical dW
 	ok_w := true
@@ -658,7 +659,7 @@ test_views :: proc() {
 
 	// grad through transpose
 	x := ml.from_data_copy({1, 2, 3, 4}, {2, 2}, requires_grad = true)
-	loss := ml.sum(ml.mul(ml.T(x), ml.from_data_copy({1, 2, 3, 4}, {2, 2})), -1)
+	loss := ml.sum(ml.mul(ml.T(x), ml.from_data_copy({1, 2, 3, 4}, {2, 2})))
 	ml.backward(loss)
 	// d/dx sum(x^T * c) = c^T
 	expect_close(x.grad, ml.from_data_copy({1, 3, 2, 4}, {2, 2}), "grad through T")
@@ -690,17 +691,17 @@ test_grad_rules :: proc() {
 	fmt.println("-- grad rules --")
 	a := ml.from_data_copy({1, -2, 3, 0.5}, {4}, requires_grad = true)
 	b := ml.from_data_copy({0, 0, 5, 0.5}, {4}, requires_grad = true)
-	ml.backward(ml.sum(ml.maximum(a, b), -1))
+	ml.backward(ml.sum(ml.maximum(a, b)))
 	expect_close(a.grad, ml.from_data_copy({1, 0, 0, 0}, {4}), "max dA (ties → b)")
 	expect_close(b.grad, ml.from_data_copy({0, 1, 1, 1}, {4}), "max dB")
 
 	x := ml.from_data_copy({0, 1, -1}, {3}, requires_grad = true)
-	ml.backward(ml.sum(ml.exp(x), -1))
+	ml.backward(ml.sum(ml.exp(x)))
 	expect_close(x.grad, ml.from_data_copy({1, math.E, 1 / math.E}, {3}), "exp grad = exp(x)")
 
 	m := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3}, requires_grad = true)
 	v := ml.from_data_copy({1, 1, 1}, {3}, requires_grad = true)
-	ml.backward(ml.sum(ml.mul(ml.sub(m, v), ml.from_data_copy({1, 2}, {2, 1})), -1))
+	ml.backward(ml.sum(ml.mul(ml.sub(m, v), ml.from_data_copy({1, 2}, {2, 1}))))
 	expect_close(m.grad, ml.from_data_copy({1, 1, 1, 2, 2, 2}, {2, 3}), "sub/mul broadcast dM")
 	expect_close(v.grad, ml.from_data_copy({-3, -3, -3}, {3}), "sub broadcast dV (unbroadcast)")
 
@@ -756,8 +757,75 @@ test_fusion :: proc() {
 	// Elided Add still receives grad: relu(a+b) all positive → da=db=1
 	ga := ml.from_data_copy({1, -2, 3, -4}, {2, 2}, requires_grad = true)
 	gb := ml.from_data_copy({10, 20, 30, 40}, {2, 2}, requires_grad = true)
-	loss := ml.sum(ml.relu(ml.add(ga, gb)), -1)
+	loss := ml.sum(ml.relu(ml.add(ga, gb)))
 	ml.backward(loss)
 	expect_close(ga.grad, ml.ones({2, 2}), "fused relu(a+b) dA")
 	expect_close(gb.grad, ml.ones({2, 2}), "fused relu(a+b) dB")
+}
+// Milestone 1: things the tinygrad compare can't see (scheduling, schedules).
+test_milestone1 :: proc() {
+	fmt.println("-- milestone 1 --")
+	// detach stops gradients but keeps values
+	x := ml.from_data_copy({1, 2, 3}, {3}, requires_grad = true)
+	ml.backward(ml.sum(ml.mul(x, ml.detach(x))))
+	expect_close(x.grad, ml.from_data_copy({1, 2, 3}, {3}), "detach: d/dx x*stop(x) = x")
+
+	// axis semantics: negative counts from the end; no axis = everything
+	m := ml.from_data_copy({1, 2, 3, 4, 5, 6}, {2, 3})
+	expect_close(ml.sum(m, -1), ml.from_data_copy({6, 15}, {2, 1}), "sum(x, -1) = last axis")
+	expect_close(ml.sum(m, -2), ml.from_data_copy({5, 7, 9}, {1, 3}), "sum(x, -2) = first axis")
+	expect_close(ml.sum(m), ml.from_data_copy({21}, {1}), "sum(x) = everything")
+	expect_close(ml.mean(m, -1), ml.from_data_copy({2, 5}, {2, 1}), "mean(x, -1)")
+	expect_close(ml.mean(m), ml.from_data_copy({3.5}, {1}), "mean(x)")
+	expect_close(ml.max_all(m), ml.from_data_copy({6}, {1}), "max_all")
+	expect_close(ml.softmax(m, -1), ml.softmax(m, 1), "softmax(x, -1) == softmax(x, 1)")
+	expect(ml.transpose(m, -2, -1).shape[0] == 3, "transpose negative axes")
+
+	// softmax rows sum to 1, and are shift-invariant (stable for large logits)
+	big := ml.from_data_copy({1000, 1001, 1002, -5, 0, 5}, {2, 3})
+	sm := ml.softmax(big, 1)
+	expect_close(ml.sum(sm, 1), ml.ones({2, 1}), "softmax rows sum to 1")
+	expect(!math.is_nan(sm.data[0]), "softmax stable at 1000")
+
+	// q @ k^T with batch dims: the transpose folds into the batched GEMM
+	q := ml.randn({4, 8, 16}, 0, 1)
+	k := ml.randn({4, 8, 16}, 0, 1)
+	ml.counters_reset()
+	att := ml.matmul(q, ml.mT(k))
+	ml.realize(att)
+	expect(att.shape[0] == 4 && att.shape[1] == 8 && att.shape[2] == 8, "batched q@k^T shape")
+	expect(ml.counters.kernels == 1, "batched mT folds into GEMM (1 kernel)")
+	d := f32(0)
+	for j in 0 ..< 16 do d += q.data[16 + j] * k.data[3 * 16 + j] // batch 0, row 1, col 3
+	expect(abs(att.data[1 * 8 + 3] - d) < 1e-4, "batched q@k^T value")
+
+	// x[B,T,D] @ W[D,E]: one reshape'd GEMM
+	xs := ml.randn({2, 3, 4}, 0, 1)
+	w := ml.randn({4, 5}, 0, 1)
+	ml.counters_reset()
+	y := ml.matmul(xs, w)
+	ml.realize(y)
+	expect(y.shape[0] == 2 && y.shape[1] == 3 && y.shape[2] == 5 && ml.counters.kernels == 1, "[B,T,D]@[D,E] is one GEMM")
+
+	// cosine schedule: warmup ramp, peak, half-way, floor
+	expect(abs(ml.cosine_lr(0, 110, 10, 1.0) - 0.1) < 1e-6, "cosine warmup step 0")
+	expect(abs(ml.cosine_lr(9, 110, 10, 1.0) - 1.0) < 1e-6, "cosine warmup reaches base")
+	expect(abs(ml.cosine_lr(60, 110, 10, 1.0, 0.1) - 0.55) < 1e-5, "cosine half-way")
+	expect(ml.cosine_lr(200, 110, 10, 1.0, 0.1) == 0.1, "cosine floor after total")
+
+	// Trainer drives Adam: fit y = 2x - 1 in a few hundred steps
+	ml.seed(1)
+	lin := ml.linear(1, 1, .Zeros)
+	params := []^ml.Tensor{lin.W, lin.b}
+	opt := ml.new_adam(params, lr = 0.05)
+	X := ml.uniform({64, 1}, -1, 1)
+	Y := ml.add(ml.mul(X, ml.scalar(2)), ml.scalar(-1))
+	ml.realize(Y)
+	for _ in 0 ..< 300 {
+		ml.clear_grads(..params)
+		d := ml.sub(ml.linear_forward(&lin, X), Y)
+		ml.backward(ml.mean(ml.square(d)))
+		ml.optimizer_step(opt)
+	}
+	expect(abs(lin.W.data[0] - 2) < 0.05 && abs(lin.b.data[0] + 1) < 0.05, "Adam fits y = 2x - 1")
 }

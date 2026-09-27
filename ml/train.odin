@@ -8,7 +8,8 @@ package ml
 // that set context.allocator and return do NOT affect the caller.
 //
 //   tr: Trainer
-//   trainer_init(&tr, params[:], lr=0.05, momentum=0.9, batch_size=128)
+//   trainer_init(&tr, params[:], lr=0.05, momentum=0.9, batch_size=128)  // SGD
+//   trainer_init(&tr, params[:], opt = ml.new_adam(params[:]))            // any Optimizer
 //   defer trainer_destroy(&tr)
 //
 //   for epoch in 0..<epochs {
@@ -30,7 +31,7 @@ import "core:mem"
 
 Trainer :: struct {
 	params:     []^Tensor,
-	opt:        ^SGD,
+	opt:        Optimizer,
 	arena:      mem.Dynamic_Arena,
 	batch_size: int,
 }
@@ -42,9 +43,10 @@ trainer_init :: proc(
 	momentum: f32 = 0.9,
 	batch_size: int = 128,
 	arena_block: int = 8 * mem.Megabyte,
+	opt: Optimizer = nil,
 ) {
 	tr.params = params
-	tr.opt = new_sgd_list(lr, momentum, params)
+	tr.opt = opt != nil ? opt : new_sgd_list(lr, momentum, params)
 	tr.batch_size = batch_size
 	mem.dynamic_arena_init(&tr.arena, block_size = arena_block)
 }
@@ -57,12 +59,12 @@ trainer_allocator :: proc(tr: ^Trainer) -> mem.Allocator {
 	return mem.dynamic_arena_allocator(&tr.arena)
 }
 
-// clear → backward → sgd. Call with arena allocator already active.
+// clear → backward → optimizer step. Call with arena allocator already active.
 trainer_backward_step :: proc(tr: ^Trainer, loss: ^Tensor) -> f32 {
 	clear_grad_list(tr.params)
 	backward(loss)
 	v := item(loss)
-	sgd_step(tr.opt)
+	optimizer_step(tr.opt)
 	return v
 }
 

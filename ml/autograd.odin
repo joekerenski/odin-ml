@@ -57,10 +57,19 @@ grad_rule :: proc(u: ^UOp, g: ^UOp, i: int) -> ^UOp {
 		return neg(g)
 	case .Exp:
 		return mul(g, u)
+	case .Log:
+		return div(g, a)
+	case .Sqrt:
+		// d sqrt(a) = 1 / (2 sqrt(a))
+		return div(g, mul(u, scalar(2)))
 	case .Expand:
 		return unbroadcast(g, s.shape)
 	case .Sum:
 		return expand(g, s.shape)
+	case .ReduceMax:
+		// grad to the max; ties split it evenly (a <= max, so eq = 1 - (a < max))
+		is_max := sub(scalar(1), cmplt(a, u))
+		return mul(is_max, div(g, sum_axes(is_max, u.arg.([]i32))))
 	case .Reshape:
 		return reshape(g, s.shape)
 	case .Permute:
@@ -69,16 +78,14 @@ grad_rule :: proc(u: ^UOp, g: ^UOp, i: int) -> ^UOp {
 		for o, j in order do inv[o] = i32(j)
 		return permute(g, inv[:len(order)])
 	case .MatMul:
-		if i == 0 do return matmul(g, T(b))
-		return matmul(T(a), g)
+		if i == 0 do return matmul(g, mT(b))
+		return matmul(mT(a), g)
 	case .Conv2d:
 		win := u.arg.(Window)
 		if i == 0 do return new_node(.Conv2dBwdInput, a.shape, win, g, b)
 		return new_node(.Conv2dBwdWeight, b.shape, win, g, a)
 	case .MaxPool2d:
 		return new_node(.MaxPool2dBwd, a.shape, u.arg, g, a)
-	case .CrossEntropy:
-		return new_node(.CrossEntropyBwd, a.shape, u.arg, g, a)
 	}
 	fmt.panicf("backward: no grad rule for %v", u.op)
 }
