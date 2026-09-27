@@ -8,7 +8,8 @@ package ml
 //   2. fuse: an ewise node joins its ewise src when shapes match and the src
 //      has exactly one consumer → one loop, intermediates never stored,
 //   3. fold: a last-two-axes Permute feeding only MatMuls → GEMM transpose flag,
-//   4. run in topo order: fused groups (fuse.odin), views, primitive kernels.
+//   4. run in topo order on the current backend (device.odin): fused groups,
+//      views, primitive kernels; then sync so results are visible on the host.
 //
 // A node's .data is kept only if something outside its fused group (or the
 // caller) needs it. Anything elided is simply recomputed if asked for later.
@@ -152,6 +153,7 @@ realize_all :: proc(sinks: []^UOp) {
 		}
 		run_node(&s, u)
 	}
+	backend.sync()
 
 	if debug_level == 1 {
 		ms := f64(time.tick_since(step_start)) / 1e6
@@ -235,15 +237,33 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	alloc_out(u)
 	#partial switch u.op {
 	case .Sum, .ReduceMax:
-		reduce_kernel(u.op, u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
+		backend.reduce(u.op, u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
 	case .Permute:
-		permute_kernel(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
+		backend.permute(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
 	case .MatMul:
 		a, ta := gemm_operand(u.src[0])
 		b, tb := gemm_operand(u.src[1])
 		n := len(u.shape)
 		M, N, K := u.shape[n - 2], u.shape[n - 1], u.src[0].shape[n - 1]
-		matmul_batched(u.data, a, b, int(numel(u.shape[:n - 2])), M, K, N, ta, tb)
+		backend.matmul(u.data, a, b, int(numel(u.shape[:n - 2])), M, K, N, ta, tb)
+	case .Conv2d, .Conv2dBwdInput, .Conv2dBwdWeight, .MaxPool2d, .MaxPool2dBwd:
+		backend.sync() // CPU-only ops: inputs must be ready on the host
+		run_cpu_node(u)
+	case:
+		fmt.panicf("run_node: no kernel for %v", u.op)
+	}
+	counters.kernels += 1
+
+	if debug_level >= 2 {
+		dt := i64(time.tick_since(t0))
+		counters.time_ns += dt
+		fmt.printfln("  kernel  %-16v shape=%v  %7.3f ms", u.op, u.shape, f64(dt) / 1e6)
+	}
+}
+
+// Ops only the CPU implements (conv / pool and their backward).
+run_cpu_node :: proc(u: ^UOp) {
+	#partial switch u.op {
 	case .Conv2d:
 		x, w := u.src[0], u.src[1]
 		win := u.arg.(Window)
@@ -262,14 +282,5 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	case .MaxPool2dBwd:
 		g, x := u.src[0], u.src[1]
 		maxpool2d_backward(u.data, g.data, x.data, x.shape[0], x.shape[1], x.shape[2], x.shape[3], u.arg.(Window))
-	case:
-		fmt.panicf("run_node: no kernel for %v", u.op)
-	}
-	counters.kernels += 1
-
-	if debug_level >= 2 {
-		dt := i64(time.tick_since(t0))
-		counters.time_ns += dt
-		fmt.printfln("  kernel  %-16v shape=%v  %7.3f ms", u.op, u.shape, f64(dt) / 1e6)
 	}
 }

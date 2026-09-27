@@ -24,6 +24,7 @@ import "core:os"
 import ml "../../ml"
 
 main :: proc() {
+	ml.setup_from_env()
 
 	fmt.println("=== Linear regression: y = w*x + b ===")
 	ml.debug_from_env()

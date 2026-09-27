@@ -29,7 +29,7 @@ forward :: proc(x: ^ml.Tensor) -> ^ml.Tensor {
 
 main :: proc() {
 	fmt.println("=== MNIST CNN: conv→pool→conv→pool→fc ===")
-	ml.debug_from_env()
+	ml.setup_from_env()
 	ml.warn_if_unoptimized()
 	ml.seed(42)
 

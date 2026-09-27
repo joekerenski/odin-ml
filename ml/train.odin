@@ -42,13 +42,13 @@ trainer_init :: proc(
 	lr: f32 = 0.05,
 	momentum: f32 = 0.9,
 	batch_size: int = 128,
-	arena_block: int = 8 * mem.Megabyte,
+	arena_block: int = 64 * mem.Megabyte,
 	opt: Optimizer = nil,
 ) {
 	tr.params = params
 	tr.opt = opt != nil ? opt : new_sgd_list(lr, momentum, params)
 	tr.batch_size = batch_size
-	mem.dynamic_arena_init(&tr.arena, block_size = arena_block)
+	arena_init(&tr.arena, arena_block)
 }
 
 trainer_destroy :: proc(tr: ^Trainer) {

@@ -39,6 +39,8 @@ expect_close :: proc(got, want: ^ml.Tensor, msg: string) {
 
 main :: proc() {
 	fmt.println("=== tensor ops ===")
+	ml.setup_from_env()
+	fmt.printfln("device: %v", ml.get_device())
 	fmt.printfln("HAS_HARDWARE_SIMD=%v  (portable #simd → NEON on this Mac)", simd.HAS_HARDWARE_SIMD)
 	fmt.println()
 

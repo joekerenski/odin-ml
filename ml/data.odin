@@ -136,7 +136,7 @@ eval_accuracy :: proc(
 	forward: proc(x: ^Tensor) -> ^Tensor, X: ^Tensor, Y: []u8, batch_size: int,
 ) -> f32 {
 	arena: mem.Dynamic_Arena
-	mem.dynamic_arena_init(&arena)
+	arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 
 	n := int(X.shape[0])

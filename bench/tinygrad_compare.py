@@ -20,27 +20,7 @@ if os.environ.get("TINYGRAD_PATH"):
     sys.path.insert(0, os.environ["TINYGRAD_PATH"])
 from tinygrad import Tensor  # noqa: E402
 
-
-def parse_odin(path: str) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    results, times = {}, {}
-    lines = Path(path).read_text().splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("RESULT "):
-            name = line.split(" ", 1)[1]
-            i += 1
-            vals = np.array([float(x) for x in lines[i].split()], dtype=np.float32)
-            results[name] = vals
-        elif line.startswith("TIME "):
-            _, name, ms = line.split()
-            times[name] = float(ms)
-        i += 1
-    return results, times
-
-
-def close(a: np.ndarray, b: np.ndarray, rtol=1e-4, atol=1e-5) -> bool:
-    return np.allclose(a, b, rtol=rtol, atol=atol)
+from oracle import close, parse_odin, seq_np  # noqa: E402
 
 
 def tiny_results() -> dict[str, np.ndarray]:
@@ -105,8 +85,7 @@ def tiny_results() -> dict[str, np.ndarray]:
 
 
 def seq(shape, k, requires_grad=False) -> Tensor:
-    n = int(np.prod(shape))
-    t = Tensor(np.sin(np.arange(n) * 0.7 + k).astype(np.float32).reshape(shape))
+    t = Tensor(seq_np(shape, k))
     if requires_grad:
         t.requires_grad = True
     return t

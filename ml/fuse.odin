@@ -116,7 +116,8 @@ run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
 		outs[k] = Fused_Store{slot_of[u], u.data}
 	}
 
-	run_fused_kernel(inputs[:n_in], insns[:len(group)], outs[:len(stores)], out_shape)
+	job := Fused_Job{inputs[:n_in], insns[:len(group)], outs[:len(stores)], out_shape}
+	backend.fused(&job)
 	return true
 }
 
@@ -130,9 +131,9 @@ Fused_Job :: struct {
 	out_shape: []i32,
 }
 
-run_fused_kernel :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, out_shape: []i32) {
-	job := Fused_Job{inputs, insns, stores, out_shape}
-	parallel_for(int(numel(out_shape)), PAR_GRAIN, run_fused_range, &job)
+// CPU backend: split the output across cores.
+run_fused_kernel :: proc(job: ^Fused_Job) {
+	parallel_for(int(numel(job.out_shape)), PAR_GRAIN, run_fused_range, job)
 }
 
 // Output elements [lo, hi), CHUNK at a time.

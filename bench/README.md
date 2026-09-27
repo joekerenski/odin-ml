@@ -11,6 +11,16 @@ uv sync          # installs numpy + tinygrad into .venv
 
 To compare against a local tinygrad checkout instead: `TINYGRAD_PATH=/path/to/tinygrad uv run tinygrad_compare.py …`.
 
+Two oracles read the same dump (`make oracle` from the repo root runs both):
+
+- `tinygrad_compare.py` — tinygrad
+- `mlx_compare.py` — MLX, using its own kernels where it has them (layer_norm,
+  cross_entropy, scaled_dot_product_attention, Adam/AdamW). Runs MLX on its CPU
+  by default: MLX's GPU float32 matmul on the M5 is reduced precision (~1e-3
+  relative); `--gpu` checks against it with rtol 3e-3.
+
+`ML_DEVICE=metal` on the odin side checks the Metal backend against the same references.
+
 ## Run
 
 ```bash
@@ -62,6 +72,7 @@ This is the **eager-vs-lazy** issue you flagged in your lessons. A lazy tensor t
 - `odin_matrix/` — **native `matrix[M,N]T` vs plain loops vs explicit #simd**, plus an
   asm / LLVM-IR study (`build_asm.sh`) showing what the compiler emits
 - `metal_dispatch/` — Metal dispatch overhead: per-kernel commit vs one command buffer, vs CPU
+- `oracle.py` — shared by both oracles: dump parser, deterministic inputs, report
 - `compare.py` — matmul gate
 - `compare_bcast.py` — broadcast gate
 

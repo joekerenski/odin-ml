@@ -36,13 +36,6 @@ make_batch :: proc(size, n_obs: int) -> (b: Batch) {
 	return
 }
 
-// Per-step arena with big blocks: after the first step every tensor comes from
-// warm, already-mapped memory (small default blocks send big tensors to the
-// heap, which maps and faults in fresh pages every step).
-arena_init :: proc(a: ^mem.Dynamic_Arena) {
-	mem.dynamic_arena_init(a, block_size = 64 * mem.Megabyte, out_band_size = 32 * mem.Megabyte)
-}
-
 // Mean NLL of the true y under the exact posterior: the floor for any model.
 exact_nll :: proc(ps: []Problem) -> f64 {
 	s: f64 = 0
@@ -64,7 +57,7 @@ Config :: struct {
 train :: proc(m: ^$M, params: []^ml.Tensor, cfg: Config, step: proc(m: ^M, b: Batch) -> (loss, post_nll: ^ml.Tensor)) {
 	opt := ml.new_adam(params, lr = cfg.lr)
 	arena: mem.Dynamic_Arena
-	arena_init(&arena)
+	ml.arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 	heap := context.allocator
 
@@ -94,7 +87,7 @@ train :: proc(m: ^$M, params: []^ml.Tensor, cfg: Config, step: proc(m: ^M, b: Ba
 // KL(exact ‖ ·) on held-out problems for the model and two references.
 evaluate :: proc(m: ^$M, cfg: Config, posterior_q: proc(m: ^M, b: Batch) -> Gmm, label: string) {
 	arena: mem.Dynamic_Arena
-	arena_init(&arena)
+	ml.arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 	context.allocator = mem.dynamic_arena_allocator(&arena)
 
@@ -137,7 +130,7 @@ report_kl :: proc(name: string, kl: []f64) {
 // KL(exact prior ‖ q_prior): how well the prior tokens alone decode to the prior.
 evaluate_prior_fit :: proc(m: ^$M, cfg: Config, prior_q: proc(m: ^M, b: Batch) -> Gmm) {
 	arena: mem.Dynamic_Arena
-	arena_init(&arena)
+	ml.arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 	context.allocator = mem.dynamic_arena_allocator(&arena)
 

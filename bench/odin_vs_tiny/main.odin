@@ -107,6 +107,7 @@ milestone1 :: proc() {
 }
 
 main :: proc() {
+	ml.setup_from_env()
 	milestone1()
 
 	// --- correctness (fixed inputs, match tinygrad_compare.py) ---

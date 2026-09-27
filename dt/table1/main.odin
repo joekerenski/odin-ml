@@ -47,7 +47,7 @@ main :: proc() {
 
 	fmt.printfln("=== M3: Distribution Transformer DT-%d, InvGamma prior on σ² ===", model_cfg.k)
 	ml.warn_if_unoptimized()
-	ml.debug_from_env()
+	ml.setup_from_env()
 	ml.seed(0)
 
 	m := dt.dt_model(model_cfg)

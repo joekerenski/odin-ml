@@ -55,7 +55,7 @@ step :: proc(m: ^Model, b: dt.Batch) -> (loss, post_nll: ^ml.Tensor) {
 main :: proc() {
 	fmt.println("=== M2: amortized posterior, InvGamma prior on σ², DeepSets MLP → GMM ===")
 	ml.warn_if_unoptimized()
-	ml.debug_from_env()
+	ml.setup_from_env()
 	ml.seed(0)
 
 	m := Model{

@@ -1,12 +1,9 @@
 package ml
 
-// Non-Darwin fallback: metal_add runs on the CPU.
-// The real implementation lives in backend_metal_darwin.odin.
+// Non-Darwin: no Metal. set_device(.Metal) returns false.
 
 when ODIN_OS != .Darwin {
-	metal_init :: proc() -> bool { return false }
-
-	metal_add :: proc(out, a, b: []f32) {
-		for i in 0 ..< len(out) do out[i] = a[i] + b[i]
+	metal_backend :: proc() -> (Backend, bool) {
+		return {}, false
 	}
 }

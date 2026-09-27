@@ -51,4 +51,4 @@ bench/**/main
 **/probe_bin
 
 # bench output
-bench/odin_ref.txt
+bench/odin_ref*.txt

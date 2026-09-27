@@ -3,9 +3,15 @@ ODIN  ?= odin
 FAST  := -o:speed -no-bounds-check
 BUILD := build
 
-.PHONY: test mnist cnn regression tour bench data clean dt-conjugate dt-table1
+.PHONY: test test-metal oracle mnist cnn regression tour bench data clean dt-conjugate dt-table1
 
 test:        ; $(ODIN) run tests/tensor_ops -out:$(BUILD)/tensor_ops
+test-metal:  ; $(ODIN) run tests/metal -o:speed -out:$(BUILD)/metal_parity   # Metal vs CPU, every kernel path
+# tinygrad + MLX oracles; ML_DEVICE=metal make oracle checks the GPU path
+oracle:
+	$(ODIN) build bench/odin_vs_tiny -o:speed -out:$(BUILD)/odin_vs_tiny
+	$(BUILD)/odin_vs_tiny > bench/odin_ref.txt
+	cd bench && uv run tinygrad_compare.py odin_ref.txt && uv run mlx_compare.py odin_ref.txt
 mnist:       ; $(ODIN) run examples/mnist $(FAST) -out:$(BUILD)/mnist
 cnn:         ; $(ODIN) run examples/mnist_cnn $(FAST) -out:$(BUILD)/mnist_cnn
 regression:  ; $(ODIN) run examples/regression $(FAST) -out:$(BUILD)/regression

@@ -8,15 +8,15 @@ Decisions
 - One flow: Tensor (lazy) → UOp DAG → fuse → kernels. No second IR, no sketches.
 - MatMul stays a primitive. No mul+sum → GEMM recovery pass.
 - Performance comes from hand-written kernels per primitive / fused group
-  (Accelerate on CPU now, handwritten Metal once the rest settles), not from a
-  codegen pipeline.
+  (Accelerate + all cores on CPU, generated/handwritten Metal on GPU), not from a
+  general optimizing compiler (fused groups are rendered to MSL directly).
 - ReLU/Sigmoid/softmax/LayerNorm etc. are UOp compositions, not primitives.
 
 Layout
   ml/                 the library
   examples/tour/      the API at every level (01 tensor … 05 nn), always runnable
   examples/           regression, mnist (MLP), mnist_cnn
-  tests/              tensor_ops (118 checks), metal (GPU smoke test)
+  tests/              tensor_ops (118 checks, any device), metal (Metal vs CPU parity)
   dt/                 the paper project (Distribution Transformers), see dt/README.md
   bench/              loop bench, matmul benches, tinygrad/numpy compare
   docs/, studies/     notes
@@ -48,16 +48,26 @@ Numbers (M5, after unification; before in parens)
 - CPU backend: fused ewise kernel runs per 256-element chunk; parallel_for on
   a persistent worker pool (fused, permute, reduce, batched GEMM); kernel
   outputs allocated non-zeroed; dt arenas use 64 MB warm blocks.
-- Metal feasibility (bench/metal_dispatch): 1000 dependent kernels in ONE
-  command buffer cost ~1 µs dispatch each; 327k-element ewise 0.017 ms vs CPU
-  0.084 ms (5×). Commit+wait per kernel: 0.2–0.3 ms (slower than CPU).
+- Metal backend (ml/backend_metal_darwin.odin): ML_DEVICE=metal, same code.
+  Unified memory: ml.arena_init arenas are zero-copy; other memory is staged.
+  A realize encodes into command buffers committed every 128 kernels (GPU runs
+  while the CPU encodes), synced once. Fused groups → generated MSL, cached by
+  shape hash. GEMM on simdgroup_matrix 8×8 units fed from threadgroup memory,
+  split-K for long K, a tiny kernel for attention heads. Conv/pool: CPU fallback.
+  DT step 86 ms (CPU) → 34 ms (Metal).
+- Checks: tests on both devices (118), Metal-vs-CPU parity over every kernel
+  path (29), tinygrad + MLX oracles on both devices (33 each). MLX's GPU fp32
+  matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
 
 Known debt
 - Multi-consumer nodes break fusion (x feeding relu AND its grad = own kernel).
 - Over-budget fused groups (>16 ops / >8 inputs) fall back to op-by-op.
 - Optimizers update raw buffers outside the graph (fine for now; lazy optim later).
 - Exp/Log run the scalar path of the fused kernel (no SIMD exp/log yet).
-- Metal: metal_add prototype only, not wired into the scheduler.
+- Metal: conv/pool run on the CPU (sync + fallback); ~1300 dispatches/step is
+  now the limit — fewer kernels (multi-consumer fusion, permutes folded into
+  GEMM strides) is the next lever for both backends. CUDA: same Backend
+  interface with managed memory (cudaMallocManaged) + NVRTC for fused groups.
 - A DT step is ~1200 kernels; multi-consumer fusion would cut that a lot.
 
 Plan for today (user)
@@ -76,8 +86,7 @@ Milestones
    DT-5 0.00082/0.00034 (paper 0.0003), DT-2 0.00139/0.00099 (paper 0.0058).
    ~14 min per run on CPU (84 ms/step).
 4. Full-covariance GMM (Cholesky param) + sequential sensor fusion. First UI hook.
-5. Metal backend (next, before M4): device-resident buffers, whole step in one
-   command buffer, MSL codegen for fused groups, reduce/permute/batched GEMM.
+5. Metal backend ✓  (done before M4; see above). CUDA later, same interface.
 
 References
 - Paper: https://arxiv.org/html/2502.02463v3
