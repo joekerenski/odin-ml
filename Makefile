@@ -3,7 +3,7 @@ ODIN  ?= odin
 FAST  := -o:speed -no-bounds-check
 BUILD := build
 
-.PHONY: test mnist cnn regression tour bench data clean dt-conjugate
+.PHONY: test mnist cnn regression tour bench data clean dt-conjugate dt-table1
 
 test:        ; $(ODIN) run tests/tensor_ops -out:$(BUILD)/tensor_ops
 mnist:       ; $(ODIN) run examples/mnist $(FAST) -out:$(BUILD)/mnist
@@ -16,6 +16,7 @@ data:        ; sh data/download-mnist.sh
 
 # Distribution Transformers (dt/)
 dt-conjugate: ; $(ODIN) run dt/conjugate $(FAST) -out:$(BUILD)/dt_conjugate
+dt-table1:    ; $(ODIN) run dt/table1 $(FAST) -out:$(BUILD)/dt_table1   # DT-5; DT-2: add -- 2
 clean:       ; rm -rf $(BUILD)
 
 $(shell mkdir -p $(BUILD))

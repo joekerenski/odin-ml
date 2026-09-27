@@ -2,13 +2,15 @@ package ml
 
 // ============================================================================
 // Fused elementwise kernel. A group of same-shape ewise UOps becomes a tiny
-// register program (insns over slots) run in ONE loop over the output:
+// program (insns over slots) run over the output in CHUNKs:
 //
-//   slots[0..n_in)      loads of external inputs (broadcast by load mode)
+//   slots[0..n_in)      each input's values for this chunk (broadcast by load
+//                       mode; Direct inputs are just pointers, no copy)
 //   slots[n_in + j]     result of insn j (one per group node, topo order)
-//   stores              slots written back to buffers someone still needs
+//   stores              results someone still needs go straight to their buffer
 //
-// SIMD (f32x4) when every load is vectorizable; scalar loop otherwise.
+// Per chunk, each insn is one tight SIMD loop with the op fixed at compile
+// time, so dispatch costs once per CHUNK elements, not once per vector.
 // ============================================================================
 
 import "base:intrinsics"
@@ -118,41 +120,102 @@ run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
 	return true
 }
 
+CHUNK :: 256
+PAR_GRAIN :: 32 * 1024 // elements per thread part, below this: one thread
+
+Fused_Job :: struct {
+	inputs:    []Fused_In,
+	insns:     []Fused_Insn,
+	stores:    []Fused_Store,
+	out_shape: []i32,
+}
+
 run_fused_kernel :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, out_shape: []i32) {
-	n := int(numel(out_shape))
-	simd_ok := true
-	for insn in insns do if insn.op == .Exp || insn.op == .Log do simd_ok = false
-	row_n, col_inner := 0, 0
-	for inp in inputs {
-		switch inp.mode {
-		case .Direct, .Scalar:
-		case .Row:
-			if row_n != 0 && row_n != inp.n do simd_ok = false
-			row_n = inp.n
-		case .Col:
-			if col_inner != 0 && col_inner != inp.inner do simd_ok = false
-			col_inner = inp.inner
-		case .Block, .Generic:
-			simd_ok = false
+	job := Fused_Job{inputs, insns, stores, out_shape}
+	parallel_for(int(numel(out_shape)), PAR_GRAIN, run_fused_range, &job)
+}
+
+// Output elements [lo, hi), CHUNK at a time.
+run_fused_range :: proc(data: rawptr, lo, hi: int) {
+	using job := (^Fused_Job)(data)
+	n_in := len(inputs)
+	buf: [MAX_FUSED_SLOTS][CHUNK]f32 // chunk scratch (L1-resident)
+	ptr: [MAX_FUSED_SLOTS][^]f32 // where each slot's chunk values live
+	store_of: [MAX_FUSED_SLOTS]int // slot → store index + 1 (0: not stored)
+	for st, k in stores do store_of[st.slot] = k + 1
+
+	for inp, k in inputs {
+		if inp.mode == .Scalar {
+			for &v in buf[k] do v = inp.data[0]
+			ptr[k] = &buf[k][0]
 		}
 	}
-	if row_n != 0 && col_inner != 0 do simd_ok = false
-
-	if simd_ok && len(insns) == 1 && row_n == 0 && col_inner == 0 && len(stores) == 1 {
-		run_single_simd(inputs, insns[0], stores[0].data, n)
-		return
+	idx: [MAX_DIMS]i32
+	for base := lo; base < hi; base += CHUNK {
+		m := min(CHUNK, hi - base)
+		for inp, k in inputs {
+			b := &buf[k]
+			switch inp.mode {
+			case .Scalar:
+			case .Direct: ptr[k] = &inp.data[base]
+			case .Row:
+				j := base % inp.n
+				for i in 0 ..< m {
+					b[i] = inp.data[j]
+					j += 1
+					if j == inp.n do j = 0
+				}
+				ptr[k] = &b[0]
+			case .Col:
+				for i in 0 ..< m do b[i] = inp.data[(base + i) / inp.inner]
+				ptr[k] = &b[0]
+			case .Block:
+				for i in 0 ..< m do b[i] = inp.data[((base + i) / inp.inner) % inp.n]
+				ptr[k] = &b[0]
+			case .Generic:
+				for i in 0 ..< m {
+					unravel_index(i32(base + i), out_shape, idx[:])
+					b[i] = inp.data[flat_of_shape(idx[:], len(out_shape), inp.shape)]
+				}
+				ptr[k] = &b[0]
+			}
+		}
+		for insn, j in insns {
+			slot := n_in + j
+			dst: [^]f32 = &buf[slot][0]
+			if st := store_of[slot]; st > 0 do dst = &stores[st - 1].data[base]
+			run_chunk(insn.op, dst, ptr[insn.a], ptr[insn.b], m)
+			ptr[slot] = dst
+		}
 	}
+}
 
-	switch {
-	case !simd_ok:
-		run_fused_scalar(inputs, insns, stores, out_shape, n)
-	case row_n != 0:
-		run_fused_rows_simd(inputs, insns, stores, n, row_n)
-	case col_inner != 0:
-		run_fused_rows_simd(inputs, insns, stores, n, col_inner)
-	case:
-		run_fused_flat_simd(inputs, insns, stores, n)
+// dst[i] = op(a[i], b[i]) for one chunk. b is ignored by unary ops.
+run_chunk :: proc(op: Op, dst, a, b: [^]f32, m: int) {
+	#partial switch op {
+	case .Add: chunk_loop(dst, a, b, m, .Add)
+	case .Sub: chunk_loop(dst, a, b, m, .Sub)
+	case .Mul: chunk_loop(dst, a, b, m, .Mul)
+	case .Div: chunk_loop(dst, a, b, m, .Div)
+	case .Max: chunk_loop(dst, a, b, m, .Max)
+	case .CmpLt: chunk_loop(dst, a, b, m, .CmpLt)
+	case .Neg: chunk_loop(dst, a, b, m, .Neg)
+	case .Sqrt: chunk_loop(dst, a, b, m, .Sqrt)
+	case .Expand: chunk_loop(dst, a, b, m, .Expand)
+	case .Exp: for i in 0 ..< m do dst[i] = math.exp(a[i])
+	case .Log: for i in 0 ..< m do dst[i] = math.ln(a[i])
+	case: panic("run_chunk: not an elementwise op")
 	}
+}
+
+chunk_loop :: #force_inline proc(dst, a, b: [^]f32, m: int, $op: Op) {
+	i := 0
+	for ; i + 4 <= m; i += 4 {
+		va := intrinsics.unaligned_load((^simd.f32x4)(&a[i]))
+		vb := intrinsics.unaligned_load((^simd.f32x4)(&b[i]))
+		intrinsics.unaligned_store((^simd.f32x4)(&dst[i]), fused_eval_simd(op, va, vb))
+	}
+	for ; i < m; i += 1 do dst[i] = fused_eval(op, a[i], b[i])
 }
 
 fused_eval :: #force_inline proc(op: Op, a, b: f32) -> f32 {
@@ -164,12 +227,10 @@ fused_eval :: #force_inline proc(op: Op, a, b: f32) -> f32 {
 	case .Max: return a > b ? a : b
 	case .CmpLt: return a < b ? 1 : 0
 	case .Neg: return -a
-	case .Exp: return math.exp(a)
-	case .Log: return math.ln(a)
 	case .Sqrt: return math.sqrt(a)
 	case .Expand: return a
 	}
-	panic("fused_eval: not ewise")
+	panic("fused_eval: not a simd ewise op")
 }
 
 fused_eval_simd :: #force_inline proc(op: Op, a, b: simd.f32x4) -> simd.f32x4 {
@@ -184,129 +245,5 @@ fused_eval_simd :: #force_inline proc(op: Op, a, b: simd.f32x4) -> simd.f32x4 {
 	case .Sqrt: return simd.sqrt(a)
 	case .Expand: return a
 	}
-	panic("fused_eval_simd: not simd ewise")
-}
-
-fused_load :: #force_inline proc(inp: Fused_In, i: int) -> f32 {
-	switch inp.mode {
-	case .Direct: return inp.data[i]
-	case .Scalar: return inp.data[0]
-	case .Row: return inp.data[i % inp.n]
-	case .Col: return inp.data[i / inp.inner]
-	case .Block: return inp.data[(i / inp.inner) % inp.n]
-	case .Generic: // needs the multi-index; handled by the caller
-	}
-	return 0
-}
-
-run_fused_scalar :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, out_shape: []i32, n: int) {
-	generic := false
-	for inp in inputs do if inp.mode == .Generic do generic = true
-	n_in := len(inputs)
-	slots: [MAX_FUSED_SLOTS]f32
-	idx: [MAX_DIMS]i32
-	for i in 0 ..< n {
-		if generic do unravel_index(i32(i), out_shape, idx[:])
-		for inp, k in inputs {
-			if inp.mode == .Generic {
-				slots[k] = inp.data[flat_of_shape(idx[:], len(out_shape), inp.shape)]
-			} else {
-				slots[k] = fused_load(inp, i)
-			}
-		}
-		for insn, j in insns do slots[n_in + j] = fused_eval(insn.op, slots[insn.a], slots[insn.b])
-		for s in stores do s.data[i] = slots[s.slot]
-	}
-}
-
-run_fused_flat_simd :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, n: int) {
-	n_in := len(inputs)
-	slots: [MAX_FUSED_SLOTS]simd.f32x4
-	i := 0
-	for ; i + 4 <= n; i += 4 {
-		for inp, k in inputs {
-			if inp.mode == .Scalar {
-				slots[k] = inp.data[0]
-			} else {
-				slots[k] = intrinsics.unaligned_load((^simd.f32x4)(&inp.data[i]))
-			}
-		}
-		for insn, j in insns do slots[n_in + j] = fused_eval_simd(insn.op, slots[insn.a], slots[insn.b])
-		for s in stores do intrinsics.unaligned_store((^simd.f32x4)(&s.data[i]), slots[s.slot])
-	}
-	fused_tail(inputs, insns, stores, i, n)
-}
-
-// One op over Direct/Scalar inputs: the op is a compile-time constant, so the
-// loop body is a single SIMD instruction (no per-vector dispatch).
-run_single_simd :: proc(inputs: []Fused_In, insn: Fused_Insn, out: []f32, n: int) {
-	a := inputs[insn.a]
-	b := inputs[insn.b]
-	switch insn.op {
-	case .Add: single_loop(a, b, out, n, .Add)
-	case .Sub: single_loop(a, b, out, n, .Sub)
-	case .Mul: single_loop(a, b, out, n, .Mul)
-	case .Div: single_loop(a, b, out, n, .Div)
-	case .Max: single_loop(a, b, out, n, .Max)
-	case .CmpLt: single_loop(a, b, out, n, .CmpLt)
-	case .Neg: single_loop(a, b, out, n, .Neg)
-	case .Sqrt: single_loop(a, b, out, n, .Sqrt)
-	case .Expand: single_loop(a, b, out, n, .Expand)
-	case .Input, .Const, .Exp, .Log, .Sum, .ReduceMax, .Reshape, .Permute, .MatMul, .Conv2d,
-	     .Conv2dBwdInput, .Conv2dBwdWeight, .MaxPool2d, .MaxPool2dBwd:
-		panic("run_single_simd: not a simd ewise op")
-	}
-}
-
-single_loop :: #force_inline proc(a, b: Fused_In, out: []f32, n: int, $op: Op) {
-	load :: #force_inline proc(x: Fused_In, i: int) -> simd.f32x4 {
-		if x.mode == .Scalar do return x.data[0]
-		return intrinsics.unaligned_load((^simd.f32x4)(&x.data[i]))
-	}
-	i := 0
-	if a.mode == .Direct && b.mode == .Direct {
-		for ; i + 4 <= n; i += 4 {
-			va := intrinsics.unaligned_load((^simd.f32x4)(&a.data[i]))
-			vb := intrinsics.unaligned_load((^simd.f32x4)(&b.data[i]))
-			intrinsics.unaligned_store((^simd.f32x4)(&out[i]), fused_eval_simd(op, va, vb))
-		}
-	} else {
-		for ; i + 4 <= n; i += 4 {
-			intrinsics.unaligned_store((^simd.f32x4)(&out[i]), fused_eval_simd(op, load(a, i), load(b, i)))
-		}
-	}
-	for ; i < n; i += 1 do out[i] = fused_eval(op, fused_load(a, i), fused_load(b, i))
-}
-
-// Rows of length `inner`. Row inputs load data[j]; Col inputs splat data[row].
-run_fused_rows_simd :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, n, inner: int) {
-	n_in := len(inputs)
-	slots: [MAX_FUSED_SLOTS]simd.f32x4
-	for row in 0 ..< n / inner {
-		base := row * inner
-		j := 0
-		for ; j + 4 <= inner; j += 4 {
-			for inp, k in inputs {
-				#partial switch inp.mode {
-				case .Direct: slots[k] = intrinsics.unaligned_load((^simd.f32x4)(&inp.data[base + j]))
-				case .Row: slots[k] = intrinsics.unaligned_load((^simd.f32x4)(&inp.data[j]))
-				case .Col: slots[k] = inp.data[row]
-				case .Scalar: slots[k] = inp.data[0]
-				}
-			}
-			for insn, t in insns do slots[n_in + t] = fused_eval_simd(insn.op, slots[insn.a], slots[insn.b])
-			for s in stores do intrinsics.unaligned_store((^simd.f32x4)(&s.data[base + j]), slots[s.slot])
-		}
-		fused_tail(inputs, insns, stores, base + j, base + inner)
-	}
-}
-
-fused_tail :: proc(inputs: []Fused_In, insns: []Fused_Insn, stores: []Fused_Store, from, to: int) {
-	n_in := len(inputs)
-	ss: [MAX_FUSED_SLOTS]f32
-	for i in from ..< to {
-		for inp, k in inputs do ss[k] = fused_load(inp, i)
-		for insn, j in insns do ss[n_in + j] = fused_eval(insn.op, ss[insn.a], ss[insn.b])
-		for s in stores do s.data[i] = ss[s.slot]
-	}
+	panic("fused_eval_simd: not a simd ewise op")
 }

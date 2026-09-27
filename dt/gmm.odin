@@ -93,3 +93,8 @@ gmm_components :: proc(g: Gmm_Row, w, mu, sd: []f64) {
 		sd[k] = math.exp(f64(g.log_stds[k]))
 	}
 }
+
+count_params :: proc(params: []^ml.Tensor) -> (n: int) {
+	for p in params do n += len(p.data)
+	return
+}

@@ -19,7 +19,8 @@ make data     # download MNIST into data/mnist
 make mnist    # MLP, ~98% in a few seconds
 make cnn      # small conv net
 make tour     # the API at every level: examples/tour/
-make dt-conjugate  # paper project, M2: amortized posterior vs exact (~2 min)
+make dt-conjugate  # paper project, M2: DeepSets MLP posterior vs exact (~40 s)
+make dt-table1     # paper project, M3: the Distribution Transformer (~14 min)
 ```
 
 Builds are optimized (`-o:speed`); plain `odin run` without it is ~10x slower.

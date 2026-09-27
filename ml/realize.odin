@@ -16,6 +16,7 @@ package ml
 // debug_level: 1 step summary, 2 one line per kernel, 3 print graph first.
 // ============================================================================
 
+import "base:runtime"
 import "core:fmt"
 import "core:time"
 
@@ -173,9 +174,13 @@ needs_store :: proc(s: ^Schedule, u: ^UOp, group: []^UOp) -> bool {
 	return s.consumers[u] > inside
 }
 
+// Kernel outputs: every kernel writes its whole output, so skip zeroing.
+// 64-byte aligned (cache line, SIMD-friendly).
 alloc_out :: proc(u: ^UOp) {
-	n := numel(u.shape)
-	u.data = make([]f32, n)
+	n := int(numel(u.shape))
+	bytes, err := runtime.mem_alloc_non_zeroed(n * size_of(f32), 64, context.allocator)
+	assert(err == nil, "alloc_out: out of memory")
+	u.data = ([^]f32)(raw_data(bytes))[:n]
 	counters.bytes_alloc += i64(n) * size_of(f32)
 }
 
@@ -238,9 +243,7 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 		b, tb := gemm_operand(u.src[1])
 		n := len(u.shape)
 		M, N, K := u.shape[n - 2], u.shape[n - 1], u.src[0].shape[n - 1]
-		for i in 0 ..< int(numel(u.shape[:n - 2])) {
-			matmul_f32(u.data[i * int(M * N):], a[i * int(M * K):], b[i * int(K * N):], M, K, N, ta, tb)
-		}
+		matmul_batched(u.data, a, b, int(numel(u.shape[:n - 2])), M, K, N, ta, tb)
 	case .Conv2d:
 		x, w := u.src[0], u.src[1]
 		win := u.arg.(Window)

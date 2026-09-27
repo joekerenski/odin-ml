@@ -182,3 +182,22 @@ matmul_tile_f32_mr4 :: proc(
 	}
 }
 
+
+// Batched GEMM: C[i] = op(A[i]) @ op(B[i]) for i in 0..<batch.
+// (Accelerate is fast even for attention-sized 5×8 matrices; a hand-written
+// loop kernel was 2× slower.)
+Bmm_Job :: struct {
+	C, A, B:          []f32,
+	M, K, N:          i32,
+	trans_a, trans_b: bool,
+}
+
+matmul_batched :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool) {
+	job := Bmm_Job{C, A, B, M, K, N, trans_a, trans_b}
+	parallel_for(batch, max(1, PAR_GRAIN / int(M * K * N)), proc(data: rawptr, lo, hi: int) {
+		using j := (^Bmm_Job)(data)
+		for i in lo ..< hi {
+			matmul_f32(C[i * int(M * N):], A[i * int(M * K):], B[i * int(K * N):], M, K, N, trans_a, trans_b)
+		}
+	}, &job)
+}

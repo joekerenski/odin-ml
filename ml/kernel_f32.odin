@@ -9,11 +9,42 @@ import "core:math"
 
 // ---- reduce (Sum / ReduceMax) --------------------------------------------
 
+Reduce_Job :: struct {
+	dst, src:           []f32,
+	outer, red, inner:  int,
+	by_outer:           bool, // split rows (else columns)
+}
+
 // dst[o, k] = reduce_r src[o, r, k]   (src viewed as [outer, red, inner])
 reduce_block :: proc(dst, src: []f32, outer, red, inner: int, $op: Op) {
+	// Split rows across threads. Few rows (e.g. a bias grad [5120,64] → [1,64]):
+	// one thread; splitting columns there costs more in cache misses than it saves.
+	job := Reduce_Job{dst, src, outer, red, inner, true}
+	if outer < 8 {
+		reduce_rows(dst, src, outer, red, inner, 0, inner, op)
+		return
+	}
+	parallel_for(outer, max(1, PAR_GRAIN / max(red * inner, 1)), reduce_range_proc(op), &job)
+}
+
+@(private)
+reduce_range_proc :: proc($op: Op) -> Range_Proc {
+	return proc(data: rawptr, lo, hi: int) {
+		j := (^Reduce_Job)(data)
+		if j.by_outer {
+			reduce_rows(j.dst[lo * j.inner:hi * j.inner], j.src[lo * j.red * j.inner:hi * j.red * j.inner], hi - lo, j.red, j.inner, 0, j.inner, op)
+		} else {
+			reduce_rows(j.dst, j.src, j.outer, j.red, j.inner, lo, hi, op)
+		}
+	}
+}
+
+// Rows [0, outer), columns [k0, k1) of the [outer, red, inner] view.
+@(private)
+reduce_rows :: proc(dst, src: []f32, outer, red, inner, k0, k1: int, $op: Op) {
 	init: f32 = op == .Sum ? 0 : math.inf_f32(-1)
-	for i in 0 ..< outer * inner do dst[i] = init
-	if inner == 1 {
+	for o in 0 ..< outer do for k in k0 ..< k1 do dst[o * inner + k] = init
+	if inner == 1 && k0 == 0 && k1 == 1 {
 		for o in 0 ..< outer {
 			acc := init
 			for v in src[o * red:(o + 1) * red] {
@@ -28,7 +59,7 @@ reduce_block :: proc(dst, src: []f32, outer, red, inner: int, $op: Op) {
 		d := dst[o * inner:(o + 1) * inner]
 		for r in 0 ..< red {
 			row := src[(o * red + r) * inner:][:inner]
-			for k in 0 ..< inner {
+			for k in k0 ..< k1 {
 				when op == .Sum do d[k] += row[k]
 				else do d[k] = max(d[k], row[k])
 			}
@@ -79,24 +110,48 @@ reduce_kernel :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
 
 // ---- permute --------------------------------------------------------------
 
-// out.shape[i] = shape[order[i]]
+// out.shape[i] = shape[order[i]]. Walks the output in order with an odometer
+// (no divisions); when the last axis stays last, copies contiguous runs.
+// Parts of the output run in parallel, each starting its odometer at lo.
+Permute_Job :: struct {
+	out, a:                []f32,
+	nd, outer_nd, run:     int,
+	out_shape, src_stride: [MAX_DIMS]int,
+}
+
 permute_kernel :: proc(out, a: []f32, shape: []i32, order: []i32) {
-	nd := len(shape)
-	if nd == 2 && order[0] == 1 {
-		M, N := int(shape[0]), int(shape[1])
-		for i in 0 ..< M do for j in 0 ..< N do out[j * M + i] = a[i * N + j]
-		return
-	}
-	out_shape, src_stride: [MAX_DIMS]i32
+	job := Permute_Job{out = out, a = a, nd = len(shape)}
 	for o, i in order {
-		out_shape[i] = shape[o]
-		src_stride[i] = stride_of(shape, int(o))
+		job.out_shape[i] = int(shape[o])
+		job.src_stride[i] = int(stride_of(shape, int(o)))
 	}
-	idx: [MAX_DIMS]i32
-	for f in 0 ..< len(out) {
-		unravel_index(i32(f), out_shape[:nd], idx[:])
-		off: i32 = 0
-		for i in 0 ..< nd do off += idx[i] * src_stride[i]
-		out[f] = a[off]
+	job.run, job.outer_nd = 1, job.nd
+	if int(order[job.nd - 1]) == job.nd - 1 {
+		job.run, job.outer_nd = job.out_shape[job.nd - 1], job.nd - 1
+	}
+	rows := len(out) / job.run
+	parallel_for(rows, max(1, PAR_GRAIN / job.run), permute_range, &job)
+}
+
+@(private)
+permute_range :: proc(data: rawptr, lo, hi: int) {
+	using job := (^Permute_Job)(data)
+	idx: [MAX_DIMS]int
+	off, r := 0, lo
+	for d := outer_nd - 1; d >= 0; d -= 1 { // odometer position of row lo
+		idx[d] = r % out_shape[d]
+		r /= out_shape[d]
+		off += idx[d] * src_stride[d]
+	}
+	for row in lo ..< hi {
+		f := row * run
+		for k in 0 ..< run do out[f + k] = a[off + k]
+		for d := outer_nd - 1; d >= 0; d -= 1 {
+			idx[d] += 1
+			off += src_stride[d]
+			if idx[d] < out_shape[d] do break
+			off -= src_stride[d] * out_shape[d]
+			idx[d] = 0
+		}
 	}
 }

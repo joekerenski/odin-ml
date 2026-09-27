@@ -42,9 +42,15 @@ The UOp model (ml/uop.odin)
   Optimizer union drives Trainer. nn: Linear, Conv2d, LayerNorm.
 
 Numbers (M5, after unification; before in parens)
-- MNIST MLP 20 epochs 4.1 s (14.0 s), 98.0%. MNIST CNN 3 epochs 27.8 s (49.4 s), 98.2%.
-- bench/loop mlp_step 0.17 ms (0.87 ms). 33/33 match tinygrad (ops, grads,
+- MNIST MLP 20 epochs 3.6 s (14.0 s), 98.0%. MNIST CNN 3 epochs 17.3 s (49.4 s), 98.2%.
+- bench/loop mlp_step 0.15 ms (0.87 ms). 33/33 match tinygrad (ops, grads,
   attention fwd+bwd, Adam/AdamW trajectories).
+- CPU backend: fused ewise kernel runs per 256-element chunk; parallel_for on
+  a persistent worker pool (fused, permute, reduce, batched GEMM); kernel
+  outputs allocated non-zeroed; dt arenas use 64 MB warm blocks.
+- Metal feasibility (bench/metal_dispatch): 1000 dependent kernels in ONE
+  command buffer cost ~1 µs dispatch each; 327k-element ewise 0.017 ms vs CPU
+  0.084 ms (5×). Commit+wait per kernel: 0.2–0.3 ms (slower than CPU).
 
 Known debt
 - Multi-consumer nodes break fusion (x feeding relu AND its grad = own kernel).
@@ -52,8 +58,7 @@ Known debt
 - Optimizers update raw buffers outside the graph (fine for now; lazy optim later).
 - Exp/Log run the scalar path of the fused kernel (no SIMD exp/log yet).
 - Metal: metal_add prototype only, not wired into the scheduler.
-- dt-conjugate spends ~9 ms/step (B=1024, per-observation encoder on 10k rows);
-  multi-consumer fusion would help here too.
+- A DT step is ~1200 kernels; multi-consumer fusion would cut that a lot.
 
 Plan for today (user)
 1. Work through the milestones  2. Implement the paper (M2–M4)
@@ -67,9 +72,12 @@ Milestones
 2. Conjugate toy ✓  dt/conjugate: DeepSets MLP → 5-GMM over log σ² (InvGamma
    prior, 10 obs). KL(exact‖q) mean 0.0015, median 0.00048 (paper DT-5 ≈ 0.0004);
    best single Gaussian 0.0101. ~2 min on M5.
-3. Attention + 6-layer decoder (d=64, 8 heads, MLP 2048). Reproduce Table 1 (KL ≈ 4e-4).
+3. Transformer ✓  dt/table1: the paper's DT (0.42M params). KL mean/median:
+   DT-5 0.00082/0.00034 (paper 0.0003), DT-2 0.00139/0.00099 (paper 0.0058).
+   ~14 min per run on CPU (84 ms/step).
 4. Full-covariance GMM (Cholesky param) + sequential sensor fusion. First UI hook.
-5. Handwritten Metal kernels for the hot primitives (MatMul, fused ewise, reduce).
+5. Metal backend (next, before M4): device-resident buffers, whole step in one
+   command buffer, MSL codegen for fused groups, reduce/permute/batched GEMM.
 
 References
 - Paper: https://arxiv.org/html/2502.02463v3

@@ -127,3 +127,36 @@ layer_norm_forward :: proc(l: ^LayerNorm, x: ^Tensor) -> ^Tensor {
 layer_norm_params :: proc(dst: ^[dynamic]^Tensor, l: LayerNorm) {
 	collect_params(dst, l.g, l.b)
 }
+
+// ---- Multi-head attention -------------------------------------------------
+
+Attention :: struct {
+	q, k, v, o: Linear,
+	heads:      i32,
+}
+
+attention_layer :: proc(dim, heads: i32) -> Attention {
+	assert(dim % heads == 0, "attention: dim must divide into heads")
+	return {linear(dim, dim, .Xavier), linear(dim, dim, .Xavier), linear(dim, dim, .Xavier), linear(dim, dim, .Xavier), heads}
+}
+
+// x [B, T, D] attends to mem [B, S, D] (pass mem = x for self-attention).
+// softmax(Q Kᵀ / √dh) V per head, heads concatenated, then the output projection.
+attention_forward :: proc(a: ^Attention, x, mem: ^Tensor) -> ^Tensor {
+	B, T, D := x.shape[0], x.shape[1], x.shape[2]
+	S, H := mem.shape[1], a.heads
+	dh := D / H
+	heads :: proc(t: ^Tensor, B, L, H, dh: i32) -> ^Tensor { // [B, L, D] → [B, H, L, dh]
+		return permute(reshape(t, {B, L, H, dh}), {0, 2, 1, 3})
+	}
+	q := heads(linear_forward(&a.q, x), B, T, H, dh)
+	k := heads(linear_forward(&a.k, mem), B, S, H, dh)
+	v := heads(linear_forward(&a.v, mem), B, S, H, dh)
+	att := softmax(mul(matmul(q, mT(k)), scalar(1 / math.sqrt(f32(dh)))), -1) // [B, H, T, S]
+	o := permute(matmul(att, v), {0, 2, 1, 3}) // [B, T, H, dh]
+	return linear_forward(&a.o, reshape(o, {B, T, D}))
+}
+
+attention_params :: proc(dst: ^[dynamic]^Tensor, a: Attention) {
+	for l in ([]Linear{a.q, a.k, a.v, a.o}) do linear_params(dst, l)
+}

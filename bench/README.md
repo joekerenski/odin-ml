@@ -61,6 +61,7 @@ This is the **eager-vs-lazy** issue you flagged in your lessons. A lazy tensor t
 - `odin_matmul_bcast/` — broadcast adds (scalar/row/col) through the graph
 - `odin_matrix/` — **native `matrix[M,N]T` vs plain loops vs explicit #simd**, plus an
   asm / LLVM-IR study (`build_asm.sh`) showing what the compiler emits
+- `metal_dispatch/` — Metal dispatch overhead: per-kernel commit vs one command buffer, vs CPU
 - `compare.py` — matmul gate
 - `compare_bcast.py` — broadcast gate
 
