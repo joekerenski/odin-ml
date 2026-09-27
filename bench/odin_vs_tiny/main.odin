@@ -106,9 +106,31 @@ milestone1 :: proc() {
 	}
 }
 
+// M4: activations as compositions, fwd + grad (sigmoid far into the tails)
+m4_ops :: proc() {
+	Unary :: proc(x: ^ml.Tensor) -> ^ml.Tensor
+	cases := []struct {
+		name:  string,
+		scale: f32,
+		f:     Unary,
+	}{
+		{"gelu", 4, proc(x: ^ml.Tensor) -> ^ml.Tensor { return ml.gelu(x) }},
+		{"tanh", 3, proc(x: ^ml.Tensor) -> ^ml.Tensor { return ml.tanh(x) }},
+		{"sigmoid_tails", 120, proc(x: ^ml.Tensor) -> ^ml.Tensor { return ml.sigmoid(x) }},
+		{"clip", 2, proc(x: ^ml.Tensor) -> ^ml.Tensor { return ml.clip(x, -1, 0.5) }},
+	}
+	for c in cases {
+		x := ml.clone(ml.mul(seq({12}, 6), ml.scalar(c.scale)), requires_grad = true)
+		print_result(c.name, c.f(x))
+		ml.backward(ml.sum(ml.mul(c.f(x), seq({12}, 7))))
+		print_result(fmt.tprintf("%s_dx", c.name), x.grad)
+	}
+}
+
 main :: proc() {
 	ml.setup_from_env()
 	milestone1()
+	m4_ops()
 
 	// --- correctness (fixed inputs, match tinygrad_compare.py) ---
 	a := ml.from_data_copy({1, 2, 3, 4}, {2, 2})

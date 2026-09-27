@@ -70,8 +70,32 @@ relu :: proc(a: ^Tensor) -> ^Tensor {
 	return maximum(a, scalar(0))
 }
 
+// 1/(1+e^(−x)) with x clipped to ±40 (σ is 0/1 there to 4e-18): unclipped,
+// e^(−x) overflows for x < −88 and the gradient becomes inf·0 = NaN.
+// Stays one chain, so it fuses into a single kernel.
 sigmoid :: proc(a: ^Tensor) -> ^Tensor {
-	return div(scalar(1), add(scalar(1), exp(neg(a))))
+	return div(scalar(1), add(scalar(1), exp(neg(clip(a, -40, 40)))))
+}
+
+// tanh(x) = 2σ(2x) − 1
+tanh :: proc(a: ^Tensor) -> ^Tensor {
+	return sub(mul(scalar(2), sigmoid(mul(a, scalar(2)))), scalar(1))
+}
+
+// GELU, tanh approximation (tinygrad's, torch approximate="tanh"):
+// ½x(1 + tanh(√(2/π)(x + 0.044715x³))) = x·σ(2√(2/π)(x + 0.044715x³))
+gelu :: proc(a: ^Tensor) -> ^Tensor {
+	u := add(a, mul(scalar(0.044715), mul(a, square(a))))
+	return mul(a, sigmoid(mul(u, scalar(1.5957691216057308))))
+}
+
+minimum :: proc(a, b: ^Tensor) -> ^Tensor {
+	return neg(maximum(neg(a), neg(b)))
+}
+
+// Clamp into [lo, hi] (numpy's clip); zero gradient outside.
+clip :: proc(a: ^Tensor, lo, hi: f32) -> ^Tensor {
+	return neg(maximum(neg(maximum(a, scalar(lo))), scalar(-hi))) // min(x, hi) = −max(−x, −hi)
 }
 
 // ---- reduce ---------------------------------------------------------------

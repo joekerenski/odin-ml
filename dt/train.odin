@@ -54,7 +54,7 @@ Config :: struct {
 // Adam + cosine schedule on fresh problems every step. step returns the loss to
 // minimize and the posterior NLL (printed next to the exact posterior's NLL:
 // their gap is the model's remaining expected KL).
-train :: proc(m: ^$M, params: []^ml.Tensor, cfg: Config, step: proc(m: ^M, b: Batch) -> (loss, post_nll: ^ml.Tensor)) {
+train :: proc(m: ^$M, params: []^ml.Tensor, cfg: Config, step: proc(m: ^M, b: Batch) -> (loss, post_nll: ^ml.Tensor)) -> (seconds, last_gap: f64) {
 	opt := ml.new_adam(params, lr = cfg.lr)
 	arena: mem.Dynamic_Arena
 	ml.arena_init(&arena)
@@ -74,18 +74,20 @@ train :: proc(m: ^$M, params: []^ml.Tensor, cfg: Config, step: proc(m: ^M, b: Ba
 		run_exact += exact_nll(b.problems)
 		if (i + 1) % cfg.log_every == 0 {
 			n := f64(cfg.log_every)
+			last_gap = (run_nll - run_exact) / n
 			fmt.printfln("  step %5d  nll %.4f   exact %.4f   gap (≈ E[KL]) %.4f   %.1fs",
-				i + 1, run_nll / n, run_exact / n, (run_nll - run_exact) / n, time.duration_seconds(time.tick_since(t0)))
+				i + 1, run_nll / n, run_exact / n, last_gap, time.duration_seconds(time.tick_since(t0)))
 			run_nll, run_exact = 0, 0
 		}
 		context.allocator = heap
 		mem.dynamic_arena_reset(&arena)
 		ml.clear_grads(..params)
 	}
+	return time.duration_seconds(time.tick_since(t0)), last_gap
 }
 
 // KL(exact ‖ ·) on held-out problems for the model and two references.
-evaluate :: proc(m: ^$M, cfg: Config, posterior_q: proc(m: ^M, b: Batch) -> Gmm, label: string) {
+evaluate :: proc(m: ^$M, cfg: Config, posterior_q: proc(m: ^M, b: Batch) -> Gmm, label: string) -> (mean_kl: f64) {
 	arena: mem.Dynamic_Arena
 	ml.arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
@@ -107,6 +109,7 @@ evaluate :: proc(m: ^$M, cfg: Config, posterior_q: proc(m: ^M, b: Batch) -> Gmm,
 		kl_prior[i] = kl_to_invgamma(grid, p.alpha, p.beta)
 	}
 	fmt.printfln("\nKL(exact posterior ‖ ·) on %d held-out problems:", n)
+	mean_kl = math.sum(kl_model) / f64(n)
 	report_kl(label, kl_model)
 	report_kl("best single Gaussian", kl_gauss)
 	report_kl("prior (ignores data)", kl_prior)
@@ -119,6 +122,7 @@ evaluate :: proc(m: ^$M, cfg: Config, posterior_q: proc(m: ^M, b: Batch) -> Gmm,
 	fmt.printfln("\nexample: prior InvGamma(%.2f, %.2f), n=%d, true y=log σ²=%.3f", p.alpha, p.beta, cfg.n_obs, p.y)
 	fmt.printfln("  exact posterior  InvGamma(%.2f, %.2f): mode of y at %.3f", a, bb, math.ln(bb / a))
 	for k in 0 ..< K do fmt.printfln("  component %d  w=%.3f  μ=%+.3f  σ=%.3f", k, w[k], mu[k], sd[k])
+	return
 }
 
 report_kl :: proc(name: string, kl: []f64) {
@@ -128,7 +132,7 @@ report_kl :: proc(name: string, kl: []f64) {
 }
 
 // KL(exact prior ‖ q_prior): how well the prior tokens alone decode to the prior.
-evaluate_prior_fit :: proc(m: ^$M, cfg: Config, prior_q: proc(m: ^M, b: Batch) -> Gmm) {
+evaluate_prior_fit :: proc(m: ^$M, cfg: Config, prior_q: proc(m: ^M, b: Batch) -> Gmm) -> (mean_kl: f64) {
 	arena: mem.Dynamic_Arena
 	ml.arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
@@ -144,6 +148,8 @@ evaluate_prior_fit :: proc(m: ^$M, cfg: Config, prior_q: proc(m: ^M, b: Batch) -
 		grid^ = invgamma_grid(p.alpha, p.beta)
 		kl[i] = kl_to_gmm(grid, gmm_row(q, i))
 	}
+	mean_kl = math.sum(kl) / f64(cfg.n_test)
 	fmt.println("\nKL(exact prior ‖ prior tokens, unembedded):")
 	report_kl("prior reconstruction", kl)
+	return
 }

@@ -95,6 +95,19 @@ def g(t: Tensor) -> np.ndarray:
     return t.grad.numpy().reshape(-1)
 
 
+def m4_ops() -> dict[str, np.ndarray]:
+    out = {}
+    cases = [("gelu", 4, lambda t: t.gelu()), ("tanh", 3, lambda t: t.tanh()),
+             ("sigmoid_tails", 120, lambda t: t.sigmoid()), ("clip", 2, lambda t: t.clip(-1, 0.5))]
+    for name, scale, f in cases:
+        x = Tensor((seq((12,), 6) * scale).numpy())
+        x.requires_grad = True
+        out[name] = f(x).numpy().reshape(-1)
+        (f(x) * seq((12,), 7)).sum().backward()
+        out[name + "_dx"] = g(x)
+    return out
+
+
 def milestone1() -> dict[str, np.ndarray]:
     out = {}
     x = seq((4,), 0) * 0.5 + 1
@@ -189,7 +202,7 @@ def main() -> int:
         print(__doc__.strip(), file=sys.stderr)
         return 2
     odin_r, odin_t = parse_odin(sys.argv[1])
-    tiny_r = tiny_results() | milestone1()
+    tiny_r = tiny_results() | milestone1() | m4_ops()
     tiny_t = bench_tiny()
 
     print("=== correctness (odin vs tinygrad) ===")

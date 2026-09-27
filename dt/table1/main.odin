@@ -11,14 +11,14 @@ package main
 // Loss (paper, Sec. 3.3): posterior NLL + prior NLL, where the prior term
 // unembeds the prior tokens directly and scores the same sampled x.
 //
-//   make dt-table1                      DT-5
+//   make dt-table1                      DT-5 (loads models/table1_dt5 if present)
 //   odin run dt/table1 -o:speed -- 2    DT-2   (optional 2nd arg: steps)
+//   ... -- 5 train                      retrain and overwrite the checkpoint
 //
 // Paper, Table 1 (wide meta-prior): DT-2 0.0058, DT-5 0.0003.
 // ============================================================================
 
 import "core:fmt"
-import "core:os"
 import "core:strconv"
 import dt ".."
 import ml "../../ml"
@@ -41,8 +41,9 @@ step :: proc(m: ^dt.Dt_Model, b: dt.Batch) -> (loss, post_nll: ^ml.Tensor) {
 main :: proc() {
 	cfg := dt.Config{n_obs = 10, batch = 1024, steps = 10000, warmup = 300, log_every = 500, n_test = 1000, lr = 1e-3}
 	model_cfg := dt.DT_PAPER
-	if len(os.args) > 1 do model_cfg.k = i32(strconv.parse_int(os.args[1]) or_else 5)
-	if len(os.args) > 2 do cfg.steps = strconv.parse_int(os.args[2]) or_else cfg.steps
+	pos, retrain := dt.args()
+	if len(pos) > 0 do model_cfg.k = i32(strconv.parse_int(pos[0]) or_else 5)
+	if len(pos) > 1 do cfg.steps = strconv.parse_int(pos[1]) or_else cfg.steps
 	cfg.log_every = max(1, min(cfg.log_every, cfg.steps / 10))
 
 	fmt.printfln("=== M3: Distribution Transformer DT-%d, InvGamma prior on σ² ===", model_cfg.k)
@@ -56,7 +57,22 @@ main :: proc() {
 		model_cfg.layers, model_cfg.dim, model_cfg.heads, model_cfg.mlp, model_cfg.k,
 		dt.count_params(params[:]), cfg.n_obs, cfg.batch, cfg.steps)
 
-	dt.train(&m, params[:], cfg, step)
-	dt.evaluate(&m, cfg, posterior_q, fmt.tprintf("DT-%d", model_cfg.k))
-	dt.evaluate_prior_fit(&m, cfg, prior_q)
+	path := fmt.tprintf("%s/table1_dt%d.safetensors", dt.MODELS_DIR, model_cfg.k)
+	if dt.try_load(path, params[:], retrain) {
+		dt.evaluate(&m, cfg, posterior_q, fmt.tprintf("DT-%d", model_cfg.k))
+		dt.evaluate_prior_fit(&m, cfg, prior_q)
+		return
+	}
+	secs, gap := dt.train(&m, params[:], cfg, step)
+	kl := dt.evaluate(&m, cfg, posterior_q, fmt.tprintf("DT-%d", model_cfg.k))
+	prior_kl := dt.evaluate_prior_fit(&m, cfg, prior_q)
+	dt.save_model(path, params[:], {
+		{"experiment", "InvGamma conjugate, Table 1 (M3)"},
+		{"arch", fmt.tprintf("DT k=%d dim=%d heads=%d layers=%d mlp=%d", model_cfg.k, model_cfg.dim, model_cfg.heads, model_cfg.layers, model_cfg.mlp)},
+		{"train", fmt.tprintf("batch=%d steps=%d lr=%g warmup=%d n_obs=%d", cfg.batch, cfg.steps, cfg.lr, cfg.warmup, cfg.n_obs)},
+		{"train_seconds", fmt.tprintf("%.0f on %v", secs, ml.get_device())},
+		{"final_train_gap", fmt.tprintf("%.5f", gap)},
+		{"eval_kl_mean", fmt.tprintf("%.5f", kl)},
+		{"eval_prior_kl_mean", fmt.tprintf("%.5f", prior_kl)},
+	})
 }

@@ -105,6 +105,12 @@ def mlx_results() -> dict[str, np.ndarray]:
         for _ in range(5):
             opt.update(params, grad_fn(params))
         out[name] = a(params["w"])
+    w7 = seq((12,), 7)
+    for name, scale, f in [("gelu", 4, nn.gelu_approx), ("tanh", 3, mx.tanh),
+                           ("sigmoid_tails", 120, mx.sigmoid), ("clip", 2, lambda t: mx.clip(t, -1, 0.5))]:
+        xs = seq((12,), 6) * scale
+        out[name] = a(f(xs))
+        out[name + "_dx"] = a(mx.grad(lambda t: mx.sum(f(t) * w7))(xs))
     return out
 
 

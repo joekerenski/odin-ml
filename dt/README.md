@@ -12,10 +12,20 @@ dt/                 package dt — shared pieces
   invgamma.odin     the conjugate problem: meta-prior, sampler, exact posterior
   kl.odin           KL(exact ‖ q) by quadrature, reference baselines
   train.odin        shared harness: fresh batches, Adam + cosine, evaluation
-  transformer.odin  the Distribution Transformer (prior tokens × observation tokens)
+  transformer.odin  the Distribution Transformer: shared trunk; 1D-param priors (M3)
+                    and GMM priors, one token per component (M4)
+  gmm_full.odin     full-covariance mixtures: NLL on the graph, f64 host math
+  tracking.odin     the sensor-fusion problem: dynamics, sensors, meta-prior
+  checkpoint.odin   model library: save to / load from models/*.safetensors
   conjugate/        M2: DeepSets MLP → GMM on the conjugate problem
   table1/           M3: the transformer on the same problem (paper, Table 1)
+  fusion/           M4: sensor fusion, the DT as the update step of a filter (Table 3)
+  models/           `make models`: list the trained models and their metadata
 ```
+
+Every experiment loads its trained weights from `models/` if present, otherwise trains
+and saves them (models/ is not in git: retrain to reproduce) (safetensors, with config and eval results as metadata; they also load
+in numpy/torch/MLX). `-- train` forces retraining.
 
 ## M2 — conjugate check (`make dt-conjugate`, ~2 min)
 
@@ -52,6 +62,59 @@ number, since the paper doesn't publish its meta-prior ranges or n, and trains
 at batch 5000 / lr 5e-3 (we use 1024 / 1e-3). Unstated details we chose:
 ReLU MLPs, pre-LN, block MLP width 256 (gives the paper's 0.43M params).
 
+## M4 — sensor fusion: the DT as a filter (`make dt-fusion`)
+
+Paper Sec. 4.3.1, settings from the reference implementation: a 2D target with state
+(px, vx, py, vy) and linear dynamics with rank-2 process noise, seen through a
+rangefinder (70% true echo with range-proportional noise, 20% exponential clutter,
+10% uniform failures) and a bearing sensor (σ = 0.1 rad).
+
+The DT learns **one Bayesian update**: 4-component full-covariance GMM prior + one
+reading per sensor → GMM posterior. Each prior component is one token (log w, μ, log-diag
+and lower triangle of the precision's Cholesky factor U); each reading is one token (a
+shared MLP with a sensor one-hot). Training priors come from the reference's conjugate
+meta-prior (Dirichlet weights, Gaussian means, Wishart precisions). As a filter, the
+posterior is pushed through the dynamics exactly (GMM → GMM) and fed back as the next
+prior, 100 times.
+
+Full-covariance NLL without a triangular solve: with Λ = UUᵀ,
+log N(x) = Σ log U_jj − ½‖Uᵀ(x−μ)‖² + c, and Uᵀr is a diagonal scale plus two constant
+0/1 matmuls over the strict lower triangle. (The paper factors the covariance instead.)
+
+60k steps × batch 1024 (61M samples, ~37 min on the M5 GPU), 0.41M params:
+
+| one update, 1000 held-out problems | E[−log q] | E[KL(exact ‖ q)] |
+|---|---|---|
+| exact posterior (importance sampling, 20k draws) | −0.068 | — |
+| DT-4 (60k steps) | +0.075 | **0.143** |
+| DT-4 (20k steps) | +0.214 | 0.282 |
+| best single Gaussian | +0.873 | 0.942 |
+| prior (ignores readings) | +1.910 | 1.978 |
+
+| filtering, 100 series × 100 steps | mean −log q_t(x_t) | ms / step (100 series) |
+|---|---|---|
+| DT-4 + exact predict (60k steps) | **−0.359 ± 0.039** | 2.5 (Metal) |
+| DT-4 + exact predict (20k steps) | −0.125 ± 0.043 | 2.6 |
+| particle filter, 1000 | −0.355 ± 0.051 | 0.7 (10 cores) |
+| particle filter, 5000 | −0.457 ± 0.047 | 3.5 |
+| particle filter, 50000 | −0.490 ± 0.035 | 37 |
+| dynamics only (no readings) | +4.225 | — |
+| paper: DT / PF-5000 / EKF | −0.197 / −0.244 / +95.9 | |
+
+By time step, the DT is within 0.04–0.05 of the particle filters for the first 30 steps
+and falls behind later (t = 60–99: −0.16 vs −0.35): the error builds up as the track
+drifts away from the training meta-prior's range (paper App. C.5 sees the same, later).
+The filter starts from 4 identical components, as in the paper, and the permutation-
+equivariant DT keeps them nearly identical: on a typical track the mixture behaves like
+one Gaussian.
+
+Differences from the paper: batch 1024 (paper 5000), block MLP 256 wide (2048), pre-LN,
+precision instead of covariance factor. The particle filter is ours (bootstrap,
+systematic resampling, weighted Gaussian fit + 1e-3·I as in the paper's scoring); it is
+stronger than the paper's (−0.46 vs −0.24 at 5000 particles), so compare the DT against
+our PF column, not across papers.
+
 ## Next
 
-- M4: full-covariance mixtures + sequential filtering (posterior → next prior).
+- Close the gap to the particle filter late in the sequence (training priors closer to
+  what the filter sees; wider block MLP as in the paper).

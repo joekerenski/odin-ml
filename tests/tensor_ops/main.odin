@@ -66,6 +66,7 @@ main :: proc() {
 	test_uop()
 	test_grad_rules()
 	test_milestone1()
+	test_checkpoint()
 	test_fusion()
 
 	fmt.println()
@@ -751,7 +752,7 @@ test_fusion :: proc() {
 	// Longer than one fused kernel's budget (16 insns / 8 inputs): still correct
 	v := ml.from_data_copy({1, 2, 3, 4, 5}, {5})
 	acc := v
-	for i in 0 ..< 20 do acc = ml.add(acc, ml.from_data_copy({1, 1, 1, 1, 1}, {5}))
+	for _ in 0 ..< 20 do acc = ml.add(acc, ml.from_data_copy({1, 1, 1, 1, 1}, {5}))
 	ml.counters_reset()
 	expect_close(acc, ml.from_data_copy({21, 22, 23, 24, 25}, {5}), "20-op chain past fused budget")
 	expect(ml.counters.kernels == 20, "over-budget group runs op by op")
@@ -830,4 +831,52 @@ test_milestone1 :: proc() {
 		ml.optimizer_step(opt)
 	}
 	expect(abs(lin.W.data[0] - 2) < 0.05 && abs(lin.b.data[0] + 1) < 0.05, "Adam fits y = 2x - 1")
+}
+
+test_checkpoint :: proc() {
+	fmt.println("-- checkpoint (safetensors) --")
+	ml.seed(3)
+	a := ml.linear(3, 4)
+	b := ml.layer_norm_layer(4)
+	params: [dynamic]^ml.Tensor
+	ml.linear_params(&params, a)
+	ml.layer_norm_params(&params, b)
+	path := "build/test_checkpoint.safetensors"
+	expect(ml.save(path, params[:], meta = {{"model", "test \"quoted\""}, {"steps", "42"}}), "save")
+
+	want := make([][]f32, len(params))
+	for p, i in params {
+		want[i] = make([]f32, len(p.data))
+		copy(want[i], p.data)
+		for &v in p.data do v = -1
+	}
+	meta, ok := ml.load(path, params[:])
+	same := ok
+	for p, i in params do for v, j in p.data do same &&= v == want[i][j]
+	expect(same, "load restores every param bit-exactly")
+	steps, _ := ml.meta_get(meta, "steps")
+	model, _ := ml.meta_get(meta, "model")
+	expect(steps == "42" && model == "test \"quoted\"", "metadata round-trips")
+
+	wrong := ml.linear(4, 3) // same count, transposed shapes
+	wp: [dynamic]^ml.Tensor
+	ml.linear_params(&wp, wrong)
+	ml.layer_norm_params(&wp, b)
+	_, wok := ml.load(path, wp[:])
+	expect(!wok, "load refuses mismatched shapes")
+
+	// activations added for M4: gelu (tanh approx), tanh, clip, minimum
+	x := ml.from_data_copy({-3, -1, 0, 0.5, 2}, {5})
+	expect_close(ml.tanh(x), ml.from_data_copy({-0.99505475, -0.7615942, 0, 0.46211716, 0.9640276}, {5}), "tanh")
+	expect_close(ml.gelu(x), ml.from_data_copy({-0.0036373, -0.15880801, 0, 0.34571401, 1.95459769}, {5}), "gelu (tanh approx)")
+	expect_close(ml.clip(x, -1, 1), ml.from_data_copy({-1, -1, 0, 0.5, 1}, {5}), "clip")
+	g := ml.from_data_copy({-3, -1, 0, 0.5, 2}, {5}, requires_grad = true)
+	ml.backward(ml.sum(ml.clip(g, -2, 1)))
+	expect_close(g.grad, ml.from_data_copy({0, 1, 1, 1, 0}, {5}), "clip grad: 1 inside, 0 outside")
+	// sigmoid far into the tails: finite values and gradients (was NaN below −88)
+	s := ml.from_data_copy({-200, -90, 0, 90, 200}, {5}, requires_grad = true)
+	ml.backward(ml.sum(ml.sigmoid(s)))
+	finite := true
+	for v in s.grad.data do finite &&= !math.is_nan(v) && !math.is_inf(v)
+	expect(finite && abs(s.grad.data[2] - 0.25) < 1e-6, "sigmoid grad finite at ±200, 0.25 at 0")
 }

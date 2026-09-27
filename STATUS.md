@@ -16,7 +16,7 @@ Layout
   ml/                 the library
   examples/tour/      the API at every level (01 tensor … 05 nn), always runnable
   examples/           regression, mnist (MLP), mnist_cnn
-  tests/              tensor_ops (118 checks, any device), metal (Metal vs CPU parity)
+  tests/              tensor_ops (127 checks, any device), metal (Metal vs CPU parity)
   dt/                 the paper project (Distribution Transformers), see dt/README.md
   bench/              loop bench, matmul benches, tinygrad/numpy compare
   docs/, studies/     notes
@@ -38,12 +38,14 @@ The UOp model (ml/uop.odin)
   (single consumer) → fold transposes → run fused kernels / primitive kernels.
 - IR ops: Input Const | Add Sub Mul Div Max CmpLt Neg Exp Log Sqrt Expand |
   Sum ReduceMax | Reshape Permute | MatMul Conv2d MaxPool2d (+ conv/pool bwd)
+- checkpoint.odin: save/load params as safetensors (+ string metadata); names default
+  to param order. Interop-checked by loading in MLX.
 - optim.odin: SGD, Adam/AdamW (tinygrad semantics), cosine_lr with warmup;
   Optimizer union drives Trainer. nn: Linear, Conv2d, LayerNorm.
 
 Numbers (M5, after unification; before in parens)
 - MNIST MLP 20 epochs 3.6 s (14.0 s), 98.0%. MNIST CNN 3 epochs 17.3 s (49.4 s), 98.2%.
-- bench/loop mlp_step 0.15 ms (0.87 ms). 33/33 match tinygrad (ops, grads,
+- bench/loop mlp_step 0.15 ms (0.87 ms). 41/41 match tinygrad and MLX (ops, grads,
   attention fwd+bwd, Adam/AdamW trajectories).
 - CPU backend: fused ewise kernel runs per 256-element chunk; parallel_for on
   a persistent worker pool (fused, permute, reduce, batched GEMM); kernel
@@ -55,8 +57,8 @@ Numbers (M5, after unification; before in parens)
   shape hash. GEMM on simdgroup_matrix 8×8 units fed from threadgroup memory,
   split-K for long K, a tiny kernel for attention heads. Conv/pool: CPU fallback.
   DT step 86 ms (CPU) → 34 ms (Metal).
-- Checks: tests on both devices (118), Metal-vs-CPU parity over every kernel
-  path (29), tinygrad + MLX oracles on both devices (33 each). MLX's GPU fp32
+- Checks: tests on both devices (127), Metal-vs-CPU parity over every kernel
+  path (29), tinygrad + MLX oracles on both devices (41 each). MLX's GPU fp32
   matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
 
 Known debt
@@ -85,7 +87,12 @@ Milestones
 3. Transformer ✓  dt/table1: the paper's DT (0.42M params). KL mean/median:
    DT-5 0.00082/0.00034 (paper 0.0003), DT-2 0.00139/0.00099 (paper 0.0058).
    ~14 min per run on CPU (84 ms/step).
-4. Full-covariance GMM (Cholesky param) + sequential sensor fusion. First UI hook.
+4. Sensor fusion ✓  dt/fusion: GMM-token DT (full covariance, precision-Cholesky),
+   the paper's tracking problem, used as the update step of a filter; exact GMM predict.
+   Eval: single-update E[KL] vs importance-sampled exact posterior; 100×100 filtering vs
+   bootstrap PFs (1k/5k/50k), with NLL by time step. Model library: ml.save/ml.load
+   (safetensors), all experiments load from models/ or train+save. Lib: gelu, tanh,
+   clip, minimum; sigmoid no longer NaNs in the backward pass for x < −88.
 5. Metal backend ✓  (done before M4; see above). CUDA later, same interface.
 
 References

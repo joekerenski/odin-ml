@@ -72,6 +72,20 @@ main :: proc() {
 	dt.gmm_head_params(&params, m.head)
 	fmt.printfln("n=%d obs, K=%d, DeepSets φ %d + MLP %d×3, %d params", CFG.n_obs, K, EMBED, HIDDEN, dt.count_params(params[:]))
 
-	dt.train(&m, params[:], CFG, step)
-	dt.evaluate(&m, CFG, posterior_q, "DeepSets MLP → GMM (K=5)")
+	PATH :: dt.MODELS_DIR + "/conjugate_deepsets.safetensors"
+	_, retrain := dt.args()
+	if dt.try_load(PATH, params[:], retrain) {
+		dt.evaluate(&m, CFG, posterior_q, "DeepSets MLP → GMM (K=5)")
+		return
+	}
+	secs, gap := dt.train(&m, params[:], CFG, step)
+	kl := dt.evaluate(&m, CFG, posterior_q, "DeepSets MLP → GMM (K=5)")
+	dt.save_model(PATH, params[:], {
+		{"experiment", "InvGamma conjugate (M2)"},
+		{"arch", fmt.tprintf("DeepSets phi=%d mlp=%dx3 K=%d", EMBED, HIDDEN, K)},
+		{"train", fmt.tprintf("batch=%d steps=%d lr=%g n_obs=%d", CFG.batch, CFG.steps, CFG.lr, CFG.n_obs)},
+		{"train_seconds", fmt.tprintf("%.0f on %v", secs, ml.get_device())},
+		{"final_train_gap", fmt.tprintf("%.5f", gap)},
+		{"eval_kl_mean", fmt.tprintf("%.5f", kl)},
+	})
 }

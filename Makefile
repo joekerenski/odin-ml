@@ -3,7 +3,7 @@ ODIN  ?= odin
 FAST  := -o:speed -no-bounds-check
 BUILD := build
 
-.PHONY: test test-metal oracle mnist cnn regression tour bench data clean dt-conjugate dt-table1
+.PHONY: test test-metal oracle mnist cnn regression tour bench data clean dt-conjugate dt-table1 dt-fusion models
 
 test:        ; $(ODIN) run tests/tensor_ops -out:$(BUILD)/tensor_ops
 test-metal:  ; $(ODIN) run tests/metal -o:speed -out:$(BUILD)/metal_parity   # Metal vs CPU, every kernel path
@@ -23,6 +23,9 @@ data:        ; sh data/download-mnist.sh
 # Distribution Transformers (dt/)
 dt-conjugate: ; $(ODIN) run dt/conjugate $(FAST) -out:$(BUILD)/dt_conjugate
 dt-table1:    ; $(ODIN) run dt/table1 $(FAST) -out:$(BUILD)/dt_table1   # DT-5; DT-2: add -- 2
+dt-fusion:    ; $(ODIN) run dt/fusion $(FAST) -out:$(BUILD)/dt_fusion   # M4; retrain: add -- train
+# trained weights live in models/ (safetensors); experiments load them instead of retraining
+models:       ; @$(ODIN) run dt/models -out:$(BUILD)/models
 clean:       ; rm -rf $(BUILD)
 
 $(shell mkdir -p $(BUILD))

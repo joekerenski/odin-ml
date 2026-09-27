@@ -1,6 +1,9 @@
 # OS
 .DS_Store
 
+# Trained weights (safetensors): reproduced by the dt experiments
+/models/
+
 # Datasets (large binaries); keep the download script
 data/*
 !data/download-mnist.sh
