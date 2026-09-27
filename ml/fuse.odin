@@ -85,7 +85,7 @@ run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
 	if len(group) > MAX_FUSED_INSNS do return false
 	out_shape := group[len(group) - 1].shape
 
-	slot_of: map[^UOp]int
+	slot_of := make(map[^UOp]int, scratch())
 	defer delete(slot_of)
 	inputs: [MAX_FUSED_INPUTS]Fused_In
 	n_in := 0

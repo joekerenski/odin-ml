@@ -9,7 +9,7 @@ A small ML library in [Odin](https://odin-lang.org), inspired by
 - **CPU first:** Accelerate GEMM on macOS, portable SIMD elsewhere. Metal later.
 
 Goal: grow it by reimplementing [Distribution Transformers](https://arxiv.org/abs/2502.02463)
-(~0.4M params). Plan and status: [STATUS.md](STATUS.md).
+(~0.4M params) — that project lives in [dt/](dt/README.md). Plan and status: [STATUS.md](STATUS.md).
 
 ## Run
 
@@ -19,6 +19,7 @@ make data     # download MNIST into data/mnist
 make mnist    # MLP, ~98% in a few seconds
 make cnn      # small conv net
 make tour     # the API at every level: examples/tour/
+make dt-conjugate  # paper project, M2: amortized posterior vs exact (~2 min)
 ```
 
 Builds are optimized (`-o:speed`); plain `odin run` without it is ~10x slower.

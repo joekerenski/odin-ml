@@ -104,11 +104,13 @@ conv2d_f32 :: proc(out, x, w: []f32, N, Ci, H, W, Co: i32, win: Window) {
 	K := Ci * kH * kW
 	P := N * Ho * Wo
 
-	col := make([]f32, K * P)
+	col := make([]f32, K * P, scratch())
+	defer delete(col, scratch())
 	im2col(col, x, N, Ci, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo)
 
 	// out_mat[Co,P] = W[Co,K] @ col[K,P]
-	out_mat := make([]f32, Co * P)
+	out_mat := make([]f32, Co * P, scratch())
+	defer delete(out_mat, scratch())
 	matmul_f32(out_mat, w, col, Co, K, P)
 	scatter_nchw_from_mat(out, out_mat, N, Co, Ho, Wo)
 }
@@ -122,9 +124,11 @@ conv2d_backward_input :: proc(dx, dout, w: []f32, N, Ci, H, W, Co: i32, win: Win
 	K := Ci * kH * kW
 	P := N * Ho * Wo
 
-	dout_mat := make([]f32, Co * P)
+	dout_mat := make([]f32, Co * P, scratch())
+	defer delete(dout_mat, scratch())
 	gather_mat_from_nchw(dout_mat, dout, N, Co, Ho, Wo)
-	dcol := make([]f32, K * P)
+	dcol := make([]f32, K * P, scratch())
+	defer delete(dcol, scratch())
 	matmul_f32(dcol, w, dout_mat, K, Co, P, trans_a = true)
 	col2im(dx, dcol, N, Ci, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo)
 }
@@ -137,9 +141,11 @@ conv2d_backward_weight :: proc(dw, dout, x: []f32, N, Ci, H, W, Co: i32, win: Wi
 	K := Ci * kH * kW
 	P := N * Ho * Wo
 
-	col := make([]f32, K * P)
+	col := make([]f32, K * P, scratch())
+	defer delete(col, scratch())
 	im2col(col, x, N, Ci, H, W, kH, kW, sH, sW, pH, pW, Ho, Wo)
-	dout_mat := make([]f32, Co * P)
+	dout_mat := make([]f32, Co * P, scratch())
+	defer delete(dout_mat, scratch())
 	gather_mat_from_nchw(dout_mat, dout, N, Co, Ho, Wo)
 	matmul_f32(dw, dout_mat, col, Co, P, K, trans_b = true)
 }

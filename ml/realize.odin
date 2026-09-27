@@ -37,6 +37,15 @@ Schedule :: struct {
 	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
 }
 
+schedule_make :: proc() -> (s: Schedule) {
+	s.topo = make([dynamic]^UOp, scratch())
+	s.consumers = make(map[^UOp]int, scratch())
+	s.sinks = make(map[^UOp]bool, scratch())
+	s.folded = make(map[^UOp]bool, scratch())
+	s.uf = make(map[^UOp]^UOp, scratch())
+	return
+}
+
 schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.topo)
 	delete(s.consumers)
@@ -73,10 +82,10 @@ is_mt :: proc(u: ^UOp) -> bool {
 }
 
 realize_all :: proc(sinks: []^UOp) {
-	s: Schedule
+	s := schedule_make()
 	defer schedule_destroy(&s)
 
-	visited: map[^UOp]bool
+	visited := make(map[^UOp]bool, scratch())
 	defer delete(visited)
 	for u in sinks {
 		schedule_visit(&s, u, &visited)
@@ -91,7 +100,7 @@ realize_all :: proc(sinks: []^UOp) {
 	k0 := counters.kernels
 
 	// consumers (each consumer counted once per distinct src)
-	matmul_uses: map[^UOp]int
+	matmul_uses := make(map[^UOp]int, scratch())
 	defer delete(matmul_uses)
 	for u in s.topo {
 		for x, i in u.src {
@@ -124,11 +133,11 @@ realize_all :: proc(sinks: []^UOp) {
 	}
 
 	// last member (in topo order) of each group runs the group
-	last: map[^UOp]^UOp
+	last := make(map[^UOp]^UOp, scratch())
 	defer delete(last)
 	for u in s.topo do if u in s.uf do last[uf_find(&s.uf, u)] = u
 
-	group: [dynamic]^UOp
+	group := make([dynamic]^UOp, scratch())
 	defer delete(group)
 	for u in s.topo {
 		if u in s.folded do continue
@@ -171,7 +180,7 @@ alloc_out :: proc(u: ^UOp) {
 }
 
 run_group :: proc(s: ^Schedule, group: []^UOp) {
-	stores: [dynamic]^UOp
+	stores := make([dynamic]^UOp, scratch())
 	defer delete(stores)
 	for u in group do if needs_store(s, u, group) do append(&stores, u)
 	assert(len(stores) > 0, "fused group has no stores")

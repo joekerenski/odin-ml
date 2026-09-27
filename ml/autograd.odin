@@ -96,17 +96,17 @@ backward :: proc(loss: ^Tensor) {
 	t0: time.Tick
 	if debug_level >= 1 do t0 = time.tick_now()
 
-	topo: [dynamic]^UOp
-	visited: map[^UOp]bool
+	topo := make([dynamic]^UOp, scratch())
+	visited := make(map[^UOp]bool, scratch())
 	defer delete(topo)
 	defer delete(visited)
 	toposort(loss, &topo, &visited)
 
-	grads: map[^UOp]^UOp
+	grads := make(map[^UOp]^UOp, scratch())
 	defer delete(grads)
 	grads[loss] = expand(scalar(1), loss.shape)
 
-	sinks: [dynamic]^UOp
+	sinks := make([dynamic]^UOp, scratch())
 	defer delete(sinks)
 	append(&sinks, loss)
 

@@ -56,15 +56,17 @@ matmul_f32 :: proc(C, A, B: []f32, M, K, N: i32, trans_a := false, trans_b := fa
 	}
 	a, b := A, B
 	if trans_a {
-		a = make([]f32, M * K)
+		a = make([]f32, M * K, scratch())
 		permute_kernel(a, A, {K, M}, {1, 0})
 	}
 	if trans_b {
-		b = make([]f32, K * N)
+		b = make([]f32, K * N, scratch())
 		permute_kernel(b, B, {N, K}, {1, 0})
 	}
 	for i in 0..<int(M * N) do C[i] = 0
 	matmul_f32_accum_pure(C, a, b, M, K, N)
+	if trans_a do delete(a, scratch())
+	if trans_b do delete(b, scratch())
 }
 
 // ============================================================================

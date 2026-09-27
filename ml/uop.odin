@@ -22,6 +22,7 @@ package ml
 // MatMul / Conv / Pool stay primitives with hand-written kernels.
 // ============================================================================
 
+import "base:runtime"
 import "core:fmt"
 
 MAX_DIMS :: 8
@@ -118,6 +119,13 @@ new_node :: proc(op: Op, shape: []i32, arg: Arg, srcs: ..^UOp) -> ^UOp {
 		if s.requires_grad do u.requires_grad = true
 	}
 	return u
+}
+
+// Internal bookkeeping (scheduler maps, kernel temporaries) lives on the heap
+// and is freed right away — never on the caller's allocator, which only holds
+// graph nodes and tensor data (e.g. a per-step arena).
+scratch :: proc() -> runtime.Allocator {
+	return runtime.heap_allocator()
 }
 
 // Post-order DFS over the full graph (through realized nodes).

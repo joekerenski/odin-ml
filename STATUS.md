@@ -17,6 +17,7 @@ Layout
   examples/tour/      the API at every level (01 tensor … 05 nn), always runnable
   examples/           regression, mnist (MLP), mnist_cnn
   tests/              tensor_ops (118 checks), metal (GPU smoke test)
+  dt/                 the paper project (Distribution Transformers), see dt/README.md
   bench/              loop bench, matmul benches, tinygrad/numpy compare
   docs/, studies/     notes
   Run from repo root via make: `make test`, `make mnist`, `make cnn` (see Makefile)
@@ -51,13 +52,21 @@ Known debt
 - Optimizers update raw buffers outside the graph (fine for now; lazy optim later).
 - Exp/Log run the scalar path of the fused kernel (no SIMD exp/log yet).
 - Metal: metal_add prototype only, not wired into the scheduler.
+- dt-conjugate spends ~9 ms/step (B=1024, per-observation encoder on 10k rows);
+  multi-consumer fusion would help here too.
+
+Plan for today (user)
+1. Work through the milestones  2. Implement the paper (M2–M4)
+3. Clean up ml/ so it imports as a module (Odin collection)
+4. Visualization app on odin-ui-v2 in its own folder
 
 Milestones
 0. Cleanup ✓  One UOp model: one executor, autograd emits UOps ✓
 1. Ops ✓  Log, Sqrt, reduce Max; softmax/logsumexp/LayerNorm/CE as compositions;
    batched matmul; Adam/AdamW; cosine LR + warmup. All checked vs tinygrad.
-2. Conjugate toy with an MLP: (prior params, data) → posterior params,
-   diagonal-cov GMM NLL loss, synthetic meta-prior sampler. Check vs closed form.
+2. Conjugate toy ✓  dt/conjugate: DeepSets MLP → 5-GMM over log σ² (InvGamma
+   prior, 10 obs). KL(exact‖q) mean 0.0015, median 0.00048 (paper DT-5 ≈ 0.0004);
+   best single Gaussian 0.0101. ~2 min on M5.
 3. Attention + 6-layer decoder (d=64, 8 heads, MLP 2048). Reproduce Table 1 (KL ≈ 4e-4).
 4. Full-covariance GMM (Cholesky param) + sequential sensor fusion. First UI hook.
 5. Handwritten Metal kernels for the hot primitives (MatMul, fused ewise, reduce).

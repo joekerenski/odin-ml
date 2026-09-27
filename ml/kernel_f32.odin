@@ -62,15 +62,19 @@ reduce_kernel :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
 		// more runs to the left? reduce into a temp, else straight into out
 		more := false
 		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
-		dst := more ? make([]f32, outer * inner) : out
+		dst := more ? make([]f32, outer * inner, scratch()) : out
 		if op == .Sum {
 			reduce_block(dst, cur, outer, r, inner, .Sum)
 		} else {
 			reduce_block(dst, cur, outer, r, inner, .ReduceMax)
 		}
+		if raw_data(cur) != raw_data(a) do delete(cur, scratch())
 		cur = dst
 	}
-	if raw_data(cur) != raw_data(out) do copy(out, cur)
+	if raw_data(cur) != raw_data(out) {
+		copy(out, cur)
+		if raw_data(cur) != raw_data(a) do delete(cur, scratch())
+	}
 }
 
 // ---- permute --------------------------------------------------------------

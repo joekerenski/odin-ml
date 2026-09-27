@@ -57,13 +57,13 @@ debug_from_env :: proc() {
 
 // Print the DAG ending at sink (no execution). Sources-first topo order.
 print_graph :: proc(sink: ^Tensor, label := "graph") {
-	topo: [dynamic]^UOp
-	visited: map[^UOp]bool
+	topo := make([dynamic]^UOp, scratch())
+	visited := make(map[^UOp]bool, scratch())
 	defer delete(topo)
 	defer delete(visited)
 	toposort(sink, &topo, &visited)
 
-	index: map[^UOp]int
+	index := make(map[^UOp]int, scratch())
 	defer delete(index)
 	for u, i in topo do index[u] = i
 
