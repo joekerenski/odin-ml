@@ -108,6 +108,24 @@ The filter starts from 4 identical components, as in the paper, and the permutat
 equivariant DT keeps them nearly identical: on a typical track the mixture behaves like
 one Gaussian.
 
+### Same model in tinygrad (`dt/tinygrad/`)
+
+A parameter-for-parameter port (same layout, so checkpoints load both ways). On a fixed
+batch with our trained weights the losses agree to 1e-6 (whole-model oracle). Trained the
+same way (60k × 1024) and scored by the Odin evaluator:
+
+| M5 GPU, same training step | kernels / step | ms / step | 60k-step run | update E[KL] | filter NLL |
+|---|---|---|---|---|---|
+| odin-ml | 1432 (+ Adam on CPU) | 34 | 37 min | 0.143 | −0.359 ± 0.039 |
+| tinygrad, JIT | 1295 (764 fused Adam) | 36.7 | — | — | — |
+| tinygrad, JIT + BEAM=2 | 1295 (764 fused Adam) | 16.6 | 21 min | 0.151 | −0.286 ± 0.041 |
+
+Same training loss and single-update KL; the filter score differs by seed, almost all of
+it late in the sequence (t = 60–99: −0.16 vs −0.02), where the tracks leave the training
+distribution. tinygrad fuses the model into about half our kernels, but that alone buys
+nothing (fused Adam: 1295 → 764 kernels at the same 16.6 ms): its JIT replays a recorded
+command list, and the 2.2× over its own default comes from BEAM-tuned kernels.
+
 Differences from the paper: batch 1024 (paper 5000), block MLP 256 wide (2048), pre-LN,
 precision instead of covariance factor. The particle filter is ours (bootstrap,
 systematic resampling, weighted Gaussian fit + 1e-3·I as in the paper's scoring); it is

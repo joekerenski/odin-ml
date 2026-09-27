@@ -11,6 +11,8 @@ package main
 //
 //   make dt-fusion                                  load models/fusion_dt4 (or train) + evaluate
 //   odin run dt/fusion -o:speed -- train [steps]    retrain and overwrite the checkpoint
+//   odin run dt/fusion -o:speed -- eval [path]      evaluate any checkpoint (e.g. the tinygrad port's)
+//   odin run dt/fusion -o:speed -- check batch      losses on a batch from dt/tinygrad (oracle)
 //
 // Evaluation:
 //   1. one update, 1000 held-out problems: E[KL(exact posterior ‖ q)], using the
@@ -328,10 +330,25 @@ evaluate_filter :: proc(m: ^dt.Dt_Full) -> (dt_nll: f64) {
 	return st.sum / f64(st.n)
 }
 
+// Losses of the loaded model on a fixed batch (comps, z, x) from a safetensors file.
+check_batch :: proc(m: ^dt.Dt_Full, path: string) {
+	B :: 256
+	b := Batch {
+		comps = ml.new_tensor({B, K, dt.N_FEAT}),
+		z     = ml.new_tensor({B, dt.N_OBS, dt.OBS_FEAT}),
+		x     = ml.new_tensor({B, 1, D}),
+	}
+	if _, ok := ml.load(path, {b.comps, b.z, b.x}, {"comps", "z", "x"}); !ok do return
+	loss, post := step(m, b)
+	fmt.printfln("odin      posterior nll %+.6f   prior nll %+.6f   (device %v)", ml.item(post), ml.item(loss) - ml.item(post), ml.get_device())
+}
+
 main :: proc() {
-	cfg := Config{batch = 1024, steps = 20000, warmup = 500, log_every = 500, lr = 1e-3}
+	STEPS :: 60000
+	cfg := Config{batch = 1024, steps = STEPS, warmup = 500, log_every = 500, lr = 1e-3}
 	pos, retrain := dt.args()
-	if len(pos) > 0 do cfg.steps = strconv.parse_int(pos[0]) or_else cfg.steps
+	mode := len(pos) > 0 && (pos[0] == "eval" || pos[0] == "check") ? pos[0] : ""
+	if mode == "" && len(pos) > 0 do cfg.steps = strconv.parse_int(pos[0]) or_else cfg.steps
 	cfg.log_every = max(1, min(cfg.log_every, cfg.steps / 10))
 
 	fmt.println("=== M4: Bayesian sensor fusion, DT update inside a filter ===")
@@ -344,6 +361,18 @@ main :: proc() {
 	fmt.printfln("%d layers, d=%d, %d heads, MLP %d (GELU), K=%d full-covariance components over %dD: %d params",
 		MODEL.layers, MODEL.dim, MODEL.heads, MODEL.mlp, K, D, dt.count_params(params[:]))
 
+	switch mode {
+	case "eval": // any checkpoint with this layout, e.g. one trained by the tinygrad port
+		path := len(pos) > 1 ? pos[1] : CHECKPOINT
+		if !dt.try_load(path, params[:], false) do return
+		evaluate_update(&m, 1000)
+		evaluate_filter(&m)
+		return
+	case "check": // whole-model oracle: losses on a batch written by dt/tinygrad/fusion.py
+		if len(pos) < 2 || !dt.try_load(len(pos) > 2 ? pos[2] : CHECKPOINT, params[:], false) do return
+		check_batch(&m, pos[1])
+		return
+	}
 	if dt.try_load(CHECKPOINT, params[:], retrain) {
 		evaluate_update(&m, 1000)
 		evaluate_filter(&m)
@@ -360,9 +389,10 @@ main :: proc() {
 		ml.Meta{"train_seconds", fmt.tprintf("%.0f on %v", secs, ml.get_device())},
 		ml.Meta{"final_posterior_nll", fmt.tprintf("%.4f", nll)},
 	)
-	dt.save_model(CHECKPOINT, params[:], meta[:]) // keep the weights even if eval fails
+	out := dt.run_path(CHECKPOINT, cfg.steps, STEPS)
+	dt.save_model(out, params[:], meta[:]) // keep the weights even if eval fails
 	kl := evaluate_update(&m, 1000)
 	filter_nll := evaluate_filter(&m)
 	append(&meta, ml.Meta{"eval_update_kl", fmt.tprintf("%.4f", kl)}, ml.Meta{"eval_filter_nll", fmt.tprintf("%.4f", filter_nll)})
-	dt.save_model(CHECKPOINT, params[:], meta[:])
+	dt.save_model(out, params[:], meta[:])
 }

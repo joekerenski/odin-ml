@@ -57,7 +57,7 @@ main :: proc() {
 		model_cfg.layers, model_cfg.dim, model_cfg.heads, model_cfg.mlp, model_cfg.k,
 		dt.count_params(params[:]), cfg.n_obs, cfg.batch, cfg.steps)
 
-	path := fmt.tprintf("%s/table1_dt%d.safetensors", dt.MODELS_DIR, model_cfg.k)
+	path := dt.run_path(fmt.tprintf("%s/table1_dt%d.safetensors", dt.MODELS_DIR, model_cfg.k), cfg.steps, 10000)
 	if dt.try_load(path, params[:], retrain) {
 		dt.evaluate(&m, cfg, posterior_q, fmt.tprintf("DT-%d", model_cfg.k))
 		dt.evaluate_prior_fit(&m, cfg, prior_q)

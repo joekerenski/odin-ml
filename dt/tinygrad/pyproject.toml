@@ -1,0 +1,10 @@
+[project]
+name = "dt-tinygrad"
+version = "0.1.0"
+description = "M4 (sensor fusion) Distribution Transformer ported to tinygrad: speed reference and whole-model oracle"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    # tinygrad master, pinned; TINYGRAD_PATH=/path/to/checkout overrides it
+    "tinygrad @ git+https://github.com/tinygrad/tinygrad@27c2bd05c9b481562c3ffc83a8202921bcc48fdc",
+]

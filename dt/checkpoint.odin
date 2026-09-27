@@ -34,6 +34,13 @@ try_load :: proc(path: string, params: []^ml.Tensor, retrain: bool) -> bool {
 	return true
 }
 
+// Where a training run saves: the experiment's checkpoint for a full-length run,
+// a step-suffixed sibling for shorter/longer ones (a quick test never clobbers it).
+run_path :: proc(path: string, steps, default_steps: int) -> string {
+	if steps == default_steps do return path
+	return fmt.tprintf("%s_%dsteps.safetensors", path[:len(path) - len(".safetensors")], steps)
+}
+
 save_model :: proc(path: string, params: []^ml.Tensor, meta: []ml.Meta) {
 	os.make_directory_all(MODELS_DIR)
 	if ml.save(path, params, meta = meta) do fmt.printfln("saved %s", path)
