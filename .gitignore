@@ -28,7 +28,8 @@ uv.lock
 *.dylib
 *.exe
 *.dSYM/
-# `odin run <dir>` drops a binary named after the package dir
+# make builds into build/; plain `odin run <dir>` drops a binary named after the dir
+/build/
 /main
 /regression
 /mnist
@@ -48,3 +49,6 @@ bench/**/main
 **/study.s
 **/study_ir/
 **/probe_bin
+
+# bench output
+bench/odin_ref.txt

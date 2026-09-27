@@ -1,7 +1,7 @@
 # tinygrad Abstraction Layers — Inspiration for odin-ml
 
 Reference notes on how tinygrad accelerates ML, for designing an Odin counterpart.
-Source: /Users/joe/code/repos/tinygrad
+Source: https://github.com/tinygrad/tinygrad
 
 ---
 

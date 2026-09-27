@@ -19,7 +19,7 @@ Layout
   tests/              tensor_ops (98 checks), metal (GPU smoke test)
   bench/              loop bench, matmul benches, tinygrad/numpy compare
   docs/, studies/     notes
-  Run from repo root: `odin run tests/tensor_ops`, `odin run examples/mnist -o:speed`
+  Run from repo root via make: `make test`, `make mnist`, `make cnn` (see Makefile)
 
 The UOp model (ml/uop.odin)
 - `Tensor :: UOp`. One node type: op, src, arg, shape, data, requires_grad, grad.

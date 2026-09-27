@@ -3,6 +3,7 @@ package main
 // ============================================================================
 // MNIST CNN — tiny LeNet-ish stack to exercise Conv2d + MaxPool + Linear.
 //
+//   make cnn                 (optimized build)
 //   odin run examples/mnist_cnn -o:speed
 //   ML_DEBUG=2 odin run examples/mnist_cnn -o:speed
 // ============================================================================
@@ -29,6 +30,7 @@ forward :: proc(x: ^ml.Tensor) -> ^ml.Tensor {
 main :: proc() {
 	fmt.println("=== MNIST CNN: conv→pool→conv→pool→fc ===")
 	ml.debug_from_env()
+	ml.warn_if_unoptimized()
 	ml.seed(42)
 
 	X_train := ml.load_idx_images("data/mnist/train-images.idx3-ubyte", flatten = false)

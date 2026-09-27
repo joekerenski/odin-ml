@@ -2,20 +2,22 @@
 """Compare odin-ml vs local tinygrad (correctness + a few timings).
 
   cd bench
-  odin run odin_vs_tiny -o:speed > /tmp/odin_ref.txt
-  uv run tinygrad_compare.py /tmp/odin_ref.txt
+  odin run odin_vs_tiny -o:speed > odin_ref.txt
+  uv run tinygrad_compare.py odin_ref.txt
 """
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-TINY = Path("/Users/joe/code/repos/tinygrad")
-sys.path.insert(0, str(TINY))
+# tinygrad from the environment (bench deps), or a local checkout via TINYGRAD_PATH
+if os.environ.get("TINYGRAD_PATH"):
+    sys.path.insert(0, os.environ["TINYGRAD_PATH"])
 from tinygrad import Tensor  # noqa: E402
 
 

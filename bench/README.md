@@ -6,17 +6,17 @@ Compare our kernels to **NumPy f32** on this machine (macOS → Accelerate BLAS)
 
 ```bash
 cd bench
-uv sync          # installs numpy into .venv
+uv sync          # installs numpy + tinygrad into .venv
 ```
 
-Local tinygrad: `/Users/joe/code/repos/tinygrad` (on `sys.path` in the compare script).
+To compare against a local tinygrad checkout instead: `TINYGRAD_PATH=/path/to/tinygrad uv run tinygrad_compare.py …`.
 
 ## Run
 
 ```bash
 # odin-ml vs tinygrad (8 core cases + matmul/add timings)
-odin run odin_vs_tiny -o:speed > /tmp/odin_ref.txt
-uv run tinygrad_compare.py /tmp/odin_ref.txt
+odin run odin_vs_tiny -o:speed > odin_ref.txt
+uv run tinygrad_compare.py odin_ref.txt
 
 # Matmul/elementwise (large)
 uv run numpy_bench.py

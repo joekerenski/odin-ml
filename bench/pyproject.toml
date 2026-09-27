@@ -1,9 +1,10 @@
 [project]
 name = "odin-ml-bench"
 version = "0.1.0"
-description = "Add your description here"
+description = "odin-ml benches: numpy and tinygrad references"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.5.1",
+    "tinygrad",
 ]

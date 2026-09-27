@@ -86,3 +86,11 @@ print_schedule :: proc(s: ^Schedule) {
 		fmt.printfln("  %3d %-16v shape=%v%s", i, u.op, u.shape, u in s.sinks ? "  (sink)" : "")
 	}
 }
+
+// Training loops are ~10x slower without optimization (the fused kernels rely
+// on inlining + vectorization). Call at startup of long-running programs.
+warn_if_unoptimized :: proc() {
+	when ODIN_OPTIMIZATION_MODE == .None {
+		fmt.eprintln("note: unoptimized build (~10x slower). Use `make` targets or -o:speed.")
+	}
+}

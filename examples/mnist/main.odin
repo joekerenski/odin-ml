@@ -3,6 +3,7 @@ package main
 // ============================================================================
 // MNIST MLP — 784 -> 128 (ReLU) -> 10 (softmax cross-entropy)
 //
+//   make mnist                 (optimized build)
 //   odin run examples/mnist -o:speed
 //   ML_DEBUG=2 odin run examples/mnist -o:speed
 // ============================================================================
@@ -21,6 +22,7 @@ forward :: proc(x: ^ml.Tensor) -> ^ml.Tensor {
 main :: proc() {
 	fmt.println("=== MNIST MLP: 784 -> 128 -> 10 ===")
 	ml.debug_from_env()
+	ml.warn_if_unoptimized()
 	ml.seed(42)
 
 	X_train := ml.load_idx_images("data/mnist/train-images.idx3-ubyte", flatten = true)
