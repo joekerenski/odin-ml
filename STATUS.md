@@ -48,8 +48,22 @@ Numbers (M5, after unification; before in parens)
 - bench/loop mlp_step 0.15 ms (0.87 ms). 41/41 match tinygrad and MLX (ops, grads,
   attention fwd+bwd, Adam/AdamW trajectories).
 - CPU backend: fused ewise kernel runs per 256-element chunk; parallel_for on
-  a persistent worker pool (fused, permute, reduce, batched GEMM); kernel
-  outputs allocated non-zeroed; dt arenas use 64 MB warm blocks.
+  a persistent worker pool (fused, permute, reduce, batched GEMM, optimizers,
+  conv/pool loops); kernel outputs allocated non-zeroed; dt arenas use 64 MB
+  warm blocks. Constants are immediates in fused groups (not input slots).
+  Within a realize, dead backward buffers are reused (cache-hot) for later
+  outputs (realize.odin; ML_REUSE=0 turns it off).
+- x86-64 (i5-13500, 20 threads, Linux): AVX2+FMA GEMM picked at runtime by
+  CPUID (kernel_gemm_amd64.odin: packed 6×16 micro-kernel, tiles on all cores,
+  split-K for long K, batched tiny-GEMM path) — a plain build is fast, no
+  -microarch flag. The pool spins briefly between jobs (5 µs/job at 20
+  threads vs 13 µs waking sleepers). Subnormals flushed (FTZ/DAZ).
+  DT fusion step 80 ms (M5 86), table1 86 ms (M5 84), MNIST MLP 3.2 s
+  (M5 3.6), CNN 8.9 s (M5 17.3); mlp_step 0.26–0.35 ms (M5 0.15: latency-bound,
+  two 25 MFLOP GEMMs at ~50 µs each). Before: 5700 ms DT step (the generic
+  x86 build lowered every fused_mul_add lane to a libm fmaf call).
+  ML_THREADS=n overrides the thread count. Most kernels are now DRAM-bound
+  here (~50 GB/s vs the M5's unified memory).
 - Metal backend (ml/backend_metal_darwin.odin): ML_DEVICE=metal, same code.
   Unified memory: ml.arena_init arenas are zero-copy; other memory is staged.
   A realize encodes into command buffers committed every 128 kernels (GPU runs
@@ -57,14 +71,16 @@ Numbers (M5, after unification; before in parens)
   shape hash. GEMM on simdgroup_matrix 8×8 units fed from threadgroup memory,
   split-K for long K, a tiny kernel for attention heads. Conv/pool: CPU fallback.
   DT step 86 ms (CPU) → 34 ms (Metal).
-- Checks: tests on both devices (127), Metal-vs-CPU parity over every kernel
+- Checks: tests on both devices (133), Metal-vs-CPU parity over every kernel
   path (29), tinygrad + MLX oracles on both devices (41 each). MLX's GPU fp32
   matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
 
 Known debt
 - Multi-consumer nodes break fusion (x feeding relu AND its grad = own kernel).
-- Over-budget fused groups (>16 ops / >8 inputs) fall back to op-by-op.
+- Over-budget fused groups (>16 ops / >12 inputs) fall back to op-by-op.
 - Optimizers update raw buffers outside the graph (fine for now; lazy optim later).
+- Buffer reuse covers backward-built nodes only: forward intermediates may be
+  read by the caller after backward, so they keep their (cold) buffers.
 - Exp/Log run the scalar path of the fused kernel (no SIMD exp/log yet).
 - Metal: conv/pool run on the CPU (sync + fallback); ~1300 dispatches/step is
   now the limit — fewer kernels (multi-consumer fusion, permutes folded into

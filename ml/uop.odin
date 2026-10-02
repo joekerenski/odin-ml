@@ -81,7 +81,13 @@ UOp :: struct {
 	data:          []f32,
 	requires_grad: bool, // leaves: set by the user; ops: any src requires grad
 	grad:          ^UOp, // leaves only, filled by backward()
+	internal:      bool, // built by backward(): nobody outside holds it, so its
+	                     // buffer can be reused once its readers ran
 }
+
+// Set while backward() builds the grad graph: new nodes are internal.
+@(private)
+building_grad: bool
 
 Tensor :: UOp
 
@@ -113,6 +119,7 @@ new_node :: proc(op: Op, shape: []i32, arg: Arg, srcs: ..^UOp) -> ^UOp {
 	u.op = op
 	u.shape = copy_shape(shape)
 	u.arg = arg
+	u.internal = building_grad
 	u.src = make([]^UOp, len(srcs))
 	for s, i in srcs {
 		u.src[i] = s

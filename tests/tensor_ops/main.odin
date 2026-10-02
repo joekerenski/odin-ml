@@ -8,10 +8,12 @@ package main
 //   odin run tests/tensor_ops
 // ============================================================================
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:simd"
 import "core:time"
 import "core:math"
+import "core:math/rand"
 import ml "../../ml"
 
 failed: int
@@ -68,6 +70,7 @@ main :: proc() {
 	test_milestone1()
 	test_checkpoint()
 	test_fusion()
+	test_cpu_kernels()
 
 	fmt.println()
 	fmt.printfln("=== %d passed, %d failed ===", passed, failed)
@@ -879,4 +882,125 @@ test_checkpoint :: proc() {
 	finite := true
 	for v in s.grad.data do finite &&= !math.is_nan(v) && !math.is_inf(v)
 	expect(finite && abs(s.grad.data[2] - 0.25) < 1e-6, "sigmoid grad finite at ±200, 0.25 at 0")
+}
+
+// ---- CPU kernel paths -------------------------------------------------------
+// GEMM (every path the CPU picks: tiny, packed with edges, split-K, batched
+// tiny; both transposes) against a float64 reference; broadcast loads that
+// cross chunk boundaries; the thread pool; buffer reuse in backward.
+
+ref_gemm :: proc(A, B: []f32, M, K, N: int, ta, tb: bool) -> []f64 {
+	C := make([]f64, M * N)
+	for i in 0 ..< M do for j in 0 ..< N {
+		s: f64 = 0
+		for k in 0 ..< K do s += f64(ta ? A[k * M + i] : A[i * K + k]) * f64(tb ? B[j * K + k] : B[k * N + j])
+		C[i * N + j] = s
+	}
+	return C
+}
+
+gemm_err :: proc(got: []f32, want: []f64, K: int) -> f64 {
+	e: f64 = 0
+	for v, i in got do e = max(e, abs(f64(v) - want[i]) / (1 + abs(want[i])) / math.sqrt(f64(K)))
+	return e
+}
+
+counter_pf: int
+
+test_cpu_kernels :: proc() {
+	fmt.println("-- cpu kernel paths --")
+	rand.reset(11)
+	rnd :: proc(n: int) -> []f32 {
+		x := make([]f32, n)
+		for &v in x do v = rand.float32() * 2 - 1
+		return x
+	}
+	// tiny, packed (edges in M and N), long-K split, wide N
+	shapes := [][3]int{{3, 5, 7}, {13, 300, 19}, {100, 513, 250}, {64, 4096, 64}, {7, 2000, 33}, {128, 784, 128}}
+	worst: f64 = 0
+	for sh in shapes {
+		M, K, N := sh[0], sh[1], sh[2]
+		for t in 0 ..< 4 {
+			ta, tb := t & 1 != 0, t & 2 != 0
+			A, B := rnd(M * K), rnd(K * N)
+			C := make([]f32, M * N)
+			for &v in C do v = 777 // must be overwritten
+			ml.matmul_f32(C, A, B, i32(M), i32(K), i32(N), ta, tb)
+			worst = max(worst, gemm_err(C, ref_gemm(A, B, M, K, N, ta, tb), K))
+		}
+	}
+	expect(worst < 1e-6, fmt.tprintf("matmul_f32, every path and transpose vs float64 (err %.1e)", worst))
+
+	bworst: f64 = 0
+	for sh in ([][4]int{{2048, 5, 8, 5}, {300, 3, 7, 11}, {3, 64, 64, 64}}) {
+		Z, M, K, N := sh[0], sh[1], sh[2], sh[3]
+		for t in 0 ..< 4 {
+			ta, tb := t & 1 != 0, t & 2 != 0
+			A, B := rnd(Z * M * K), rnd(Z * K * N)
+			C := make([]f32, Z * M * N)
+			ml.matmul_batched(C, A, B, Z, i32(M), i32(K), i32(N), ta, tb)
+			for z in 0 ..< Z {
+				want := ref_gemm(A[z * M * K:][:M * K], B[z * K * N:][:K * N], M, K, N, ta, tb)
+				bworst = max(bworst, gemm_err(C[z * M * N:][:M * N], want, K))
+			}
+		}
+	}
+	expect(bworst < 1e-6, fmt.tprintf("matmul_batched, tiny and big items vs float64 (err %.1e)", bworst))
+
+	// broadcast loads over several 256-element chunks: Col, Block, Generic
+	x := ml.from_data_copy(rnd(3 * 7 * 5 * 11), {3, 7, 5, 11})
+	col := ml.from_data_copy(rnd(3 * 7 * 5), {3, 7, 5, 1})
+	blk := ml.from_data_copy(rnd(7), {1, 7, 1, 1})
+	gen := ml.from_data_copy(rnd(7 * 11), {7, 1, 11})
+	y := ml.add(ml.mul(ml.sub(x, col), blk), gen)
+	ml.realize(y)
+	bad := 0
+	for a in 0 ..< 3 do for b in 0 ..< 7 do for c in 0 ..< 5 do for d in 0 ..< 11 {
+		i := ((a * 7 + b) * 5 + c) * 11 + d
+		want := (x.data[i] - col.data[(a * 7 + b) * 5 + c]) * blk.data[b] + gen.data[b * 11 + d]
+		if abs(y.data[i] - want) > 1e-6 do bad += 1
+	}
+	expect(bad == 0, "fused Col / Block / Generic loads across chunks")
+
+	// every index exactly once, many sizes; a nested parallel_for runs inline
+	total := 0
+	for i in 0 ..< 2000 {
+		n := 1 + (i * 7919) % 70000
+		ml.parallel_for(n, 1 + i % 300, proc(data: rawptr, lo, hi: int) {
+			sync_add(&counter_pf, hi - lo)
+		}, nil)
+		total += n
+	}
+	expect(counter_pf == total, "parallel_for covers every index once")
+	nested := 0
+	ml.parallel_for(64, 1, proc(data: rawptr, lo, hi: int) {
+		ml.parallel_for(1000, 1, proc(data: rawptr, lo, hi: int) {
+			sync_add((^int)(data), hi - lo)
+		}, data)
+	}, &nested)
+	expect(nested == 64 * 1000, "nested parallel_for runs inline")
+
+	// buffer reuse: same grads with and without, forward values still readable
+	run_mlp :: proc(reuse: bool) -> (g1, g2: []f32, h_sum: f32) {
+		ml.buffer_reuse = reuse
+		defer ml.buffer_reuse = true
+		rand.reset(5)
+		X := ml.randn({64, 40}, 0, 1)
+		W1 := ml.randn({40, 32}, 0, 0.2, requires_grad = true)
+		W2 := ml.randn({32, 8}, 0, 0.2, requires_grad = true)
+		h := ml.gelu(ml.matmul(X, W1))
+		out := ml.tanh(ml.matmul(h, W2))
+		ml.backward(ml.sum(ml.mul(out, out)))
+		return W1.grad.data, W2.grad.data, ml.item(ml.sum(h))
+	}
+	a1, a2, ha := run_mlp(false)
+	b1, b2, hb := run_mlp(true)
+	same := len(a1) == len(b1) && len(a2) == len(b2) && ha == hb
+	for v, i in a1 do if v != b1[i] do same = false
+	for v, i in a2 do if v != b2[i] do same = false
+	expect(same, "backward with buffer reuse == without (and forward still readable)")
+}
+
+sync_add :: proc(p: ^int, v: int) {
+	intrinsics.atomic_add(p, v)
 }

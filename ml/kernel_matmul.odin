@@ -5,9 +5,11 @@ package ml
 //
 // Backends:
 //   - .Accelerate on Darwin (links Apple BLAS, same stack as NumPy) → best perf
-//   - .Pure          portable tiled SIMD (NEON via #simd) for learning / other OS
+//   - .AVX2          x86-64 with AVX2+FMA (kernel_gemm_amd64.odin): packed, all cores
+//   - .Pure          portable tiled SIMD (NEON via #simd) for learning / other CPUs
 //
-// Select with `matmul_set_backend`. Default: Accelerate on Darwin, Pure elsewhere.
+// Select with `matmul_set_backend`. Default: Accelerate on Darwin, AVX2 on
+// x86-64 CPUs that have it, Pure elsewhere.
 // ============================================================================
 
 import "base:intrinsics"
@@ -16,6 +18,7 @@ import "core:simd"
 Matmul_Backend :: enum {
 	Pure,
 	Accelerate,
+	AVX2,
 }
 
 matmul_backend: Matmul_Backend = .Pure
@@ -25,12 +28,19 @@ matmul_init_backend :: proc "contextless" () {
 	// Prefer system BLAS on Apple Silicon/macOS when available.
 	when ODIN_OS == .Darwin {
 		matmul_backend = .Accelerate
+	} else when ODIN_ARCH == .amd64 {
+		matmul_backend = gemm_x86_available ? .AVX2 : .Pure
 	} else {
 		matmul_backend = .Pure
 	}
 }
 
 matmul_set_backend :: proc(b: Matmul_Backend) {
+	when ODIN_ARCH == .amd64 {
+		if b == .AVX2 && !gemm_x86_available do return
+	} else {
+		if b == .AVX2 do return
+	}
 	matmul_backend = b
 }
 
@@ -42,6 +52,7 @@ matmul_get_backend :: proc() -> Matmul_Backend {
 
 // C[M,N] = op(A) @ op(B), C overwritten. op(X) = X^T when trans_*:
 // A stored [M,K] (or [K,M] if trans_a), B stored [K,N] (or [N,K] if trans_b).
+// Uses all cores unless called from inside a parallel_for.
 matmul_f32 :: proc(C, A, B: []f32, M, K, N: i32, trans_a := false, trans_b := false) {
 	assert(len(A) >= int(M * K))
 	assert(len(B) >= int(K * N))
@@ -50,6 +61,11 @@ matmul_f32 :: proc(C, A, B: []f32, M, K, N: i32, trans_a := false, trans_b := fa
 	case .Accelerate:
 		when ODIN_OS == .Darwin {
 			accelerate_sgemm(C, A, B, M, K, N, trans_a, trans_b)
+			return
+		}
+	case .AVX2:
+		when ODIN_ARCH == .amd64 {
+			gemm_x86(C, A, B, int(M), int(K), int(N), trans_a, trans_b, parallel = !in_parallel_for)
 			return
 		}
 	case .Pure:
@@ -122,14 +138,14 @@ matmul_tile_f32_mr4 :: proc(
 				a1: simd.f32x4 = A[(i + 1) * k + p]
 				a2: simd.f32x4 = A[(i + 2) * k + p]
 				a3: simd.f32x4 = A[(i + 3) * k + p]
-				c00 = intrinsics.fused_mul_add(a0, b0, c00)
-				c01 = intrinsics.fused_mul_add(a0, b1, c01)
-				c10 = intrinsics.fused_mul_add(a1, b0, c10)
-				c11 = intrinsics.fused_mul_add(a1, b1, c11)
-				c20 = intrinsics.fused_mul_add(a2, b0, c20)
-				c21 = intrinsics.fused_mul_add(a2, b1, c21)
-				c30 = intrinsics.fused_mul_add(a3, b0, c30)
-				c31 = intrinsics.fused_mul_add(a3, b1, c31)
+				c00 = fma4(a0, b0, c00)
+				c01 = fma4(a0, b1, c01)
+				c10 = fma4(a1, b0, c10)
+				c11 = fma4(a1, b1, c11)
+				c20 = fma4(a2, b0, c20)
+				c21 = fma4(a2, b1, c21)
+				c30 = fma4(a3, b0, c30)
+				c31 = fma4(a3, b1, c31)
 			}
 
 			intrinsics.unaligned_store((^simd.f32x4)(&C[(i + 0) * n + j + 0]), c00)
@@ -168,7 +184,7 @@ matmul_tile_f32_mr4 :: proc(
 			for p := p0; p < p_max; p += 1 {
 				av: simd.f32x4 = A[i * k + p]
 				bv := intrinsics.unaligned_load((^simd.f32x4)(&B[p * n + j]))
-				acc = intrinsics.fused_mul_add(av, bv, acc)
+				acc = fma4(av, bv, acc)
 			}
 			intrinsics.unaligned_store((^simd.f32x4)(&C[i * n + j]), acc)
 		}
@@ -183,6 +199,14 @@ matmul_tile_f32_mr4 :: proc(
 }
 
 
+// FMA where the baseline ISA has it (arm64); x86-64 without -microarch would
+// lower fused_mul_add to a libm call per lane, so multiply then add there.
+@(private = "file")
+fma4 :: #force_inline proc "contextless" (a, b, c: simd.f32x4) -> simd.f32x4 {
+	when ODIN_ARCH == .amd64 do return a * b + c
+	else do return intrinsics.fused_mul_add(a, b, c)
+}
+
 // Batched GEMM: C[i] = op(A[i]) @ op(B[i]) for i in 0..<batch.
 // (Accelerate is fast even for attention-sized 5×8 matrices; a hand-written
 // loop kernel was 2× slower.)
@@ -193,7 +217,23 @@ Bmm_Job :: struct {
 }
 
 matmul_batched :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool) {
+	// Few big matrices: one at a time, each on all cores. Many: one per thread.
+	if batch == 1 || (batch < 2 * thread_count() && int(M) * int(K) * int(N) >= 1 << 20) {
+		for i in 0 ..< batch {
+			matmul_f32(C[i * int(M * N):], A[i * int(M * K):], B[i * int(K * N):], M, K, N, trans_a, trans_b)
+		}
+		return
+	}
 	job := Bmm_Job{C, A, B, M, K, N, trans_a, trans_b}
+	when ODIN_ARCH == .amd64 {
+		if matmul_backend == .AVX2 && int(M) * int(K) * int(N) <= 16 * 16 * 64 {
+			parallel_for(batch, max(1, PAR_GRAIN / int(M * K * N)), proc(data: rawptr, lo, hi: int) {
+				j := (^Bmm_Job)(data)
+				gemm_x86_batched_small(j.C, j.A, j.B, lo, hi, int(j.M), int(j.K), int(j.N), j.trans_a, j.trans_b)
+			}, &job)
+			return
+		}
+	}
 	parallel_for(batch, max(1, PAR_GRAIN / int(M * K * N)), proc(data: rawptr, lo, hi: int) {
 		using j := (^Bmm_Job)(data)
 		for i in lo ..< hi {

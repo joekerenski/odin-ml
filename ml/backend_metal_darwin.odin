@@ -289,7 +289,7 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 		enc = metal_ctx.enc
 	}
 	MTL.ComputeCommandEncoder_setComputePipelineState(enc, pso)
-	for r, i in bufs do MTL.ComputeCommandEncoder_setBuffer(enc, r.buf, NS.UInteger(r.off), NS.UInteger(i))
+	for r, i in bufs do if r.buf != nil do MTL.ComputeCommandEncoder_setBuffer(enc, r.buf, NS.UInteger(r.off), NS.UInteger(i))
 	MTL.ComputeCommandEncoder_setBytes(enc, ([^]byte)(raw_data(params))[:len(params) * 4], 30)
 	MTL.ComputeCommandEncoder_dispatchThreads(
 		enc,
@@ -313,7 +313,7 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 
 // ---- fused elementwise: render the register program to MSL ----------------
 
-// Params (u32): p[0] = n; input k: p[1+2k] = n_k, p[2+2k] = inner_k;
+// Params (u32): p[0] = n; input k: p[1+2k] = n_k (a Const: its f32 bits), p[2+2k] = inner_k;
 // G = 1+2·n_in: p[G] = ndim, p[G+1..] = out shape, then for each Generic
 // input its broadcast strides over the out dims.
 @(private = "file")
@@ -361,7 +361,7 @@ fused_source :: proc(job: ^Fused_Job) -> string {
 	G := 1 + 2 * n_in
 	nd := len(job.out_shape)
 	strings.write_string(&b, "#include <metal_stdlib>\nusing namespace metal;\nkernel void fused(\n")
-	for k in 0 ..< n_in do fmt.sbprintf(&b, "    device const float* in%d [[buffer(%d)]],\n", k, k)
+	for inp, k in job.inputs do if inp.mode != .Const do fmt.sbprintf(&b, "    device const float* in%d [[buffer(%d)]],\n", k, k)
 	for k in 0 ..< len(job.stores) do fmt.sbprintf(&b, "    device float* out%d [[buffer(%d)]],\n", k, n_in + k)
 	strings.write_string(&b, "    constant uint* p [[buffer(30)]],\n    uint i [[thread_position_in_grid]]) {\n    if (i >= p[0]) return;\n")
 	gen := 0
@@ -369,6 +369,7 @@ fused_source :: proc(job: ^Fused_Job) -> string {
 		switch inp.mode {
 		case .Direct: fmt.sbprintf(&b, "    float s%d = in%d[i];\n", k, k)
 		case .Scalar: fmt.sbprintf(&b, "    float s%d = in%d[0];\n", k, k)
+		case .Const: fmt.sbprintf(&b, "    float s%d = as_type<float>(p[%d]);\n", k, 1 + 2 * k)
 		case .Row: fmt.sbprintf(&b, "    float s%d = in%d[i %% p[%d]];\n", k, k, 1 + 2 * k)
 		case .Col: fmt.sbprintf(&b, "    float s%d = in%d[i / p[%d]];\n", k, k, 2 + 2 * k)
 		case .Block: fmt.sbprintf(&b, "    float s%d = in%d[(i / p[%d]) %% p[%d]];\n", k, k, 2 + 2 * k, 1 + 2 * k)
@@ -397,7 +398,7 @@ metal_fused :: proc(job: ^Fused_Job) {
 		metal_ctx.programs[key] = pso
 	}
 	n := int(numel(job.out_shape))
-	params: [128]u32
+	params: [1 + 2 * MAX_FUSED_INPUTS + 1 + MAX_DIMS * (1 + MAX_FUSED_INPUTS)]u32
 	params[0] = u32(n)
 	n_in := len(job.inputs)
 	G := 1 + 2 * n_in
@@ -417,6 +418,10 @@ metal_fused :: proc(job: ^Fused_Job) {
 				params[S + d] = sd >= 0 && inp.shape[sd] != 1 ? u32(stride_of(inp.shape, sd)) : 0
 			}
 			gen += 1
+		}
+		if inp.mode == .Const {
+			params[1 + 2 * k] = transmute(u32)inp.value
+			continue // no buffer: bufs[k] stays unbound
 		}
 		bufs[k] = resolve(inp.data)
 	}

@@ -104,6 +104,7 @@ backward :: proc(loss: ^Tensor) {
 
 	grads := make(map[^UOp]^UOp, scratch())
 	defer delete(grads)
+	building_grad = true
 	grads[loss] = expand(scalar(1), loss.shape)
 
 	sinks := make([dynamic]^UOp, scratch())
@@ -130,6 +131,7 @@ backward :: proc(loss: ^Tensor) {
 		}
 		counters.bwd_ops += 1
 	}
+	building_grad = false
 
 	realize_all(sinks[:])
 

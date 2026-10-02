@@ -45,15 +45,28 @@ clear_grad_list :: proc(params: []^Tensor) {
 	clear_grads(..params)
 }
 
+// Updates run as kernels over each parameter: all cores, constants hoisted
+// out of the loop (param, velocity and grad are separate buffers).
+@(private)
+Sgd_Job :: struct {
+	w, v, g:      [^]f32,
+	lr, momentum: f32,
+}
+
 sgd_step :: proc(opt: ^SGD) {
 	for i in 0..<len(opt.params) {
 		p := opt.params[i]
-		v := opt.velocities[i]
 		if p.grad == nil do continue
-		for j in 0..<len(p.data) {
-			v[j] = opt.momentum * v[j] + p.grad.data[j]
-			p.data[j] -= opt.lr * v[j]
-		}
+		job := Sgd_Job{raw_data(p.data), raw_data(opt.velocities[i]), raw_data(p.grad.data), opt.lr, opt.momentum}
+		parallel_for(len(p.data), PAR_GRAIN, proc(data: rawptr, lo, hi: int) {
+			j := (^Sgd_Job)(data)
+			w, v, g, lr, mom := j.w, j.v, j.g, j.lr, j.momentum
+			for k in lo ..< hi {
+				vk := mom * v[k] + g[k]
+				v[k] = vk
+				w[k] -= lr * vk
+			}
+		}, &job)
 	}
 }
 
@@ -90,19 +103,32 @@ new_adam :: proc(
 	return opt
 }
 
+@(private)
+Adam_Job :: struct {
+	w, m, v, g:                  [^]f32,
+	lr, b1, b2, eps, wd, c1, c2: f32,
+}
+
 adam_step :: proc(opt: ^Adam) {
 	opt.t += 1
 	c1 := 1 - math.pow(opt.b1, f32(opt.t))
 	c2 := 1 - math.pow(opt.b2, f32(opt.t))
 	for p, i in opt.params {
 		if p.grad == nil do continue
-		m, v, g := opt.m[i], opt.v[i], p.grad.data
-		for j in 0 ..< len(p.data) {
-			m[j] = opt.b1 * m[j] + (1 - opt.b1) * g[j]
-			v[j] = opt.b2 * v[j] + (1 - opt.b2) * g[j] * g[j]
-			up := (m[j] / c1) / (math.sqrt(v[j] / c2) + opt.eps) + opt.weight_decay * p.data[j]
-			p.data[j] -= opt.lr * up
-		}
+		job := Adam_Job{raw_data(p.data), raw_data(opt.m[i]), raw_data(opt.v[i]), raw_data(p.grad.data),
+			opt.lr, opt.b1, opt.b2, opt.eps, opt.weight_decay, c1, c2}
+		parallel_for(len(p.data), PAR_GRAIN, proc(data: rawptr, lo, hi: int) {
+			j := (^Adam_Job)(data)
+			w, m, v, g := j.w, j.m, j.v, j.g
+			lr, b1, b2, eps, wd, c1, c2 := j.lr, j.b1, j.b2, j.eps, j.wd, j.c1, j.c2
+			for k in lo ..< hi {
+				mk := b1 * m[k] + (1 - b1) * g[k]
+				vk := b2 * v[k] + (1 - b2) * g[k] * g[k]
+				m[k], v[k] = mk, vk
+				up := (mk / c1) / (math.sqrt(vk / c2) + eps) + wd * w[k]
+				w[k] -= lr * up
+			}
+		}, &job)
 	}
 }
 

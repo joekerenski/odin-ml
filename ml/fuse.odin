@@ -18,7 +18,7 @@ import "core:math"
 import "core:simd"
 
 MAX_FUSED_INSNS :: 16
-MAX_FUSED_INPUTS :: 8
+MAX_FUSED_INPUTS :: 12 // buffers + constants (Metal: inputs + stores must stay below buffer index 30)
 MAX_FUSED_SLOTS :: MAX_FUSED_INPUTS + MAX_FUSED_INSNS
 
 // How input element i of the output maps into an input buffer.
@@ -29,6 +29,7 @@ Load_Mode :: enum {
 	Col,     // data[i / inner]        [B,N] ← [B,1]
 	Block,   // data[(i / inner) % n]  [N,C,H,W] ← [1,C,1,1]
 	Generic, // unravel + broadcast index
+	Const,   // a scalar constant (Const node): passed as a value, no buffer
 }
 
 Fused_In :: struct {
@@ -37,6 +38,7 @@ Fused_In :: struct {
 	n:     int,
 	inner: int,
 	shape: []i32,
+	value: f32, // .Const
 }
 
 Fused_Insn :: struct {
@@ -96,8 +98,12 @@ run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
 		for x in u.src {
 			if x in slot_of do continue
 			if n_in == MAX_FUSED_INPUTS do return false
-			mode, n, inner := classify_load(x.shape, out_shape)
-			inputs[n_in] = Fused_In{mode, x.data, n, inner, x.shape}
+			if x.op == .Const {
+				inputs[n_in] = Fused_In{mode = .Const, n = 1, shape = x.shape, value = x.arg.(f32)}
+			} else {
+				mode, n, inner := classify_load(x.shape, out_shape)
+				inputs[n_in] = Fused_In{mode, x.data, n, inner, x.shape, 0}
+			}
 			slot_of[x] = n_in
 			n_in += 1
 		}
@@ -122,7 +128,7 @@ run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
 }
 
 CHUNK :: 256
-PAR_GRAIN :: 32 * 1024 // elements per thread part, below this: one thread
+PAR_GRAIN :: 8 * 1024 // elements per thread part (20 threads: a [1024, 4, 64] tensor in 32 parts), below this: one thread
 
 Fused_Job :: struct {
 	inputs:    []Fused_In,
@@ -146,18 +152,46 @@ run_fused_range :: proc(data: rawptr, lo, hi: int) {
 	for st, k in stores do store_of[st.slot] = k + 1
 
 	for inp, k in inputs {
-		if inp.mode == .Scalar {
-			for &v in buf[k] do v = inp.data[0]
+		if inp.mode == .Scalar || inp.mode == .Const {
+			v := inp.mode == .Const ? inp.value : inp.data[0]
+			for &x in buf[k] do x = v
 			ptr[k] = &buf[k][0]
 		}
 	}
-	idx: [MAX_DIMS]i32
+	// Generic inputs: walk the output with an odometer, each input's offset
+	// following its broadcast strides (0 on broadcast dims). No divisions per
+	// element.
+	nd := len(out_shape)
+	gstride: [MAX_FUSED_INPUTS][MAX_DIMS]int
+	goff: [MAX_FUSED_INPUTS]int
+	has_generic := false
+	for inp, k in inputs {
+		if inp.mode != .Generic do continue
+		has_generic = true
+		pad := nd - len(inp.shape)
+		for d in 0 ..< nd {
+			sd := d - pad
+			gstride[k][d] = sd >= 0 && inp.shape[sd] != 1 ? int(stride_of(inp.shape, sd)) : 0
+		}
+	}
+	idx: [MAX_DIMS]int
+	if has_generic {
+		r := lo
+		for d := nd - 1; d >= 0; d -= 1 {
+			idx[d] = r % int(out_shape[d])
+			r /= int(out_shape[d])
+		}
+		for inp, k in inputs {
+			if inp.mode != .Generic do continue
+			for d in 0 ..< nd do goff[k] += idx[d] * gstride[k][d]
+		}
+	}
 	for base := lo; base < hi; base += CHUNK {
 		m := min(CHUNK, hi - base)
 		for inp, k in inputs {
 			b := &buf[k]
 			switch inp.mode {
-			case .Scalar:
+			case .Scalar, .Const:
 			case .Direct: ptr[k] = &inp.data[base]
 			case .Row:
 				j := base % inp.n
@@ -167,19 +201,36 @@ run_fused_range :: proc(data: rawptr, lo, hi: int) {
 					if j == inp.n do j = 0
 				}
 				ptr[k] = &b[0]
-			case .Col:
-				for i in 0 ..< m do b[i] = inp.data[(base + i) / inp.inner]
-				ptr[k] = &b[0]
-			case .Block:
-				for i in 0 ..< m do b[i] = inp.data[((base + i) / inp.inner) % inp.n]
-				ptr[k] = &b[0]
-			case .Generic:
-				for i in 0 ..< m {
-					unravel_index(i32(base + i), out_shape, idx[:])
-					b[i] = inp.data[flat_of_shape(idx[:], len(out_shape), inp.shape)]
+			case .Col, .Block:
+				// runs of `inner` equal values: one division per chunk
+				q, r := base / inp.inner, base % inp.inner
+				if inp.mode == .Block do q %= inp.n
+				for i := 0; i < m; {
+					run := min(inp.inner - r, m - i)
+					v := inp.data[q]
+					for x in i ..< i + run do b[x] = v
+					i += run
+					r = 0
+					q += 1
+					if inp.mode == .Block && q == inp.n do q = 0
 				}
 				ptr[k] = &b[0]
+			case .Generic:
+				// filled below, all Generic inputs in one odometer pass
 			}
+		}
+		if has_generic {
+			for i in 0 ..< m {
+				for inp, k in inputs do if inp.mode == .Generic do buf[k][i] = inp.data[goff[k]]
+				for d := nd - 1; d >= 0; d -= 1 {
+					idx[d] += 1
+					for inp, k in inputs do if inp.mode == .Generic do goff[k] += gstride[k][d]
+					if idx[d] < int(out_shape[d]) do break
+					for inp, k in inputs do if inp.mode == .Generic do goff[k] -= gstride[k][d] * int(out_shape[d])
+					idx[d] = 0
+				}
+			}
+			for inp, k in inputs do if inp.mode == .Generic do ptr[k] = &buf[k][0]
 		}
 		for insn, j in insns {
 			slot := n_in + j
@@ -248,3 +299,4 @@ fused_eval_simd :: #force_inline proc(op: Op, a, b: simd.f32x4) -> simd.f32x4 {
 	}
 	panic("fused_eval_simd: not a simd ewise op")
 }
+

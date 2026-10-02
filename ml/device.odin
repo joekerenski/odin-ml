@@ -20,6 +20,7 @@ package ml
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 
 Device :: enum {
@@ -76,9 +77,15 @@ arena_init :: proc(a: ^mem.Dynamic_Arena, block_size := 64 * mem.Megabyte) {
 	mem.dynamic_arena_init(a, block_allocator = alloc, array_allocator = alloc, block_size = block_size, out_band_size = block_size / 2)
 }
 
-// ML_DEBUG=0..3 and ML_DEVICE=cpu|metal from the environment.
+// ML_DEBUG=0..3, ML_DEVICE=cpu|metal, ML_THREADS=n (CPU threads, default
+// all logical cores) and ML_REUSE=0|1 (buffer reuse, realize.odin) from the
+// environment.
 setup_from_env :: proc() {
 	debug_from_env()
+	if v, ok := os.lookup_env_alloc("ML_REUSE", context.temp_allocator); ok do buffer_reuse = v != "0"
+	if v, ok := os.lookup_env_alloc("ML_THREADS", context.temp_allocator); ok && !pool_ready {
+		if n, ok2 := strconv.parse_int(v); ok2 && n > 0 do num_threads = n
+	}
 	v, found := os.lookup_env_alloc("ML_DEVICE", context.temp_allocator)
 	if !found do return
 	switch strings.to_lower(v, context.temp_allocator) {

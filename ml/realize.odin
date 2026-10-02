@@ -11,6 +11,14 @@ package ml
 //   4. run in topo order on the current backend (device.odin): fused groups,
 //      views, primitive kernels; then sync so results are visible on the host.
 //
+// Buffer reuse: once every reader of an internal (backward-built, see uop.odin)
+// buffer has run, it goes to a pool and the next output of the same size
+// takes it — memory still hot in cache instead of fresh arena memory, which
+// on x86 costs a DRAM read before the write. Views (Reshape, folded
+// transposes) share their source's buffer and count as its readers' readers.
+// Kernels run in order on every backend, so a buffer is never written while
+// an earlier kernel could still read it.
+//
 // A node's .data is kept only if something outside its fused group (or the
 // caller) needs it. Anything elided is simply recomputed if asked for later.
 //
@@ -37,7 +45,18 @@ Schedule :: struct {
 	sinks:       map[^UOp]bool,
 	folded:      map[^UOp]bool, // Permutes absorbed into MatMul
 	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
+	// buffer reuse
+	owner:       map[^UOp]^UOp, // node → node whose buffer it uses (views)
+	refs:        map[^UOp]int, // owner → readers still to run
+	pinned:      map[^UOp]bool, // owner whose buffer must outlive the realize
+	pool:        map[int][dynamic][]f32, // free buffers by length, LIFO
 }
+
+// Reuse dead internal buffers within a realize (ML_REUSE=0 turns it off).
+buffer_reuse := true
+
+@(private)
+current_pool: ^map[int][dynamic][]f32
 
 schedule_make :: proc() -> (s: Schedule) {
 	s.topo = make([dynamic]^UOp, scratch())
@@ -45,6 +64,10 @@ schedule_make :: proc() -> (s: Schedule) {
 	s.sinks = make(map[^UOp]bool, scratch())
 	s.folded = make(map[^UOp]bool, scratch())
 	s.uf = make(map[^UOp]^UOp, scratch())
+	s.owner = make(map[^UOp]^UOp, scratch())
+	s.refs = make(map[^UOp]int, scratch())
+	s.pinned = make(map[^UOp]bool, scratch())
+	s.pool = make(map[int][dynamic][]f32, scratch())
 	return
 }
 
@@ -54,6 +77,52 @@ schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.sinks)
 	delete(s.folded)
 	delete(s.uf)
+	delete(s.owner)
+	delete(s.refs)
+	delete(s.pinned)
+	for _, l in s.pool do delete(l)
+	delete(s.pool)
+}
+
+// u just got a buffer (its own, or a view of its src's): count its readers
+// against the owning buffer.
+@(private)
+track_buffer :: proc(s: ^Schedule, u: ^UOp) {
+	o := u
+	if (u.op == .Reshape || u in s.folded) {
+		if src_o, ok := s.owner[u.src[0]]; ok do o = src_o
+		else do return // a view of something realized before: not ours
+	}
+	s.owner[u] = o
+	s.refs[o] += s.consumers[u]
+	if !u.internal || u in s.sinks do s.pinned[o] = true
+}
+
+// A reader of x ran.
+@(private)
+release_read :: proc(s: ^Schedule, x: ^UOp) {
+	o, ok := s.owner[x]
+	if !ok do return
+	s.refs[o] -= 1
+	if s.refs[o] > 0 || o in s.pinned || !buffer_reuse do return
+	if o.data == nil do return
+	l, has := &s.pool[len(o.data)]
+	if !has {
+		s.pool[len(o.data)] = make([dynamic][]f32, scratch())
+		l = &s.pool[len(o.data)]
+	}
+	append(l, o.data)
+	o.data = nil
+}
+
+// Every distinct src of u has been read.
+@(private)
+release_srcs :: proc(s: ^Schedule, u: ^UOp) {
+	for x, i in u.src {
+		dup := false
+		for j in 0 ..< i do if u.src[j] == x do dup = true
+		if !dup do release_read(s, x)
+	}
 }
 
 // Post-order over unrealized nodes; realized nodes are leaves of the schedule.
@@ -134,24 +203,44 @@ realize_all :: proc(sinks: []^UOp) {
 		}
 	}
 
-	// last member (in topo order) of each group runs the group
-	last := make(map[^UOp]^UOp, scratch())
-	defer delete(last)
-	for u in s.topo do if u in s.uf do last[uf_find(&s.uf, u)] = u
-
-	group := make([dynamic]^UOp, scratch())
-	defer delete(group)
+	// members of each group in topo order, gathered in one pass; the last
+	// member runs the group
+	members := make(map[^UOp][dynamic]^UOp, scratch())
+	defer {
+		for _, m in members do delete(m)
+		delete(members)
+	}
 	for u in s.topo {
-		if u in s.folded do continue
+		if !(u in s.uf) do continue
+		root := uf_find(&s.uf, u)
+		m, ok := &members[root]
+		if !ok {
+			members[root] = make([dynamic]^UOp, scratch())
+			m = &members[root]
+		}
+		append(m, u)
+	}
+
+	current_pool = &s.pool
+	defer current_pool = nil
+	for u in s.topo {
+		if u in s.folded {
+			// a transpose read in place by its MatMuls: a view of its src
+			track_buffer(&s, u)
+			release_srcs(&s, u)
+			continue
+		}
 		if u in s.uf {
-			root := uf_find(&s.uf, u)
-			if last[root] != u do continue
-			clear(&group)
-			for v in s.topo do if v in s.uf && uf_find(&s.uf, v) == root do append(&group, v)
-			run_group(&s, group[:])
+			group := members[uf_find(&s.uf, u)][:]
+			if group[len(group) - 1] != u do continue
+			run_group(&s, group)
+			for v in group do if v.data != nil do track_buffer(&s, v)
+			for v in group do release_srcs(&s, v)
 			continue
 		}
 		run_node(&s, u)
+		track_buffer(&s, u)
+		release_srcs(&s, u)
 	}
 	backend.sync()
 
@@ -180,6 +269,12 @@ needs_store :: proc(s: ^Schedule, u: ^UOp, group: []^UOp) -> bool {
 // 64-byte aligned (cache line, SIMD-friendly).
 alloc_out :: proc(u: ^UOp) {
 	n := int(numel(u.shape))
+	if current_pool != nil {
+		if l, ok := &current_pool[n]; ok && len(l) > 0 {
+			u.data = pop(l)
+			return
+		}
+	}
 	bytes, err := runtime.mem_alloc_non_zeroed(n * size_of(f32), 64, context.allocator)
 	assert(err == nil, "alloc_out: out of memory")
 	u.data = ([^]f32)(raw_data(bytes))[:n]

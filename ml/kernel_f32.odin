@@ -21,6 +21,10 @@ reduce_block :: proc(dst, src: []f32, outer, red, inner: int, $op: Op) {
 	// one thread; splitting columns there costs more in cache misses than it saves.
 	job := Reduce_Job{dst, src, outer, red, inner, true}
 	if outer < 8 {
+		if red >= 64 && red * inner * outer >= 2 * PAR_GRAIN {
+			reduce_split(dst, src, outer, red, inner, op)
+			return
+		}
 		reduce_rows(dst, src, outer, red, inner, 0, inner, op)
 		return
 	}
@@ -35,6 +39,43 @@ reduce_range_proc :: proc($op: Op) -> Range_Proc {
 			reduce_rows(j.dst[lo * j.inner:hi * j.inner], j.src[lo * j.red * j.inner:hi * j.red * j.inner], hi - lo, j.red, j.inner, 0, j.inner, op)
 		} else {
 			reduce_rows(j.dst, j.src, j.outer, j.red, j.inner, lo, hi, op)
+		}
+	}
+}
+
+// Few rows, long reduced axis (a bias grad [1, 4096, 64] → [1, 1, 64], a full
+// sum): each thread reduces a contiguous chunk of the reduced axis into its
+// own partial, then the partials are combined.
+@(private)
+Reduce_Split_Job :: struct {
+	partial, src:             []f32,
+	outer, red, inner, chunk: int,
+}
+
+@(private)
+reduce_split :: proc(dst, src: []f32, outer, red, inner: int, $op: Op) {
+	chunks := min(red / 32, 4 * thread_count())
+	chunk := (red + chunks - 1) / chunks
+	chunks = (red + chunk - 1) / chunk
+	rows := outer * inner
+	job := Reduce_Split_Job{make([]f32, chunks * rows, scratch()), src, outer, red, inner, chunk}
+	defer delete(job.partial, scratch())
+	parallel_for(chunks, 1, proc(data: rawptr, lo, hi: int) {
+		using j := (^Reduce_Split_Job)(data)
+		for c in lo ..< hi {
+			r0, r1 := c * chunk, min(red, (c + 1) * chunk)
+			for o in 0 ..< outer {
+				part := partial[(c * outer + o) * inner:][:inner]
+				reduce_rows(part, src[(o * red + r0) * inner:(o * red + r1) * inner], 1, r1 - r0, inner, 0, inner, op)
+			}
+		}
+	}, &job)
+	copy(dst[:rows], job.partial[:rows])
+	for c in 1 ..< chunks {
+		p := job.partial[c * rows:][:rows]
+		for i in 0 ..< rows {
+			when op == .Sum do dst[i] += p[i]
+			else do dst[i] = max(dst[i], p[i])
 		}
 	}
 }
