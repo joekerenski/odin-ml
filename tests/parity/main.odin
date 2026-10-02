@@ -1,20 +1,26 @@
 package main
 
 // ============================================================================
-// Backend parity: every Metal kernel path vs the CPU backend.
+// Backend parity: every GPU kernel path vs the CPU backend.
 //
-//   odin run tests/metal -o:speed
+//   odin run tests/parity -o:speed            (the GPU this machine has)
+//   ML_DEVICE=cuda odin run tests/parity -o:speed
 //
 // Each case builds the same graph (same inputs) once per device, realizes it
 // (with backward where there are grads) and compares all outputs and grads.
-// Shapes are picked to hit each kernel variant: hardware 8×8 GEMM, split-K,
-// tiled fallback, tiny batched GEMM, both reduce kernels, permute, every
-// broadcast load mode — plus the models built from them.
+// On the GPU it runs twice: tensors on the heap (staged in and copied back)
+// and tensors in an ml.arena_init arena (device-visible memory, zero-copy).
+// Shapes are picked to hit each kernel variant: Metal's hardware 8×8 GEMM,
+// split-K, tiled fallback, tiny batched GEMM, both reduce kernels, permute,
+// every broadcast load mode — plus the models built from them.
 // ============================================================================
 
 import "core:fmt"
 import "core:math"
 import "core:math/rand"
+import "core:mem"
+import "core:os"
+import "core:strings"
 import ml "../../ml"
 
 failed, passed: int
@@ -25,18 +31,37 @@ Case :: struct {
 	build:  proc(x: []^ml.Tensor) -> ^ml.Tensor,
 }
 
-// Build + realize (+ backward) on one device. Returns output and grads, flat.
-run :: proc(c: Case, dev: ml.Device) -> (out: []f32, grads: [][]f32) {
+gpu: ml.Device
+
+// Build + realize (+ backward) on one device. Returns output and grads, flat
+// (copied out, so they outlive an arena).
+run :: proc(c: Case, dev: ml.Device, arena := false) -> (out: []f32, grads: [][]f32) {
 	ml.set_device(dev)
+	a: mem.Dynamic_Arena
+	heap := context.allocator
+	if arena {
+		ml.arena_init(&a, 16 * mem.Megabyte)
+		context.allocator = mem.dynamic_arena_allocator(&a)
+	}
+	defer if arena {
+		context.allocator = heap
+		mem.dynamic_arena_destroy(&a)
+	}
 	rand.reset(7)
 	xs := make([]^ml.Tensor, len(c.shapes))
 	for s, i in c.shapes do xs[i] = ml.randn(s, 0, 1, requires_grad = true)
 	y := c.build(xs)
 	ml.backward(ml.sum(ml.mul(y, ml.randn(y.shape, 0, 1))))
-	out = y.data
-	grads = make([][]f32, len(xs))
-	for x, i in xs do grads[i] = x.grad != nil ? x.grad.data : nil
+	out = clone(y.data, heap)
+	grads = make([][]f32, len(xs), heap)
+	for x, i in xs do grads[i] = x.grad != nil ? clone(x.grad.data, heap) : nil
 	return
+}
+
+clone :: proc(s: []f32, allocator: mem.Allocator) -> []f32 {
+	c := make([]f32, len(s), allocator)
+	copy(c, s)
+	return c
 }
 
 close :: proc(a, b: []f32) -> (ok: bool, worst: f32) {
@@ -52,29 +77,43 @@ close :: proc(a, b: []f32) -> (ok: bool, worst: f32) {
 
 check :: proc(c: Case) {
 	cpu_out, cpu_g := run(c, .CPU)
-	gpu_out, gpu_g := run(c, .Metal)
-	ok, worst := close(gpu_out, cpu_out)
-	for g, i in cpu_g {
-		if g == nil do continue
-		gok, gw := close(gpu_g[i], g)
-		ok &&= gok
-		worst = max(worst, gw)
-	}
-	if ok {
-		passed += 1
-		fmt.printfln("  ok    %-36s (worst rel %.1e)", c.name, worst)
-	} else {
-		failed += 1
-		fmt.printfln("  FAIL  %-36s (worst rel %.1e)", c.name, worst)
+	for arena in ([]bool{false, true}) {
+		gpu_out, gpu_g := run(c, gpu, arena)
+		ok, worst := close(gpu_out, cpu_out)
+		for g, i in cpu_g {
+			if g == nil do continue
+			gok, gw := close(gpu_g[i], g)
+			ok &&= gok
+			worst = max(worst, gw)
+		}
+		mode := arena ? "arena" : "heap"
+		if ok {
+			passed += 1
+			fmt.printfln("  ok    %-36s %-5s (worst rel %.1e)", c.name, mode, worst)
+		} else {
+			failed += 1
+			fmt.printfln("  FAIL  %-36s %-5s (worst rel %.1e)", c.name, mode, worst)
+		}
 	}
 }
 
 main :: proc() {
-	fmt.println("=== Metal vs CPU backend parity ===")
-	if !ml.set_device(.Metal) {
-		fmt.println("no Metal device")
+	// the GPU: ML_DEVICE=metal|cuda, else whichever this machine has
+	want, _ := os.lookup_env_alloc("ML_DEVICE", context.temp_allocator)
+	want = strings.to_lower(want, context.temp_allocator)
+	found := false
+	for d in ([]ml.Device{.Metal, .CUDA}) {
+		if want == "metal" && d != .Metal || want == "cuda" && d != .CUDA do continue
+		if ml.set_device(d) {
+			gpu, found = d, true
+			break
+		}
+	}
+	if !found {
+		fmt.println("=== GPU vs CPU backend parity ===\nno GPU backend available")
 		return
 	}
+	fmt.printfln("=== %v vs CPU backend parity %s===", gpu, gpu == .CUDA ? fmt.tprintf("(%s) ", ml.cuda_device_name()) : "")
 
 	mm :: proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.matmul(x[0], x[1]) }
 	mm_ta :: proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.matmul(ml.mT(x[0]), x[1]) }
@@ -118,8 +157,12 @@ main :: proc() {
 		{"softmax + logsumexp [16,5,10]", {{16, 5, 10}}, proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.add(ml.softmax(x[0], -1), ml.logsumexp(x[0], -1)) }},
 		{"layer_norm    [64,5,64]", {{64, 5, 64}}, proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.layer_norm(x[0]) }},
 		{"attention     [32,5,64] x [32,10,64]", {{32, 5, 64}, {32, 10, 64}, {64, 64}, {64, 64}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
-			q := ml.reshape(ml.matmul(x[0], x[2]), {32, 5, 8, 8})
-			k := ml.reshape(ml.matmul(x[1], x[3]), {32, 10, 8, 8})
+			// projections scaled 1/√64 as in a real init: unit-variance weights
+			// make logits of ±60, a saturated softmax, and an ill-conditioned
+			// test (fp32 on any two backends then differs by ~1e-3)
+			s := ml.scalar(0.125)
+			q := ml.reshape(ml.matmul(x[0], ml.mul(x[2], s)), {32, 5, 8, 8})
+			k := ml.reshape(ml.matmul(x[1], ml.mul(x[3], s)), {32, 10, 8, 8})
 			q = ml.permute(q, {0, 2, 1, 3})
 			k = ml.permute(k, {0, 2, 1, 3})
 			att := ml.softmax(ml.mul(ml.matmul(q, ml.mT(k)), ml.scalar(0.35)), -1)

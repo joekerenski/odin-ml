@@ -7,8 +7,9 @@ A small ML library in [Odin](https://odin-lang.org), inspired by
 - **Fusion:** chains of elementwise ops become one SIMD loop; transposes fold into GEMM.
 - **Autograd on the IR:** grad rules emit UOps, so forward and backward are fused together.
 - **Checkpoints:** `ml.save` / `ml.load` write safetensors (loads in numpy, torch, MLX, tinygrad).
-- **Devices:** CPU (multi-core; Accelerate GEMM on macOS, AVX2 GEMM on x86-64) and Metal (Apple GPU, unified
-  memory, a whole step in one command buffer). One switch, same code: `ML_DEVICE=metal`.
+- **Devices:** CPU (multi-core; Accelerate GEMM on macOS, AVX2 GEMM on x86-64), Metal (Apple GPU, unified
+  memory, a whole step in one command buffer) and CUDA (NVIDIA GPU on Linux: managed memory, NVRTC-compiled
+  fused kernels, cuBLAS). One switch, same code: `ML_DEVICE=metal`, `ML_DEVICE=cuda` (or `gpu`).
 
 Goal: grow it by reimplementing [Distribution Transformers](https://arxiv.org/abs/2502.02463)
 (~0.4M params) — that project lives in [dt/](dt/README.md). Plan and status: [STATUS.md](STATUS.md).
@@ -16,9 +17,9 @@ Goal: grow it by reimplementing [Distribution Transformers](https://arxiv.org/ab
 ## Run
 
 ```sh
-make test     # op + grad checks          (ML_DEVICE=metal make test: same on the GPU)
-make test-metal  # Metal vs CPU parity, every kernel path
-make oracle   # vs tinygrad and MLX
+make test     # op + grad checks          (ML_DEVICE=metal|cuda make test: same on the GPU)
+make test-gpu    # GPU (Metal or CUDA) vs CPU parity, every kernel path
+make oracle   # vs tinygrad and MLX (Linux: DEV=CUDA make oracle-tiny, tinygrad only)
 make data     # download MNIST into data/mnist
 make mnist    # MLP, ~98% in a few seconds
 make cnn      # small conv net
@@ -33,7 +34,7 @@ The dt experiments load their weights from `models/` (not in git) when present a
 (then save) otherwise; add `-- train` to retrain (e.g. `odin run dt/fusion -o:speed -- train`).
 
 Builds are optimized (`-o:speed`); plain `odin run` without it is ~10x slower.
-Any program picks its device from `ML_DEVICE=cpu|metal` (default cpu); `ML_THREADS=n`
+Any program picks its device from `ML_DEVICE=cpu|metal|cuda|gpu` (default cpu); `ML_THREADS=n`
 sets the CPU thread count (default: all logical cores).
 Benchmarks and the tinygrad comparison live in [bench/](bench/README.md).
 

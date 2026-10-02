@@ -22,7 +22,6 @@ package ml
 // ============================================================================
 
 import "core:fmt"
-import "core:hash"
 import "core:mem"
 import "core:strings"
 import "core:time"
@@ -317,26 +316,6 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 // G = 1+2·n_in: p[G] = ndim, p[G+1..] = out shape, then for each Generic
 // input its broadcast strides over the out dims.
 @(private = "file")
-fused_hash :: proc(job: ^Fused_Job) -> u64 {
-	key: [256]u8
-	n := 0
-	put :: proc(key: ^[256]u8, n: ^int, v: int) {
-		key[n^] = u8(v)
-		n^ += 1
-	}
-	put(&key, &n, len(job.inputs))
-	put(&key, &n, len(job.out_shape))
-	for inp in job.inputs do put(&key, &n, int(inp.mode))
-	for insn in job.insns {
-		put(&key, &n, int(insn.op))
-		put(&key, &n, insn.a)
-		put(&key, &n, insn.b)
-	}
-	for st in job.stores do put(&key, &n, st.slot)
-	return hash.fnv64a(key[:n])
-}
-
-@(private = "file")
 fused_expr :: proc(op: Op, a, b: string) -> string {
 	#partial switch op {
 	case .Add: return fmt.tprintf("%s + %s", a, b)
@@ -391,7 +370,7 @@ fused_source :: proc(job: ^Fused_Job) -> string {
 }
 
 metal_fused :: proc(job: ^Fused_Job) {
-	key := fused_hash(job)
+	key := fused_program_hash(job)
 	pso, ok := metal_ctx.programs[key]
 	if !ok {
 		pso = metal_compile(fused_source(job), "fused")

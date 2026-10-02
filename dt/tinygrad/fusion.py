@@ -13,6 +13,7 @@ TINYGRAD_PATH=/path/to/tinygrad uses a local checkout instead of the pinned one.
 """
 import math, os, sys, time, pathlib
 if p := os.environ.get("TINYGRAD_PATH"): sys.path.insert(0, p)
+sys.setrecursionlimit(100000)  # the training step's graph is deep (JIT capture, scheduling)
 import numpy as np
 from tinygrad import Tensor, TinyJit, GlobalCounters, Context, Device
 from tinygrad.nn.optim import Adam

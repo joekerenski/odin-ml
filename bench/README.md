@@ -19,7 +19,11 @@ Two oracles read the same dump (`make oracle` from the repo root runs both):
   by default: MLX's GPU float32 matmul on the M5 is reduced precision (~1e-3
   relative); `--gpu` checks against it with rtol 3e-3.
 
-`ML_DEVICE=metal` on the odin side checks the Metal backend against the same references.
+`ML_DEVICE=metal` (or `cuda`) on the odin side checks that GPU backend against the same references.
+
+On Linux (no MLX), `make oracle-tiny` runs the tinygrad oracle from a local checkout
+(`TINYGRAD_PATH`, default `~/code/repos/tinygrad`). tinygrad's default device there may be `NV`;
+`DEV=CUDA make oracle-tiny` runs it on the GPU through CUDA.
 
 ## Run
 

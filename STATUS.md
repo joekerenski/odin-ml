@@ -71,8 +71,23 @@ Numbers (M5, after unification; before in parens)
   shape hash. GEMM on simdgroup_matrix 8×8 units fed from threadgroup memory,
   split-K for long K, a tiny kernel for attention heads. Conv/pool: CPU fallback.
   DT step 86 ms (CPU) → 34 ms (Metal).
-- Checks: tests on both devices (133), Metal-vs-CPU parity over every kernel
-  path (29), tinygrad + MLX oracles on both devices (41 each). MLX's GPU fp32
+- CUDA backend (ml/backend_cuda_linux.odin): ML_DEVICE=cuda, same code. libcuda,
+  NVRTC, cuBLAS loaded at runtime (a build without them still runs). Managed
+  memory; on CUDA the arena sends allocations ≥ 4 KB out of band to a caching
+  allocator, so kernel outputs stay on GPU pages and host-written graph nodes /
+  batches on host pages (no page ping-pong); CPU fallbacks and the optimizer
+  bulk-prefetch what they touch (Backend.to_host). Heap tensors are staged via
+  pinned memory. Fused groups → CUDA C → NVRTC cubin, cached by program hash
+  (~1 s of compiles on the first DT step). GEMM: cuBLAS fp32 (no TF32); tiny
+  batched (attention heads) on a one-thread-per-output kernel.
+  RTX 4090: DT fusion 13 ms/step (GPU 7 ms of it), table1 15.6 ms/step;
+  tinygrad on the same GPU 41.6 ms/step (BEAM=0, 1300 kernels).
+  MNIST MLP 8.1 s and CNN 16.7 s (conv/pool on the CPU) — slower than the CPU
+  backend at these sizes.
+- Checks: tests on CPU, Metal, CUDA (133), GPU-vs-CPU parity over every kernel
+  path, heap and arena memory (tests/parity: 58 on CUDA), tinygrad oracle
+  41/41 with odin on CPU and CUDA vs tinygrad on CUDA; whole-model DT oracle
+  agrees to 1e-6 on both (dt/tinygrad/fusion.py check). MLX's GPU fp32
   matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
 
 Known debt
@@ -82,10 +97,13 @@ Known debt
 - Buffer reuse covers backward-built nodes only: forward intermediates may be
   read by the caller after backward, so they keep their (cold) buffers.
 - Exp/Log run the scalar path of the fused kernel (no SIMD exp/log yet).
-- Metal: conv/pool run on the CPU (sync + fallback); ~1300 dispatches/step is
-  now the limit — fewer kernels (multi-consumer fusion, permutes folded into
-  GEMM strides) is the next lever for both backends. CUDA: same Backend
-  interface with managed memory (cudaMallocManaged) + NVRTC for fused groups.
+- Metal and CUDA: conv/pool run on the CPU (sync + fallback); ~1300
+  dispatches/step is now the limit — fewer kernels (multi-consumer fusion,
+  permutes folded into GEMM strides) is the next lever for every backend.
+- CUDA: ~4.5 ms/step of launch (encode) time overlaps 7 ms of GPU time; CUDA
+  Graphs (record a step, replay it) and Adam on the GPU are the next levers.
+  NVRTC programs aren't cached on disk (first step compiles ~1 s). The caching
+  allocator never returns blocks to the driver.
 - A DT step is ~1200 kernels; multi-consumer fusion would cut that a lot.
 
 Plan for today (user)
@@ -109,7 +127,7 @@ Milestones
    bootstrap PFs (1k/5k/50k), with NLL by time step. Model library: ml.save/ml.load
    (safetensors), all experiments load from models/ or train+save. Lib: gelu, tanh,
    clip, minimum; sigmoid no longer NaNs in the backward pass for x < −88.
-5. Metal backend ✓  (done before M4; see above). CUDA later, same interface.
+5. Metal backend ✓  (done before M4; see above). CUDA ✓ (Linux, RTX 4090), same interface.
 
 References
 - Paper: https://arxiv.org/html/2502.02463v3

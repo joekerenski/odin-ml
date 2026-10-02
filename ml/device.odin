@@ -5,9 +5,10 @@ package ml
 // don't change:
 //
 //   ml.set_device(.Metal)        or   ML_DEVICE=metal (ml.setup_from_env)
+//   ml.set_device(.CUDA)         or   ML_DEVICE=cuda
 //
 // Tensor data stays a host []f32 on every device. Backends need memory the
-// device can see too: unified memory on Metal (managed memory on CUDA later).
+// device can see too: unified memory on Metal, managed memory on CUDA.
 // ml.arena_init gives per-step arenas on that memory, so a whole step is
 // zero-copy. Data allocated elsewhere (heap params, test tensors) still works:
 // backends stage it in and copy results back — slower, never wrong.
@@ -26,6 +27,7 @@ import "core:strings"
 Device :: enum {
 	CPU,
 	Metal,
+	CUDA,
 }
 
 Backend :: struct {
@@ -37,6 +39,9 @@ Backend :: struct {
 	permute:   proc(out, a: []f32, shape: []i32, order: []i32),
 	matmul:    proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool),
 	sync:      proc(),
+	// optional: move a buffer's pages to the host before CPU code touches it
+	// (CUDA managed memory; one bulk migration instead of a fault per page)
+	to_host:   proc(data: []f32),
 }
 
 CPU_BACKEND :: Backend {
@@ -62,6 +67,10 @@ set_device :: proc(d: Device) -> bool {
 		b, ok := metal_backend()
 		if !ok do return false
 		backend = b
+	case .CUDA:
+		b, ok := cuda_backend()
+		if !ok do return false
+		backend = b
 	}
 	return true
 }
@@ -72,12 +81,16 @@ get_device :: proc() -> Device {
 
 // Per-step arena on device-visible memory, with blocks big enough that
 // tensors come from warm, reused memory after the first step.
+// On CUDA, allocations of 4 KB and up go out of band to the backend allocator
+// (cached, device-resident buffers; see backend_cuda_linux.odin) so kernel
+// outputs never share managed pages with host-written graph nodes.
 arena_init :: proc(a: ^mem.Dynamic_Arena, block_size := 64 * mem.Megabyte) {
 	alloc := backend.allocator()
-	mem.dynamic_arena_init(a, block_allocator = alloc, array_allocator = alloc, block_size = block_size, out_band_size = block_size / 2)
+	out_band := backend.device == .CUDA ? 4096 : block_size / 2
+	mem.dynamic_arena_init(a, block_allocator = alloc, array_allocator = alloc, block_size = block_size, out_band_size = out_band)
 }
 
-// ML_DEBUG=0..3, ML_DEVICE=cpu|metal, ML_THREADS=n (CPU threads, default
+// ML_DEBUG=0..3, ML_DEVICE=cpu|metal|cuda|gpu, ML_THREADS=n (CPU threads, default
 // all logical cores) and ML_REUSE=0|1 (buffer reuse, realize.odin) from the
 // environment.
 setup_from_env :: proc() {
@@ -91,9 +104,13 @@ setup_from_env :: proc() {
 	switch strings.to_lower(v, context.temp_allocator) {
 	case "cpu":
 		set_device(.CPU)
-	case "metal", "gpu":
+	case "metal":
 		if !set_device(.Metal) do fmt.eprintln("ML_DEVICE=metal: Metal not available, staying on CPU")
+	case "cuda":
+		if !set_device(.CUDA) do fmt.eprintln("ML_DEVICE=cuda: CUDA not available, staying on CPU")
+	case "gpu": // whichever this machine has
+		if !set_device(.Metal) && !set_device(.CUDA) do fmt.eprintln("ML_DEVICE=gpu: no GPU backend available, staying on CPU")
 	case:
-		fmt.eprintfln("ML_DEVICE=%s: unknown device (cpu|metal)", v)
+		fmt.eprintfln("ML_DEVICE=%s: unknown device (cpu|metal|cuda|gpu)", v)
 	}
 }

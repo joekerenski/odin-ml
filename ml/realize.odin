@@ -312,6 +312,12 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 	}
 }
 
+// The buffer behind a src (a folded transpose reads its own src's).
+gemm_operand_data :: proc(u: ^UOp) -> []f32 {
+	d, _ := gemm_operand(u)
+	return d
+}
+
 // Operand for GEMM: a realized buffer, or a folded transpose of one.
 gemm_operand :: proc(u: ^UOp) -> (data: []f32, trans: bool) {
 	if u.data == nil && is_mt(u) do return u.src[0].data, true
@@ -343,6 +349,10 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 		backend.matmul(u.data, a, b, int(numel(u.shape[:n - 2])), M, K, N, ta, tb)
 	case .Conv2d, .Conv2dBwdInput, .Conv2dBwdWeight, .MaxPool2d, .MaxPool2dBwd:
 		backend.sync() // CPU-only ops: inputs must be ready on the host
+		if backend.to_host != nil {
+			for x in u.src do backend.to_host(gemm_operand_data(x))
+			backend.to_host(u.data)
+		}
 		run_cpu_node(u)
 	case:
 		fmt.panicf("run_node: no kernel for %v", u.op)

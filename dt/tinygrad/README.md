@@ -19,3 +19,11 @@ odin run dt/fusion -o:speed -- eval models/fusion_dt4_tinygrad.safetensors   # O
 
 tinygrad is pinned to a master commit in `pyproject.toml`. To use a local checkout instead:
 `TINYGRAD_PATH=~/code/repos/tinygrad uv run --no-project --with numpy python fusion.py ...`
+
+On Linux + CUDA (RTX 4090), as of this writing: `DEV=CUDA` (tinygrad's default there is `NV`),
+Python 3.12 (3.13's fixed C recursion limit trips on this graph) and `PARALLEL=0` (pickling the
+graph for compile workers recurses too deep); fusion.py raises the recursion limit itself:
+
+```sh
+DEV=CUDA PARALLEL=0 uv run --python 3.12 fusion.py bench 30
+```

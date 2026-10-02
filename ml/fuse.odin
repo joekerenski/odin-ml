@@ -15,6 +15,7 @@ package ml
 
 import "base:intrinsics"
 import "core:math"
+import "core:hash"
 import "core:simd"
 
 MAX_FUSED_INSNS :: 16
@@ -300,3 +301,23 @@ fused_eval_simd :: #force_inline proc(op: Op, a, b: simd.f32x4) -> simd.f32x4 {
 	panic("fused_eval_simd: not a simd ewise op")
 }
 
+// Structural hash of a fused program (inputs' load modes, insns, stores, rank):
+// GPU backends compile one kernel per distinct program and cache it by this.
+fused_program_hash :: proc(job: ^Fused_Job) -> u64 {
+	key: [256]u8
+	n := 0
+	put :: proc(key: ^[256]u8, n: ^int, v: int) {
+		key[n^] = u8(v)
+		n^ += 1
+	}
+	put(&key, &n, len(job.inputs))
+	put(&key, &n, len(job.out_shape))
+	for inp in job.inputs do put(&key, &n, int(inp.mode))
+	for insn in job.insns {
+		put(&key, &n, int(insn.op))
+		put(&key, &n, insn.a)
+		put(&key, &n, insn.b)
+	}
+	for st in job.stores do put(&key, &n, st.slot)
+	return hash.fnv64a(key[:n])
+}

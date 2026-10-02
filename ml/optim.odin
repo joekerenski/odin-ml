@@ -57,6 +57,7 @@ sgd_step :: proc(opt: ^SGD) {
 	for i in 0..<len(opt.params) {
 		p := opt.params[i]
 		if p.grad == nil do continue
+		if backend.to_host != nil do backend.to_host(p.grad.data)
 		job := Sgd_Job{raw_data(p.data), raw_data(opt.velocities[i]), raw_data(p.grad.data), opt.lr, opt.momentum}
 		parallel_for(len(p.data), PAR_GRAIN, proc(data: rawptr, lo, hi: int) {
 			j := (^Sgd_Job)(data)
@@ -115,6 +116,7 @@ adam_step :: proc(opt: ^Adam) {
 	c2 := 1 - math.pow(opt.b2, f32(opt.t))
 	for p, i in opt.params {
 		if p.grad == nil do continue
+		if backend.to_host != nil do backend.to_host(p.grad.data)
 		job := Adam_Job{raw_data(p.data), raw_data(opt.m[i]), raw_data(opt.v[i]), raw_data(p.grad.data),
 			opt.lr, opt.b1, opt.b2, opt.eps, opt.weight_decay, c1, c2}
 		parallel_for(len(p.data), PAR_GRAIN, proc(data: rawptr, lo, hi: int) {
