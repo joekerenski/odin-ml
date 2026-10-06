@@ -88,14 +88,17 @@ Numbers (M5, after unification; before in parens)
   tinygrad on the same GPU 41.6 ms/step (BEAM=0, 1300 kernels).
   MNIST MLP 8.1 s and CNN 16.7 s (conv/pool on the CPU) — slower than the CPU
   backend at these sizes.
-- Checks: tests on CPU, Metal, CUDA (135), GPU-vs-CPU parity over every kernel
-  path, heap and arena memory, CPU views vs copies (tests/parity: 78 on Metal), tinygrad oracle
+- Checks: tests on CPU, Metal, CUDA (137), GPU-vs-CPU parity over every kernel
+  path, heap and arena memory, CPU vs the reference path (views copied,
+  nothing recomputed) (tests/parity: 78 on Metal), tinygrad oracle
   41/41 with odin on CPU and CUDA vs tinygrad on CUDA; whole-model DT oracle
   agrees to 1e-6 on both (dt/tinygrad/fusion.py check). MLX's GPU fp32
   matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
 
 Known debt
-- Fusion budget: groups stop growing at 16 ops / 12 inputs (perf plan, PR 6).
+- Fusion places a group at its last member's position; a group-level cycle
+  check (then a topo sort of groups) would also merge e.g. bias-grad sums into
+  the kernel producing the grad (~50 standalone column sums per M4 step).
 - Optimizers update raw buffers outside the graph (fine for now; lazy optim later).
 - Buffer reuse covers backward-built nodes only: forward intermediates may be
   read by the caller after backward, so they keep their (cold) buffers.
@@ -151,9 +154,23 @@ the 4090 before merge:
    stores into the target layout (attention's head merge). Expand was already
    an index transform (stride 0) in fused kernels.
    M4: 802 → 682 kernels, no copies left; Metal 23.7 → 22.1 ms, CPU 42.8 → 40.5 ms.
-6. GEMM epilogues (bias + activation); no op/input budgets
+6. No op/input budgets; rematerialization  [PR 6]
+   Budgets 16 ops / 12 inputs → 64 / 24, plus the real limit: ≤ 28 bound
+   buffers (inputs + stores; Metal binds 31). Rematerialization (remat.odin):
+   a value other kernels read is recomputed in each when its expression reads
+   ≤ 1 full-size buffer (the cone is cloned into the reading group) — e.g.
+   GELU's intermediates are recomputed in the backward pass from the
+   pre-activation instead of 8 stores + reads. On by default on GPUs only
+   (the CPU interpreter's scalar exp/log make recompute dearer than the
+   traffic); ML_REMAT=0|1 forces it.
+   M4: 682 → 672 kernels; Metal 22.1 → ~20 ms (fused elementwise 2.7 → 1.3 ms
+   GPU time); CPU 40.5 → 42.3 ms (bigger groups). Now ~16 ms of GPU work
+   (GEMM 9, reductions 5.5, elementwise 1.3) and ~4 ms of host scheduling
+   outside the GPU window per step. GEMM epilogues moved to stage 7, where
+   GEMMs become generated kernels (upside now < 1 ms).
 7. Lowering knobs (workgroup, upcast, unroll, reduce strategy, GEMM tiles) +
-   kernel search on device + disk cache of choices and binaries
+   kernel search on device + disk cache of choices and binaries; GEMM
+   epilogues (bias + activation)
 8. Record and replay (Metal indirect command buffers, CUDA Graphs) + optimizer
    as UOps on the device
 

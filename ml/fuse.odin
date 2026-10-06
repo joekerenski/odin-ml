@@ -17,8 +17,9 @@ import "base:intrinsics"
 import "core:math"
 import "core:simd"
 
-MAX_FUSED_INSNS :: 16
-MAX_FUSED_INPUTS :: 12 // buffers + constants (Metal: inputs + stores must stay below buffer index 30)
+MAX_FUSED_INSNS :: 64
+MAX_FUSED_INPUTS :: 24 // buffers + constants
+MAX_FUSED_BUFS :: 28   // input buffers + stores (Metal binds ≤ 31: 29 is a split's partial, 30 the params)
 MAX_FUSED_SLOTS :: MAX_FUSED_INPUTS + 2 * MAX_FUSED_INSNS // inputs, instructions, identity copies for extra stores
 
 // How input element i of the output maps into an input buffer.
