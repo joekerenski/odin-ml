@@ -72,7 +72,8 @@ Numbers (M5, after unification; before in parens)
   Unified memory: ml.arena_init arenas are zero-copy; other memory is staged.
   A realize encodes into command buffers committed every 128 kernels (GPU runs
   while the CPU encodes), synced once. Fused groups → generated MSL, cached by
-  shape hash. GEMM on simdgroup_matrix 8×8 units fed from threadgroup memory,
+  shape hash. GEMM on simdgroup_matrix 8×8 units, generated per tile and
+  picked per shape by timing on the device (backend_metal_gemm_darwin.odin),
   split-K for long K, a tiny kernel for attention heads. Conv/pool: CPU fallback.
   DT step 86 ms (CPU) → 34 ms (Metal).
 - CUDA backend (ml/backend_cuda_linux.odin): ML_DEVICE=cuda, same code. libcuda,
@@ -170,7 +171,20 @@ the 4090 before merge:
    GEMMs become generated kernels (upside now < 1 ms).
 7. Lowering knobs (workgroup, upcast, unroll, reduce strategy, GEMM tiles) +
    kernel search on device + disk cache of choices and binaries; GEMM
-   epilogues (bias + activation)
+   epilogues (bias + activation)  [PR 7: GEMM part]
+   Metal GEMMs are generated per tile (32/64 × 32/64), each staged through
+   threadgroup memory or loading 8×8 fragments straight from device memory
+   (no barriers; wins most of our K = 64 shapes), plus the tiny kernel and
+   split-K. Per problem the candidates are timed on the device (rotating
+   operand copies so reads are cold, like in the step) and the choice is
+   cached in ~/.cache/odin-ml/<device>.txt (search.odin; ML_SEARCH=0: fixed
+   heuristic). First run of a model ~3.5 s of search on the M5. Parity runs
+   every variant (ml.gemm_force).
+   M4: GEMM GPU time 9.2 → 7.8 ms; step ~20 → 19.6 ms. The step moves less
+   than the kernels: ~4 ms of host scheduling runs before the GPU starts, and
+   854 dispatches on a serial encoder each wait for the previous one (stage 8).
+   Not done: reduce / elementwise knobs, GEMM epilogues (< 1 ms upside
+   measured), CUDA (cuBLAS stays), on-disk binaries.
 8. Record and replay (Metal indirect command buffers, CUDA Graphs) + optimizer
    as UOps on the device
 
