@@ -279,7 +279,7 @@ metal_sync :: proc() {
 dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32, grid: [3]int, group: [3]int, label := "") {
 	enc := encoder()
 	metal_ctx.n_dispatch += 1
-	if metal_ctx.n_dispatch % COMMIT_EVERY == 0 && debug_level < 2 {
+	if metal_ctx.n_dispatch % COMMIT_EVERY == 0 && !kernel_timing() {
 		MTL.CommandEncoder_endEncoding(enc)
 		MTL.CommandBuffer_commit(metal_ctx.cmd)
 		append(&metal_ctx.in_flight, metal_ctx.cmd)
@@ -295,13 +295,14 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 		{NS.Integer(grid[0]), NS.Integer(grid[1]), NS.Integer(grid[2])},
 		{NS.Integer(group[0]), NS.Integer(group[1]), NS.Integer(group[2])},
 	)
-	if debug_level >= 2 {
+	if kernel_timing() {
 		cmd := metal_ctx.cmd
 		MTL.CommandEncoder_endEncoding(metal_ctx.enc)
 		MTL.CommandBuffer_commit(cmd)
 		MTL.CommandBuffer_waitUntilCompleted(cmd)
 		gpu_ms := f64(MTL.CommandBuffer_GPUEndTime(cmd) - MTL.CommandBuffer_GPUStartTime(cmd)) * 1000
-		fmt.printfln("  gpu     %-40s %8.4f ms", label, gpu_ms)
+		profile_add_ms(gpu_ms, label)
+		if debug_level >= 2 do fmt.printfln("  gpu     %-40s %8.4f ms", label, gpu_ms)
 		// fresh command buffer; staged/scratch state carries over until the real sync
 		NS.AutoreleasePool_drain(metal_ctx.pool)
 		metal_ctx.pool = NS.AutoreleasePool_alloc()->init()
@@ -407,7 +408,7 @@ metal_fused :: proc(job: ^Fused_Job) {
 	for st, k in job.stores do bufs[n_in + k] = resolve(st.data, output = true)
 	used := G + 1 + nd + gen * nd
 	label := ""
-	if debug_level >= 2 {
+	if kernel_timing() {
 		b := strings.builder_make(context.temp_allocator)
 		strings.write_string(&b, "fused[")
 		for insn, i in job.insns do fmt.sbprintf(&b, "%s%v", i > 0 ? "," : "", insn.op)
@@ -609,15 +610,15 @@ metal_reduce :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
 			name = op == .Sum ? "reduce_sum_thread" : "reduce_max_thread"
 			partial := scratch_alloc(outer * split * inner * size_of(f32))
 			dispatch(metal_get_kernel(KERNELS, name), {src, partial}, []u32{u32(outer * split), u32(r / split), u32(inner)}, {outer * split * inner, 1, 1}, {256, 1, 1},
-				debug_level >= 2 ? fmt.tprintf("%s split %d×%d×%d/%d", name, outer, r, inner, split) : "")
+				kernel_timing() ? fmt.tprintf("%s split %d×%d×%d/%d", name, outer, r, inner, split) : "")
 			dispatch(metal_get_kernel(KERNELS, name), {partial, dst}, []u32{u32(outer), u32(split), u32(inner)}, {rows, 1, 1}, {256, 1, 1},
-				debug_level >= 2 ? fmt.tprintf("%s combine", name) : "")
+				kernel_timing() ? fmt.tprintf("%s combine", name) : "")
 		} else if r >= 128 && rows < 8192 {
 			name = op == .Sum ? "reduce_sum_group" : "reduce_max_group"
-			dispatch(metal_get_kernel(KERNELS, name), {src, dst}, params, {rows * 256, 1, 1}, {256, 1, 1}, debug_level >= 2 ? fmt.tprintf("%s %d×%d×%d", name, outer, r, inner) : "")
+			dispatch(metal_get_kernel(KERNELS, name), {src, dst}, params, {rows * 256, 1, 1}, {256, 1, 1}, kernel_timing() ? fmt.tprintf("%s %d×%d×%d", name, outer, r, inner) : "")
 		} else {
 			name = op == .Sum ? "reduce_sum_thread" : "reduce_max_thread"
-			dispatch(metal_get_kernel(KERNELS, name), {src, dst}, params, {rows, 1, 1}, {256, 1, 1}, debug_level >= 2 ? fmt.tprintf("%s %d×%d×%d", name, outer, r, inner) : "")
+			dispatch(metal_get_kernel(KERNELS, name), {src, dst}, params, {rows, 1, 1}, {256, 1, 1}, kernel_timing() ? fmt.tprintf("%s %d×%d×%d", name, outer, r, inner) : "")
 		}
 		src = dst
 		did = true
@@ -633,7 +634,7 @@ metal_permute :: proc(out, a: []f32, shape: []i32, order: []i32) {
 		params[2 + i] = u32(shape[o])
 		params[10 + i] = u32(stride_of(shape, int(o)))
 	}
-	dispatch(metal_get_kernel(KERNELS, "permute"), {resolve(a), resolve(out, output = true)}, params[:], {len(out), 1, 1}, {256, 1, 1}, debug_level >= 2 ? fmt.tprintf("permute %v %v", shape, order) : "")
+	dispatch(metal_get_kernel(KERNELS, "permute"), {resolve(a), resolve(out, output = true)}, params[:], {len(out), 1, 1}, {256, 1, 1}, kernel_timing() ? fmt.tprintf("permute %v %v", shape, order) : "")
 }
 
 metal_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool) {
@@ -649,7 +650,7 @@ metal_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b:
 	switch {
 	case m <= 16 && n <= 16 && k <= 64:
 		// attention-sized: one thread per output
-		dispatch(metal_get_kernel(KERNELS, "matmul_small"), {a, b, c}, params, {n, m, batch}, {n, m, 1}, debug_level >= 2 ? fmt.tprintf("matmul_small %dx%dx%d b%d", m, k, n, batch) : "")
+		dispatch(metal_get_kernel(KERNELS, "matmul_small"), {a, b, c}, params, {n, m, batch}, {n, m, 1}, kernel_timing() ? fmt.tprintf("matmul_small %dx%dx%d b%d", m, k, n, batch) : "")
 	case batch == 1 && k >= 1024 && m * n <= 64 * 1024:
 		// few outputs, long K (weight grads): split K, then sum the partials
 		splits := min(k / 256, 64)
@@ -657,9 +658,9 @@ metal_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b:
 		splits = (k + kc - 1) / kc
 		params[5] = u32(kc)
 		partial := scratch_alloc(splits * m * n * size_of(f32))
-		dispatch(metal_get_kernel(KERNELS, kernel), {a, b, partial}, params, grid(sg, m, n, splits), group, debug_level >= 2 ? fmt.tprintf("%s splitk %dx%dx%d s%d", kernel, m, k, n, splits) : "")
+		dispatch(metal_get_kernel(KERNELS, kernel), {a, b, partial}, params, grid(sg, m, n, splits), group, kernel_timing() ? fmt.tprintf("%s splitk %dx%dx%d s%d", kernel, m, k, n, splits) : "")
 		dispatch(metal_get_kernel(KERNELS, "reduce_sum_thread"), {partial, c}, []u32{1, u32(splits), u32(m * n)}, {m * n, 1, 1}, {256, 1, 1}, "splitk_sum")
 	case:
-		dispatch(metal_get_kernel(KERNELS, kernel), {a, b, c}, params, grid(sg, m, n, batch), group, debug_level >= 2 ? fmt.tprintf("%s %dx%dx%d b%d", kernel, m, k, n, batch) : "")
+		dispatch(metal_get_kernel(KERNELS, kernel), {a, b, c}, params, grid(sg, m, n, batch), group, kernel_timing() ? fmt.tprintf("%s %dx%dx%d b%d", kernel, m, k, n, batch) : "")
 	}
 }

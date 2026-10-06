@@ -3,6 +3,7 @@ ODIN  ?= odin
 FAST  := -o:speed -no-bounds-check
 BUILD := build
 
+PHONY_PERF := perf perf-baseline perf-tiny
 .PHONY: test test-gpu test-metal test-cuda oracle oracle-tiny mnist cnn regression tour bench data clean dt-conjugate dt-table1 dt-fusion models
 
 test:        ; $(ODIN) run tests/tensor_ops -out:$(BUILD)/tensor_ops
@@ -24,6 +25,14 @@ mnist:       ; $(ODIN) run examples/mnist $(FAST) -out:$(BUILD)/mnist
 cnn:         ; $(ODIN) run examples/mnist_cnn $(FAST) -out:$(BUILD)/mnist_cnn
 regression:  ; $(ODIN) run examples/regression $(FAST) -out:$(BUILD)/regression
 bench:       ; $(ODIN) run bench/loop $(FAST) -disable-assert -out:$(BUILD)/loop
+# performance plan yardstick (STATUS.md): ML_DEVICE=metal|cuda|cpu make perf; ARGS=<name> runs matching workloads
+GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null)
+perf:          ; $(ODIN) run bench/perf $(FAST) -define:GIT_REV=$(GIT_REV) -out:$(BUILD)/perf -- $(ARGS)
+perf-baseline: ; $(ODIN) run bench/perf $(FAST) -define:GIT_REV=$(GIT_REV) -out:$(BUILD)/perf -- baseline
+# the bar: the same M4 step in tinygrad (local checkout), default and BEAM=2 (first BEAM run searches ~6 min)
+perf-tiny:
+	cd dt/tinygrad && TINYGRAD_PATH=$(TINYGRAD_PATH) uv run --no-project --with numpy python fusion.py bench 30
+	cd dt/tinygrad && BEAM=2 TINYGRAD_PATH=$(TINYGRAD_PATH) uv run --no-project --with numpy python fusion.py bench 30
 tour:
 	@for f in examples/tour/0*.odin; do $(ODIN) run $$f -file -out:$(BUILD)/tour || exit 1; done
 data:        ; sh data/download-mnist.sh

@@ -541,14 +541,15 @@ launch :: proc(f: CUfunction, bufs: []CUdeviceptr, params: []u32, grid: [3]int, 
 		args[i] = &ptrs[i]
 	}
 	args[len(bufs)] = &p
-	if debug_level >= 2 do cu.cuEventRecord(cuda_ctx.ev_a, cuda_ctx.stream)
+	if kernel_timing() do cu.cuEventRecord(cuda_ctx.ev_a, cuda_ctx.stream)
 	check(cu.cuLaunchKernel(f, u32(grid[0]), u32(grid[1]), u32(grid[2]), u32(block[0]), u32(block[1]), u32(block[2]), 0, cuda_ctx.stream, &args[0], nil), "cuLaunchKernel")
-	if debug_level >= 2 {
+	if kernel_timing() {
 		cu.cuEventRecord(cuda_ctx.ev_b, cuda_ctx.stream)
 		check(cu.cuEventSynchronize(cuda_ctx.ev_b), fmt.tprintf("kernel %s", label))
 		ms: f32
 		cu.cuEventElapsedTime(&ms, cuda_ctx.ev_a, cuda_ctx.ev_b)
-		fmt.printfln("  gpu     %-40s %8.4f ms", label, ms)
+		profile_add_ms(f64(ms), label)
+		if debug_level >= 2 do fmt.printfln("  gpu     %-40s %8.4f ms", label, ms)
 	}
 }
 
@@ -655,7 +656,7 @@ cuda_fused :: proc(job: ^Fused_Job) {
 		nb += 1
 	}
 	label := ""
-	if debug_level >= 2 {
+	if kernel_timing() {
 		b := strings.builder_make(context.temp_allocator)
 		strings.write_string(&b, "fused[")
 		for insn, i in job.insns do fmt.sbprintf(&b, "%s%v", i > 0 ? "," : "", insn.op)
@@ -763,7 +764,7 @@ cuda_reduce :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
 		if inner >= 16 && r >= 512 && rows < 8192 {
 			for s in ([]int{64, 32, 16, 8}) do if r % s == 0 && split == 1 do split = s
 		}
-		label := debug_level >= 2 ? fmt.tprintf("reduce %v %d×%d×%d", op, outer, r, inner) : ""
+		label := kernel_timing() ? fmt.tprintf("reduce %v %d×%d×%d", op, outer, r, inner) : ""
 		if split > 1 {
 			// [outer, split, r/split, inner] → partial [outer, split, inner] → dst
 			partial := scratch_alloc(outer * split * inner * size_of(f32))
@@ -788,7 +789,7 @@ cuda_permute :: proc(out, a: []f32, shape: []i32, order: []i32) {
 		params[2 + i] = u32(shape[o])
 		params[10 + i] = u32(stride_of(shape, int(o)))
 	}
-	label := debug_level >= 2 ? fmt.tprintf("permute %v %v", shape, order) : ""
+	label := kernel_timing() ? fmt.tprintf("permute %v %v", shape, order) : ""
 	launch(fixed_kernel("permute"), {resolve(a), resolve(out, output = true)}, params[:], {blocks_for(len(out)), 1, 1}, {BLOCK, 1, 1}, label)
 }
 
@@ -797,7 +798,7 @@ cuda_permute :: proc(out, a: []f32, shape: []i32, order: []i32) {
 cuda_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool) {
 	if batch > 1 && M <= 16 && N <= 16 && K <= 64 {
 		n := batch * int(M) * int(N)
-		label := debug_level >= 2 ? fmt.tprintf("matmul_small %dx%dx%d b%d", M, K, N, batch) : ""
+		label := kernel_timing() ? fmt.tprintf("matmul_small %dx%dx%d b%d", M, K, N, batch) : ""
 		launch(fixed_kernel("matmul_small"), {resolve(A), resolve(B), resolve(C, output = true)},
 			{u32(M), u32(K), u32(N), u32(trans_a), u32(trans_b), u32(batch)}, {blocks_for(n), 1, 1}, {BLOCK, 1, 1}, label)
 		return
@@ -812,7 +813,7 @@ cuda_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: 
 	op_a := i32(trans_a ? CUBLAS_OP_T : CUBLAS_OP_N)
 	ldb := trans_b ? K : N
 	lda := trans_a ? M : K
-	if debug_level >= 2 do cu.cuEventRecord(cuda_ctx.ev_a, cuda_ctx.stream)
+	if kernel_timing() do cu.cuEventRecord(cuda_ctx.ev_a, cuda_ctx.stream)
 	st: i32
 	if batch == 1 {
 		st = cublas.cublasSgemm(cuda_ctx.blas, op_b, op_a, N, M, K, &alpha, b, ldb, a, lda, &beta, c, N)
@@ -822,11 +823,12 @@ cuda_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: 
 	}
 	if st != 0 do fmt.panicf("cuBLAS: sgemm failed (%d) %dx%dx%d batch %d", st, M, K, N, batch)
 	cuda_ctx.n_launch += 1
-	if debug_level >= 2 {
+	if kernel_timing() {
 		cu.cuEventRecord(cuda_ctx.ev_b, cuda_ctx.stream)
 		check(cu.cuEventSynchronize(cuda_ctx.ev_b), "sgemm")
 		ms: f32
 		cu.cuEventElapsedTime(&ms, cuda_ctx.ev_a, cuda_ctx.ev_b)
-		fmt.printfln("  gpu     %-40s %8.4f ms", fmt.tprintf("sgemm %dx%dx%d b%d", M, K, N, batch), ms)
+		profile_add_ms(f64(ms), batch == 1 ? "cublas_sgemm" : "cublas_sgemm_batched")
+		if debug_level >= 2 do fmt.printfln("  gpu     %-40s %8.4f ms", fmt.tprintf("sgemm %dx%dx%d b%d", M, K, N, batch), ms)
 	}
 }
