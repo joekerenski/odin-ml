@@ -6,4 +6,5 @@ when ODIN_OS != .Darwin {
 	metal_backend :: proc() -> (Backend, bool) {
 		return {}, false
 	}
+	metal_concurrent := true
 }

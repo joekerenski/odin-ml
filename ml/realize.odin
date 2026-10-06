@@ -28,6 +28,7 @@ package ml
 
 import "base:runtime"
 import "core:fmt"
+import "core:slice"
 import "core:time"
 
 realize :: proc(t: ^Tensor) -> ^Tensor {
@@ -48,7 +49,9 @@ Schedule :: struct {
 	alias:       map[^UOp]^UOp, // view nodes that are their base's buffer as is
 	store_into:  map[^UOp]Store_Into, // MatMuls writing straight into a view node's buffer
 	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
+	order:       [dynamic]^UOp, // what the run loop visits: views, nodes, groups' last members
 	clones:      [dynamic]^UOp, // nodes rematerialization added (remat.odin)
+	clone_of:    [dynamic]^UOp, // the node each clone copies
 	rewired:     [dynamic]Rewire, // srcs it pointed at clones, restored afterwards
 	dead:        map[^UOp]bool, // group members nothing reads after rematerialization
 	// buffer reuse
@@ -89,6 +92,8 @@ schedule_make :: proc() -> (s: Schedule) {
 	s.store_into = make(map[^UOp]Store_Into, scratch())
 	s.uf = make(map[^UOp]^UOp, scratch())
 	s.clones = make([dynamic]^UOp, scratch())
+	s.order = make([dynamic]^UOp, scratch())
+	s.clone_of = make([dynamic]^UOp, scratch())
 	s.rewired = make([dynamic]Rewire, scratch())
 	s.dead = make(map[^UOp]bool, scratch())
 	s.owner = make(map[^UOp]^UOp, scratch())
@@ -107,6 +112,7 @@ schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.alias)
 	delete(s.store_into)
 	delete(s.uf)
+	delete(s.order)
 	free_clones(s)
 	delete(s.dead)
 	delete(s.owner)
@@ -206,32 +212,50 @@ realize_all :: proc(sinks: []^UOp) {
 		}
 	}
 
-	plan_views(&s)
-	fuse_groups(&s)
-
-	// members of each group in topo order, gathered in one pass; the last
-	// member runs the group
+	// members of each group in topo order; the last member runs the group
 	members := make(map[^UOp][dynamic]^UOp, scratch())
 	defer {
 		for _, m in members do delete(m)
 		delete(members)
 	}
-	for u in s.topo {
-		if !(u in s.uf) do continue
-		root := uf_find(&s.uf, u)
-		m, ok := &members[root]
-		if !ok {
-			members[root] = make([dynamic]^UOp, scratch())
-			m = &members[root]
-		}
-		append(m, u)
+	// the same structure as a recent realize: replay its decisions
+	ix: Sched_Index
+	key: []u8
+	defer if key != nil {
+		delete(key, scratch())
+		sched_index_destroy(&ix)
 	}
-	if remat_mode == .On || remat_mode == .Auto && backend.device != .CPU do remat(&s, &members)
+	rec: ^Sched_Record
+	if sched_cache_enabled {
+		key = sched_key(&s, &ix)
+		rec = sched_lookup(key)
+	}
+	if rec != nil {
+		sched_replay(&s, &ix, rec, &members)
+	} else {
+		plan_views(&s)
+		fuse_groups(&s)
+		for u in s.topo {
+			if !(u in s.uf) do continue
+			root := uf_find(&s.uf, u)
+			m, ok := &members[root]
+			if !ok {
+				members[root] = make([dynamic]^UOp, scratch())
+				m = &members[root]
+			}
+			append(m, u)
+		}
+		if remat_mode == .On || remat_mode == .Auto && backend.device != .CPU do remat(&s, &members)
+		delete(s.order)
+		s.order = run_order(&s, &members, backend.device == .Metal && metal_concurrent)
+		if sched_cache_enabled do sched_record(&s, &ix, key, &members)
+	}
+	sched_ms: f64
+	if debug_level >= 1 do sched_ms = f64(time.tick_since(step_start)) / 1e6
 
 	current_pool = &s.pool
 	defer current_pool = nil
-	for u in s.topo {
-		if u in s.dead do continue
+	for u in s.order {
 		if u.op == .Permute || u.op == .Reshape {
 			run_view(&s, u)
 			track_buffer(&s, u)
@@ -254,8 +278,60 @@ realize_all :: proc(sinks: []^UOp) {
 
 	if debug_level == 1 {
 		ms := f64(time.tick_since(step_start)) / 1e6
-		fmt.printfln("  realize: %d kernels  %.3f ms", counters.kernels - k0, ms)
+		fmt.printfln("  realize: %d kernels  %.3f ms (schedule %.3f ms)", counters.kernels - k0, ms, sched_ms)
 	}
+}
+
+// ---- run order ------------------------------------------------------------------
+//
+// The units the run loop visits — view nodes, single nodes, groups (at their
+// last member) — in topo order, or by level for a concurrent GPU encoder:
+// level = longest chain of kernels from the graph's inputs, so the kernels of
+// one level are independent and need no barrier between them (topo order
+// from a DFS puts dependent kernels next to each other).
+@(private)
+run_order :: proc(s: ^Schedule, members: ^map[^UOp][dynamic]^UOp, by_level: bool) -> [dynamic]^UOp {
+	order := make([dynamic]^UOp, scratch())
+	unit :: proc(s: ^Schedule, u: ^UOp) -> ^UOp {
+		if u in s.uf do return uf_find(&s.uf, u)
+		return u
+	}
+	for u in s.topo {
+		if u in s.dead do continue
+		if u in s.uf {
+			g := members[uf_find(&s.uf, u)]
+			if g[len(g) - 1] != u do continue
+		}
+		append(&order, u)
+	}
+	if !by_level do return order
+	stored := make(map[^UOp]bool, scratch()) // view nodes a GEMM writes: no kernel of their own
+	defer delete(stored)
+	for _, into in s.store_into do stored[into.v] = true
+	level := make(map[^UOp]int, len(order), scratch())
+	defer delete(level)
+	Item :: struct {
+		u:          ^UOp,
+		level, pos: int,
+	}
+	items := make([]Item, len(order), scratch())
+	defer delete(items, scratch())
+	for t, pos in order {
+		me := unit(s, t)
+		group := t in s.uf ? members[me][:] : []^UOp{t}
+		lv := 0
+		for v in group do for x in v.src {
+			if x.data != nil do continue
+			ux := unit(s, x)
+			if ux != me do lv = max(lv, level[ux])
+		}
+		kernel := !((t.op == .Permute || t.op == .Reshape) && (t in s.views || t in s.alias || t in stored))
+		level[me] = lv + (kernel ? 1 : 0)
+		items[pos] = Item{t, level[me], pos}
+	}
+	slice.sort_by(items, proc(a, b: Item) -> bool { return a.level < b.level || a.level == b.level && a.pos < b.pos })
+	for it, i in items do order[i] = it.u
+	return order
 }
 
 // ---- views ----------------------------------------------------------------------

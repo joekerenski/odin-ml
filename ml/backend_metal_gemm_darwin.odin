@@ -266,12 +266,12 @@ metal_matmul :: proc(g: ^Gemm) {
 	}
 	if l.splits > 1 {
 		partial := scratch_alloc(l.splits * g.M * g.N * size_of(f32))
-		dispatch(gemm_pso(ch.tile), {a, b, partial}, l.params[:], l.grid, l.group, label)
+		dispatch(gemm_pso(ch.tile), {a, b, partial}, l.params[:], l.grid, l.group, 2, label)
 		dispatch(metal_get_kernel(KERNELS, "reduce_sum_thread"), {partial, c}, []u32{1, u32(l.splits), u32(g.M * g.N)},
-			{g.M * g.N, 1, 1}, {256, 1, 1}, kernel_timing() ? "splitk_sum" : "")
+			{g.M * g.N, 1, 1}, {256, 1, 1}, 1, kernel_timing() ? "splitk_sum" : "")
 		return
 	}
-	dispatch(gemm_pso(ch.tile), {a, b, c}, l.params[:], l.grid, l.group, label)
+	dispatch(gemm_pso(ch.tile), {a, b, c}, l.params[:], l.grid, l.group, 2, label)
 }
 
 // Time every candidate on scratch operands of the same extents (values don't
@@ -302,10 +302,10 @@ gemm_search :: proc(g: ^Gemm) -> Gemm_Choice {
 	copies := make([][3]Dev_Ref, R, context.temp_allocator)
 	off := 0
 	for &c in copies do for j in 0 ..< 3 {
-		c[j] = Dev_Ref{arena, off}
+		c[j] = Dev_Ref{arena, off, 4 * ext[j]}
 		off = (off + 4 * ext[j] + 255) &~ 255
 	}
-	partial := Dev_Ref{arena, off}
+	partial := Dev_Ref{arena, off, 0}
 	best, best_ms := gemm_default(g), max(f64)
 	combine := metal_get_kernel(KERNELS, "reduce_sum_thread")
 	for ch in cands {

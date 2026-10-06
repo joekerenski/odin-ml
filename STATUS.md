@@ -89,7 +89,7 @@ Numbers (M5, after unification; before in parens)
   tinygrad on the same GPU 41.6 ms/step (BEAM=0, 1300 kernels).
   MNIST MLP 8.1 s and CNN 16.7 s (conv/pool on the CPU) — slower than the CPU
   backend at these sizes.
-- Checks: tests on CPU, Metal, CUDA (137), GPU-vs-CPU parity over every kernel
+- Checks: tests on CPU, Metal, CUDA (138), GPU-vs-CPU parity over every kernel
   path, heap and arena memory, CPU vs the reference path (views copied,
   nothing recomputed) (tests/parity: 78 on Metal), tinygrad oracle
   41/41 with odin on CPU and CUDA vs tinygrad on CUDA; whole-model DT oracle
@@ -186,7 +186,21 @@ the 4090 before merge:
    Not done: reduce / elementwise knobs, GEMM epilogues (< 1 ms upside
    measured), CUDA (cuBLAS stays), on-disk binaries.
 8. Record and replay (Metal indirect command buffers, CUDA Graphs) + optimizer
-   as UOps on the device
+   as UOps on the device  [PR 8: replay of scheduling, concurrent dispatch]
+   Schedule cache (schedule_cache.odin): a step's graph has the same structure
+   every time, so the scheduler's decisions (views, groups, clones, dead
+   members, consumer counts, run order) are recorded by topo position and
+   replayed onto the next graph with the same structure key (compared in
+   full). Host scheduling 3.4 → ~1 ms per M4 step. ML_SCHED_CACHE=0 off.
+   Metal: a concurrent encoder with memory barriers only where a kernel reads
+   what an earlier one (since the last barrier) wrote, or writes what it read
+   or wrote; kernels run in level order (longest kernel chain from the inputs)
+   so neighbours are independent: 854 dispatches, 523 barriers.
+   ML_METAL_SERIAL=1 for the serial encoder.
+   M4: Metal 19.6 → 16.65 ms (≈ 12.9 ms GPU window + ~1 ms scheduling +
+   ~2.5 ms sampling, graph building, encoding of the first batch, Adam).
+   Not done: kernel-list replay (ICB / CUDA Graphs), Adam on the device (0.16
+   ms on the M5's unified memory; matters on CUDA).
 
 Milestones
 0. Cleanup ✓  One UOp model: one executor, autograd emits UOps ✓
