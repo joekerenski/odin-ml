@@ -1,4 +1,29 @@
-# odin-ml microbenches
+# odin-ml benches
+
+## make perf — the performance plan's yardstick
+
+```bash
+ML_DEVICE=metal make perf            # or cuda / cpu; ARGS=dt_fusion runs matching workloads
+ML_DEVICE=metal make perf-baseline   # (re)write bench/perf/baseline-<machine>.json — commit it
+make perf-tiny                       # the bar: the same M4 step in tinygrad, default and BEAM=2
+```
+
+Workloads:
+- training steps: M4 and M3 DT steps (sample + forward + backward + Adam), and
+  MNIST-shaped MLP and CNN steps on synthetic data;
+- micros: stream bandwidth, 2048³ GEMM, row softmax, row LayerNorm.
+
+Each workload reports:
+- step time (median / p10 / p90) and kernels per step, with deltas vs the
+  committed baseline for this machine type (`<device>-<os>-<arch>`);
+- one profiled step broken down by kernel type: count, device ms, achieved GB/s
+  and GFLOP/s.
+
+Every run is appended to `build/perf.jsonl`. Profiled kernels run one at a time,
+so the breakdown sums to more than the step median; the median is the real number.
+The same profile is available in code: `ml.profile_begin()` … `ml.profile_end()`.
+
+## Microbenches vs NumPy
 
 Compare our kernels to **NumPy f32** on this machine (macOS → Accelerate BLAS).
 

@@ -119,7 +119,9 @@ Workload: one M4 training step, ~9.3 GFLOP, ~400 MB of activation traffic.
 One branch + PR per stage, measured with `make perf` on the M5; CUDA checked on
 the 4090 before merge:
 1. Measurement: make perf (fixed workloads, per-kernel-type profile with
-   bandwidth/FLOP rates, JSON log), tinygrad comparison
+   bandwidth/FLOP rates, JSON log), tinygrad comparison  [PR 1]
+   M5 baselines in bench/perf/baseline-*.json (Metal: M4 27.5 ms, 1302 kernels;
+   45% fused elementwise, 31% GEMM, 15% reduce, 9% permute)
 2. Kernel IR: one representation for every fused kernel (index space, loads,
    expression DAG, reduce accumulators, stores); all backends render from it
 3. Multi-consumer fusion with a cycle check

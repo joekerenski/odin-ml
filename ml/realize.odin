@@ -288,17 +288,23 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 	assert(len(stores) > 0, "fused group has no stores")
 
 	t0: time.Tick
-	if debug_level >= 2 do t0 = time.tick_now()
+	if debug_level >= 2 || profiling do t0 = time.tick_now()
 
+	profile_open(.Fused, fused_bytes(group, stores[:]), i64(numel(group[len(group) - 1].shape)) * i64(len(group)), len(group))
 	if !run_fused(group, stores[:]) {
 		// too big for one kernel: run each node on its own
+		if profiling do pop(&profile_stats)
 		for u in group {
 			single := []^UOp{u}
+			profile_open(.Fused, fused_bytes(single, single), i64(numel(u.shape)))
+			tk := time.tick_now()
 			ok := run_fused(single, single)
 			assert(ok)
+			profile_host_wall(tk, .Fused)
 			counters.kernels += 1
 		}
 	} else {
+		profile_host_wall(t0, .Fused)
 		counters.kernels += 1
 		counters.fused_ops += len(group) - 1
 	}
@@ -336,6 +342,11 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	}
 
 	alloc_out(u)
+	kind := profile_kind(u)
+	if profiling {
+		profile_open(kind, node_bytes(u), node_flops(u))
+		t0 = time.tick_now()
+	}
 	#partial switch u.op {
 	case .Sum, .ReduceMax:
 		backend.reduce(u.op, u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
@@ -357,6 +368,7 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	case:
 		fmt.panicf("run_node: no kernel for %v", u.op)
 	}
+	profile_host_wall(t0, kind)
 	counters.kernels += 1
 
 	if debug_level >= 2 {
@@ -364,6 +376,66 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 		counters.time_ns += dt
 		fmt.printfln("  kernel  %-16v shape=%v  %7.3f ms", u.op, u.shape, f64(dt) / 1e6)
 	}
+}
+
+// ---- profile bookkeeping (profile.odin) -------------------------------------
+
+// Host-run kernels report wall time; GPU kernels report device time themselves.
+@(private)
+profile_host_wall :: proc(t0: time.Tick, kind: Kernel_Kind) {
+	if profiling && (backend.device == .CPU || kind == .Conv_Pool) {
+		profile_set_wall(f64(time.tick_since(t0)) / 1e6)
+	}
+}
+
+@(private)
+profile_kind :: proc(u: ^UOp) -> Kernel_Kind {
+	#partial switch u.op {
+	case .Sum, .ReduceMax: return .Reduce
+	case .Permute: return .Permute
+	case .MatMul: return .GEMM
+	}
+	return .Conv_Pool
+}
+
+// Bytes a fused group reads (each outside input once, at its own size; constants
+// are immediates) and writes (its stores).
+@(private)
+fused_bytes :: proc(group, stores: []^UOp) -> (b: i64) {
+	seen := make([dynamic]^UOp, scratch())
+	defer delete(seen)
+	outer: for u in group {
+		for x in u.src {
+			if x.op == .Const do continue
+			for v in group do if v == x do continue outer
+			for v in seen do if v == x do continue outer
+			append(&seen, x)
+			b += i64(numel(x.shape)) * 4
+		}
+	}
+	for u in stores do b += i64(numel(u.shape)) * 4
+	return
+}
+
+@(private)
+node_bytes :: proc(u: ^UOp) -> (b: i64) {
+	b = i64(numel(u.shape))
+	for x in u.src do b += i64(numel(x.shape))
+	return 4 * b
+}
+
+@(private)
+node_flops :: proc(u: ^UOp) -> i64 {
+	#partial switch u.op {
+	case .Sum, .ReduceMax:
+		return i64(numel(u.src[0].shape))
+	case .MatMul:
+		return 2 * i64(numel(u.shape)) * i64(u.src[0].shape[len(u.src[0].shape) - 1])
+	case .Conv2d:
+		w := u.src[1].shape // [out_c, in_c, kH, kW]
+		return 2 * i64(numel(u.shape)) * i64(w[1] * w[2] * w[3])
+	}
+	return 0
 }
 
 // Ops only the CPU implements (conv / pool and their backward).
