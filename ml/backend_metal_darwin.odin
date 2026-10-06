@@ -15,10 +15,10 @@ package ml
 // and waits once. That's what makes ~1200 small kernels per step cheap
 // (~1 µs dispatch each, bench/metal_dispatch).
 //
-// Kernels. Fused elementwise groups are rendered to MSL from their register
-// program and compiled once per program shape (cached by a structural hash).
-// Reduce, permute and batched GEMM are fixed kernels. Fast-math is off so
-// results match the CPU path closely.
+// Kernels. Every scheduler kernel (kernel_ir.odin) is rendered to MSL by
+// kernel_render.odin and compiled once per structure (cached by kernel_hash);
+// shapes, strides and constants are parameters. Batched GEMM is a hand-written
+// kernel. Fast-math is off so results match the CPU path closely.
 // ============================================================================
 
 import "core:fmt"
@@ -99,9 +99,7 @@ metal_backend :: proc() -> (Backend, bool) {
 	return Backend {
 		device    = .Metal,
 		allocator = metal_allocator,
-		fused     = metal_fused,
-		reduce    = metal_reduce,
-		permute   = metal_permute,
+		kernel    = metal_kernel,
 		matmul    = metal_matmul,
 		sync      = metal_sync,
 	}, true
@@ -311,111 +309,40 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 	}
 }
 
-// ---- fused elementwise: render the register program to MSL ----------------
-
-// Params (u32): p[0] = n; input k: p[1+2k] = n_k (a Const: its f32 bits), p[2+2k] = inner_k;
-// G = 1+2·n_in: p[G] = ndim, p[G+1..] = out shape, then for each Generic
-// input its broadcast strides over the out dims.
-@(private = "file")
-fused_expr :: proc(op: Op, a, b: string) -> string {
-	#partial switch op {
-	case .Add: return fmt.tprintf("%s + %s", a, b)
-	case .Sub: return fmt.tprintf("%s - %s", a, b)
-	case .Mul: return fmt.tprintf("%s * %s", a, b)
-	case .Div: return fmt.tprintf("%s / %s", a, b)
-	case .Max: return fmt.tprintf("(%s > %s ? %s : %s)", a, b, a, b)
-	case .CmpLt: return fmt.tprintf("(%s < %s ? 1.0f : 0.0f)", a, b)
-	case .Neg: return fmt.tprintf("-%s", a)
-	case .Exp: return fmt.tprintf("exp(%s)", a)
-	case .Log: return fmt.tprintf("log(%s)", a)
-	case .Sqrt: return fmt.tprintf("sqrt(%s)", a)
-	case .Expand: return a
-	}
-	fmt.panicf("fused_expr: %v", op)
-}
+// ---- kernel IR: rendered by kernel_render.odin, cached by structure ----------
 
 @(private = "file")
-fused_source :: proc(job: ^Fused_Job) -> string {
-	b := strings.builder_make(context.temp_allocator)
-	n_in := len(job.inputs)
-	G := 1 + 2 * n_in
-	nd := len(job.out_shape)
-	strings.write_string(&b, "#include <metal_stdlib>\nusing namespace metal;\nkernel void fused(\n")
-	for inp, k in job.inputs do if inp.mode != .Const do fmt.sbprintf(&b, "    device const float* in%d [[buffer(%d)]],\n", k, k)
-	for k in 0 ..< len(job.stores) do fmt.sbprintf(&b, "    device float* out%d [[buffer(%d)]],\n", k, n_in + k)
-	strings.write_string(&b, "    constant uint* p [[buffer(30)]],\n    uint i [[thread_position_in_grid]]) {\n    if (i >= p[0]) return;\n")
-	gen := 0
-	for inp, k in job.inputs {
-		switch inp.mode {
-		case .Direct: fmt.sbprintf(&b, "    float s%d = in%d[i];\n", k, k)
-		case .Scalar: fmt.sbprintf(&b, "    float s%d = in%d[0];\n", k, k)
-		case .Const: fmt.sbprintf(&b, "    float s%d = as_type<float>(p[%d]);\n", k, 1 + 2 * k)
-		case .Row: fmt.sbprintf(&b, "    float s%d = in%d[i %% p[%d]];\n", k, k, 1 + 2 * k)
-		case .Col: fmt.sbprintf(&b, "    float s%d = in%d[i / p[%d]];\n", k, k, 2 + 2 * k)
-		case .Block: fmt.sbprintf(&b, "    float s%d = in%d[(i / p[%d]) %% p[%d]];\n", k, k, 2 + 2 * k, 1 + 2 * k)
-		case .Generic:
-			S := G + 1 + nd + gen * nd
-			fmt.sbprintf(&b, "    float s%d; {{ uint r = i, o = 0;\n", k)
-			fmt.sbprintf(&b, "      for (int d = %d; d >= 0; d--) {{ uint c = r %% p[%d + d]; r /= p[%d + d]; o += c * p[%d + d]; }}\n", nd - 1, G + 1, G + 1, S)
-			fmt.sbprintf(&b, "      s%d = in%d[o]; }}\n", k, k)
-			gen += 1
-		}
-	}
-	for insn, j in job.insns {
-		a, bb := fmt.tprintf("s%d", insn.a), fmt.tprintf("s%d", insn.b)
-		fmt.sbprintf(&b, "    float s%d = %s;\n", n_in + j, fused_expr(insn.op, a, bb))
-	}
-	for st, k in job.stores do fmt.sbprintf(&b, "    out%d[i] = s%d;\n", k, st.slot)
-	strings.write_string(&b, "}\n")
-	return strings.to_string(b)
-}
-
-metal_fused :: proc(job: ^Fused_Job) {
-	key := fused_program_hash(job)
+program :: proc(k: ^Kernel, variant: GPU_Variant) -> ^MTL.ComputePipelineState {
+	key := kernel_hash(k, int(variant))
 	pso, ok := metal_ctx.programs[key]
 	if !ok {
-		pso = metal_compile(fused_source(job), "fused")
+		pso = metal_compile(gpu_source(k, variant, .Metal), "k_main")
 		metal_ctx.programs[key] = pso
 	}
-	n := int(numel(job.out_shape))
-	params: [1 + 2 * MAX_FUSED_INPUTS + 1 + MAX_DIMS * (1 + MAX_FUSED_INPUTS)]u32
-	params[0] = u32(n)
-	n_in := len(job.inputs)
-	G := 1 + 2 * n_in
-	nd := len(job.out_shape)
-	params[G] = u32(nd)
-	for d in 0 ..< nd do params[G + 1 + d] = u32(job.out_shape[d])
-	gen := 0
-	bufs: [MAX_FUSED_INPUTS + MAX_FUSED_INSNS]Dev_Ref
-	for inp, k in job.inputs {
-		params[1 + 2 * k] = u32(inp.n)
-		params[2 + 2 * k] = u32(inp.inner)
-		if inp.mode == .Generic {
-			S := G + 1 + nd + gen * nd
-			pad := nd - len(inp.shape)
-			for d in 0 ..< nd {
-				sd := d - pad
-				params[S + d] = sd >= 0 && inp.shape[sd] != 1 ? u32(stride_of(inp.shape, sd)) : 0
-			}
-			gen += 1
-		}
-		if inp.mode == .Const {
-			params[1 + 2 * k] = transmute(u32)inp.value
-			continue // no buffer: bufs[k] stays unbound
-		}
-		bufs[k] = resolve(inp.data)
+	return pso
+}
+
+metal_kernel :: proc(k: ^Kernel) {
+	plan := gpu_plan(k)
+	bufs: [MAX_KERNEL_BUFS]Dev_Ref
+	for j in 0 ..< k.n_bufs do bufs[j] = resolve(k.bufs[j], output = j >= k.n_in)
+	if plan.split > 1 {
+		// partial [O·S, I] from k's program, then a plain reduction over S
+		pa, pb, na, nb := gpu_split_params(k, plan.split)
+		O, I := k.dims[0], k.dims[2]
+		partial := scratch_alloc(O * plan.split * I * size_of(f32))
+		in_bufs := bufs
+		in_bufs[k.n_in] = partial
+		label := k.label != "" ? fmt.tprintf("Reduce_Split %s", k.label) : ""
+		dispatch(program(k, .Reduce_Thread), in_bufs[:k.n_in + 1], pa[:na], {plan.threads, 1, 1}, {GPU_GROUP, 1, 1}, label)
+		kb := kernel_reduce_run(k.nodes[kernel_reduce_node(k)].op, nil, nil, O, plan.split, I)
+		dispatch(program(&kb, .Reduce_Thread), {partial, bufs[k.n_in]}, pb[:nb], {O * I, 1, 1}, {GPU_GROUP, 1, 1}, label)
+		return
 	}
-	for st, k in job.stores do bufs[n_in + k] = resolve(st.data, output = true)
-	used := G + 1 + nd + gen * nd
-	label := ""
-	if kernel_timing() {
-		b := strings.builder_make(context.temp_allocator)
-		strings.write_string(&b, "fused[")
-		for insn, i in job.insns do fmt.sbprintf(&b, "%s%v", i > 0 ? "," : "", insn.op)
-		fmt.sbprintf(&b, "] %v", job.out_shape)
-		label = strings.to_string(b)
-	}
-	dispatch(pso, bufs[:n_in + len(job.stores)], params[:used], {n, 1, 1}, {256, 1, 1}, label)
+	p: [GPU_PARAMS]u32
+	n := gpu_params(k, &p)
+	dispatch(program(k, plan.variant), bufs[:k.n_bufs], p[:n], {plan.threads, 1, 1}, {GPU_GROUP, 1, 1},
+		k.label != "" ? fmt.tprintf("%v %s", plan.variant, k.label) : "")
 }
 
 // ---- fixed kernels --------------------------------------------------------
@@ -425,48 +352,15 @@ KERNELS :: `
 #include <metal_stdlib>
 using namespace metal;
 
-// [outer, red, inner] → [outer, inner]. One thread per output...
-#define REDUCE_THREAD(NAME, INIT, ACC)                                          \
-kernel void NAME(device const float* a [[buffer(0)]], device float* out [[buffer(1)]], \
-                 constant uint* p [[buffer(30)]], uint t [[thread_position_in_grid]]) { \
-    uint outer = p[0], red = p[1], inner = p[2];                               \
-    if (t >= outer * inner) return;                                            \
-    uint o = t / inner, k = t % inner;                                         \
-    float acc = INIT;                                                          \
-    for (uint r = 0; r < red; r++) { float v = a[(o * red + r) * inner + k]; acc = ACC; } \
-    out[t] = acc;                                                              \
-}
-// ...or, for long reductions, one 256-thread group per output.
-#define REDUCE_GROUP(NAME, INIT, ACC, COMB)                                     \
-kernel void NAME(device const float* a [[buffer(0)]], device float* out [[buffer(1)]], \
-                 constant uint* p [[buffer(30)]], uint t [[thread_index_in_threadgroup]], \
-                 uint g [[threadgroup_position_in_grid]]) {                    \
-    uint red = p[1], inner = p[2];                                             \
-    uint o = g / inner, k = g % inner;                                         \
-    threadgroup float sh[256];                                                 \
-    float acc = INIT;                                                          \
-    for (uint r = t; r < red; r += 256) { float v = a[(o * red + r) * inner + k]; acc = ACC; } \
-    sh[t] = acc;                                                               \
-    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
-    for (uint s = 128; s > 0; s >>= 1) {                                       \
-        if (t < s) { float x = sh[t], v = sh[t + s]; sh[t] = COMB; }           \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
-    }                                                                          \
-    if (t == 0) out[g] = sh[0];                                                \
-}
-REDUCE_THREAD(reduce_sum_thread, 0.0f, acc + v)
-REDUCE_THREAD(reduce_max_thread, -INFINITY, (v > acc ? v : acc))
-REDUCE_GROUP(reduce_sum_group, 0.0f, acc + v, x + v)
-REDUCE_GROUP(reduce_max_group, -INFINITY, (v > acc ? v : acc), (v > x ? v : x))
-
-// out.shape[i] = shape[order[i]]; p = [nd, n, out_shape[8], src_stride[8]]
-kernel void permute(device const float* a [[buffer(0)]], device float* out [[buffer(1)]],
-                    constant uint* p [[buffer(30)]], uint i [[thread_position_in_grid]]) {
-    uint nd = p[0];
-    if (i >= p[1]) return;
-    uint r = i, off = 0;
-    for (int d = int(nd) - 1; d >= 0; d--) { uint c = r % p[2 + d]; r /= p[2 + d]; off += c * p[10 + d]; }
-    out[i] = a[off];
+// Split-K GEMM combine: [1, splits, m·n] → [m·n]. One thread per output.
+kernel void reduce_sum_thread(device const float* a [[buffer(0)]], device float* out [[buffer(1)]],
+                              constant uint* p [[buffer(30)]], uint t [[thread_position_in_grid]]) {
+    uint outer = p[0], red = p[1], inner = p[2];
+    if (t >= outer * inner) return;
+    uint o = t / inner, k = t % inner;
+    float acc = 0.0f;
+    for (uint r = 0; r < red; r++) acc += a[(o * red + r) * inner + k];
+    out[t] = acc;
 }
 
 // C[z] = op(A[z]) @ op(B[z]); 16×16 tiles in threadgroup memory.
@@ -571,70 +465,6 @@ kernel void matmul_small(device const float* A [[buffer(0)]], device const float
 @(private = "file")
 round_up :: proc(x, m: int) -> int {
 	return (x + m - 1) / m * m
-}
-
-// Same run decomposition as the CPU reduce_kernel; temporaries in scratch.
-metal_reduce :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
-	red: [MAX_DIMS]bool
-	for ax in axes do red[ax] = true
-	cur_shape: [MAX_DIMS]i32
-	copy(cur_shape[:], shape)
-	nd := len(shape)
-	src := resolve(a)
-	did := false
-	d := nd - 1
-	for d >= 0 {
-		if !red[d] || cur_shape[d] == 1 {
-			d -= 1
-			continue
-		}
-		hi := d + 1
-		for d >= 0 && red[d] do d -= 1
-		lo := d + 1
-		outer := int(numel(cur_shape[:lo]))
-		r := int(numel(cur_shape[lo:hi]))
-		inner := int(numel(cur_shape[hi:nd]))
-		for k in lo ..< hi do cur_shape[k] = 1
-		more := false
-		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
-		dst := more ? scratch_alloc(outer * inner * size_of(f32)) : resolve(out, output = true)
-		rows := outer * inner
-		params := []u32{u32(outer), u32(r), u32(inner)}
-		name: string
-		split := 1 // chunks of the reduced axis, for long column reductions
-		if inner >= 16 && r >= 512 && rows < 8192 {
-			for s in ([]int{64, 32, 16, 8}) do if r % s == 0 && split == 1 do split = s
-		}
-		if split > 1 {
-			// [outer, split, r/split, inner] → partial [outer, split, inner] → dst
-			name = op == .Sum ? "reduce_sum_thread" : "reduce_max_thread"
-			partial := scratch_alloc(outer * split * inner * size_of(f32))
-			dispatch(metal_get_kernel(KERNELS, name), {src, partial}, []u32{u32(outer * split), u32(r / split), u32(inner)}, {outer * split * inner, 1, 1}, {256, 1, 1},
-				kernel_timing() ? fmt.tprintf("%s split %d×%d×%d/%d", name, outer, r, inner, split) : "")
-			dispatch(metal_get_kernel(KERNELS, name), {partial, dst}, []u32{u32(outer), u32(split), u32(inner)}, {rows, 1, 1}, {256, 1, 1},
-				kernel_timing() ? fmt.tprintf("%s combine", name) : "")
-		} else if r >= 128 && rows < 8192 {
-			name = op == .Sum ? "reduce_sum_group" : "reduce_max_group"
-			dispatch(metal_get_kernel(KERNELS, name), {src, dst}, params, {rows * 256, 1, 1}, {256, 1, 1}, kernel_timing() ? fmt.tprintf("%s %d×%d×%d", name, outer, r, inner) : "")
-		} else {
-			name = op == .Sum ? "reduce_sum_thread" : "reduce_max_thread"
-			dispatch(metal_get_kernel(KERNELS, name), {src, dst}, params, {rows, 1, 1}, {256, 1, 1}, kernel_timing() ? fmt.tprintf("%s %d×%d×%d", name, outer, r, inner) : "")
-		}
-		src = dst
-		did = true
-	}
-	if !did do metal_permute(out, a, {i32(len(a))}, {0}) // nothing to reduce: copy
-}
-
-metal_permute :: proc(out, a: []f32, shape: []i32, order: []i32) {
-	params: [18]u32
-	nd := len(shape)
-	params[0], params[1] = u32(nd), u32(len(out))
-	for o, i in order {
-		params[2 + i] = u32(shape[o])
-		params[10 + i] = u32(stride_of(shape, int(o)))
-	}
-	dispatch(metal_get_kernel(KERNELS, "permute"), {resolve(a), resolve(out, output = true)}, params[:], {len(out), 1, 1}, {256, 1, 1}, kernel_timing() ? fmt.tprintf("permute %v %v", shape, order) : "")
 }
 
 metal_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool) {

@@ -1,8 +1,8 @@
 package ml
 
 // ============================================================================
-// Fused elementwise kernel. A group of same-shape ewise UOps becomes a tiny
-// program (insns over slots) run over the output in CHUNKs:
+// CPU elementwise kernels (kernel_cpu.odin builds the job from a Kernel). The
+// program (insns over slots) runs over the output in CHUNKs:
 //
 //   slots[0..n_in)      each input's values for this chunk (broadcast by load
 //                       mode; Direct inputs are just pointers, no copy)
@@ -15,7 +15,6 @@ package ml
 
 import "base:intrinsics"
 import "core:math"
-import "core:hash"
 import "core:simd"
 
 MAX_FUSED_INSNS :: 16
@@ -34,12 +33,12 @@ Load_Mode :: enum {
 }
 
 Fused_In :: struct {
-	mode:  Load_Mode,
-	data:  []f32,
-	n:     int,
-	inner: int,
-	shape: []i32,
-	value: f32, // .Const
+	mode:    Load_Mode,
+	data:    []f32,
+	n:       int,
+	inner:   int,
+	strides: [MAX_DIMS]int, // .Generic: per output dim (0 = broadcast)
+	value:   f32,           // .Const
 }
 
 Fused_Insn :: struct {
@@ -52,82 +51,6 @@ Fused_Store :: struct {
 	data: []f32,
 }
 
-// Right-align `shape` under `out` and pick the cheapest load.
-classify_load :: proc(shape, out: []i32) -> (mode: Load_Mode, n, inner: int) {
-	n = int(numel(shape))
-	if n == int(numel(out)) do return .Direct, n, 0
-	if n == 1 do return .Scalar, n, 0
-	pad := len(out) - len(shape)
-	lo, hi := -1, -1
-	for d in 0 ..< len(shape) {
-		if shape[d] != 1 {
-			if lo < 0 do lo = pad + d
-			hi = pad + d + 1
-		}
-	}
-	for d in lo ..< hi {
-		if shape[d - pad] != out[d] do return .Generic, n, 0
-	}
-	inner = int(numel(out[hi:]))
-	if inner == 1 do return .Row, n, 1
-	if numel(out[:lo]) == 1 do return .Col, n, inner
-	return .Block, n, inner
-}
-
-flat_of_shape :: proc(idx: []i32, odim: int, shape: []i32) -> int {
-	s := 0
-	st := 1
-	for d := len(shape) - 1; d >= 0; d -= 1 {
-		if shape[d] != 1 do s += int(idx[odim - len(shape) + d]) * st
-		st *= int(shape[d])
-	}
-	return s
-}
-
-// Run `group` as one kernel, writing `stores`. Returns false (without doing
-// anything) if the group exceeds the kernel's register budget.
-run_fused :: proc(group: []^UOp, stores: []^UOp) -> bool {
-	if len(group) > MAX_FUSED_INSNS do return false
-	out_shape := group[len(group) - 1].shape
-
-	slot_of := make(map[^UOp]int, scratch())
-	defer delete(slot_of)
-	inputs: [MAX_FUSED_INPUTS]Fused_In
-	n_in := 0
-	for u in group do slot_of[u] = -1
-	for u in group {
-		for x in u.src {
-			if x in slot_of do continue
-			if n_in == MAX_FUSED_INPUTS do return false
-			if x.op == .Const {
-				inputs[n_in] = Fused_In{mode = .Const, n = 1, shape = x.shape, value = x.arg.(f32)}
-			} else {
-				mode, n, inner := classify_load(x.shape, out_shape)
-				inputs[n_in] = Fused_In{mode, x.data, n, inner, x.shape, 0}
-			}
-			slot_of[x] = n_in
-			n_in += 1
-		}
-	}
-
-	insns: [MAX_FUSED_INSNS]Fused_Insn
-	for u, j in group {
-		b := op_is_binary(u.op) ? slot_of[u.src[1]] : 0
-		insns[j] = Fused_Insn{u.op, slot_of[u.src[0]], b}
-		slot_of[u] = n_in + j
-	}
-
-	outs: [MAX_FUSED_INSNS]Fused_Store
-	for u, k in stores {
-		alloc_out(u)
-		outs[k] = Fused_Store{slot_of[u], u.data}
-	}
-
-	job := Fused_Job{inputs[:n_in], insns[:len(group)], outs[:len(stores)], out_shape}
-	backend.fused(&job)
-	return true
-}
-
 CHUNK :: 256
 PAR_GRAIN :: 8 * 1024 // elements per thread part (20 threads: a [1024, 4, 64] tensor in 32 parts), below this: one thread
 
@@ -135,12 +58,14 @@ Fused_Job :: struct {
 	inputs:    []Fused_In,
 	insns:     []Fused_Insn,
 	stores:    []Fused_Store,
-	out_shape: []i32,
+	out_shape: []int,
 }
 
 // CPU backend: split the output across cores.
 run_fused_kernel :: proc(job: ^Fused_Job) {
-	parallel_for(int(numel(job.out_shape)), PAR_GRAIN, run_fused_range, job)
+	n := 1
+	for d in job.out_shape do n *= d
+	parallel_for(n, PAR_GRAIN, run_fused_range, job)
 }
 
 // Output elements [lo, hi), CHUNK at a time.
@@ -163,24 +88,20 @@ run_fused_range :: proc(data: rawptr, lo, hi: int) {
 	// following its broadcast strides (0 on broadcast dims). No divisions per
 	// element.
 	nd := len(out_shape)
-	gstride: [MAX_FUSED_INPUTS][MAX_DIMS]int
-	goff: [MAX_FUSED_INPUTS]int
+	gstride: [MAX_FUSED_SLOTS][MAX_DIMS]int
+	goff: [MAX_FUSED_SLOTS]int
 	has_generic := false
 	for inp, k in inputs {
 		if inp.mode != .Generic do continue
 		has_generic = true
-		pad := nd - len(inp.shape)
-		for d in 0 ..< nd {
-			sd := d - pad
-			gstride[k][d] = sd >= 0 && inp.shape[sd] != 1 ? int(stride_of(inp.shape, sd)) : 0
-		}
+		gstride[k] = inp.strides
 	}
 	idx: [MAX_DIMS]int
 	if has_generic {
 		r := lo
 		for d := nd - 1; d >= 0; d -= 1 {
-			idx[d] = r % int(out_shape[d])
-			r /= int(out_shape[d])
+			idx[d] = r % out_shape[d]
+			r /= out_shape[d]
 		}
 		for inp, k in inputs {
 			if inp.mode != .Generic do continue
@@ -226,8 +147,8 @@ run_fused_range :: proc(data: rawptr, lo, hi: int) {
 				for d := nd - 1; d >= 0; d -= 1 {
 					idx[d] += 1
 					for inp, k in inputs do if inp.mode == .Generic do goff[k] += gstride[k][d]
-					if idx[d] < int(out_shape[d]) do break
-					for inp, k in inputs do if inp.mode == .Generic do goff[k] -= gstride[k][d] * int(out_shape[d])
+					if idx[d] < out_shape[d] do break
+					for inp, k in inputs do if inp.mode == .Generic do goff[k] -= gstride[k][d] * out_shape[d]
 					idx[d] = 0
 				}
 			}
@@ -299,25 +220,4 @@ fused_eval_simd :: #force_inline proc(op: Op, a, b: simd.f32x4) -> simd.f32x4 {
 	case .Expand: return a
 	}
 	panic("fused_eval_simd: not a simd ewise op")
-}
-
-// Structural hash of a fused program (inputs' load modes, insns, stores, rank):
-// GPU backends compile one kernel per distinct program and cache it by this.
-fused_program_hash :: proc(job: ^Fused_Job) -> u64 {
-	key: [256]u8
-	n := 0
-	put :: proc(key: ^[256]u8, n: ^int, v: int) {
-		key[n^] = u8(v)
-		n^ += 1
-	}
-	put(&key, &n, len(job.inputs))
-	put(&key, &n, len(job.out_shape))
-	for inp in job.inputs do put(&key, &n, int(inp.mode))
-	for insn in job.insns {
-		put(&key, &n, int(insn.op))
-		put(&key, &n, insn.a)
-		put(&key, &n, insn.b)
-	}
-	for st in job.stores do put(&key, &n, st.slot)
-	return hash.fnv64a(key[:n])
 }

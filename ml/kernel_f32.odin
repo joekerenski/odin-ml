@@ -108,49 +108,6 @@ reduce_rows :: proc(dst, src: []f32, outer, red, inner, k0, k1: int, $op: Op) {
 	}
 }
 
-// Reduce over `axes` (kept as size 1). Each maximal run of adjacent reduced
-// axes is one reduce_block pass, rightmost run first.
-reduce_kernel :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
-	red: [MAX_DIMS]bool
-	for ax in axes do red[ax] = true
-	cur := a
-	cur_shape: [MAX_DIMS]i32
-	copy(cur_shape[:], shape)
-	nd := len(shape)
-
-	d := nd - 1
-	for d >= 0 {
-		if !red[d] || cur_shape[d] == 1 {
-			d -= 1
-			continue
-		}
-		hi := d + 1
-		for d >= 0 && red[d] do d -= 1
-		lo := d + 1
-		outer := int(numel(cur_shape[:lo]))
-		r := int(numel(cur_shape[lo:hi]))
-		inner := int(numel(cur_shape[hi:nd]))
-		for k in lo ..< hi do cur_shape[k] = 1
-		// more runs to the left? reduce into a temp, else straight into out
-		more := false
-		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
-		dst := more ? make([]f32, outer * inner, scratch()) : out
-		if op == .Sum {
-			reduce_block(dst, cur, outer, r, inner, .Sum)
-		} else {
-			reduce_block(dst, cur, outer, r, inner, .ReduceMax)
-		}
-		if raw_data(cur) != raw_data(a) do delete(cur, scratch())
-		cur = dst
-	}
-	if raw_data(cur) != raw_data(out) {
-		copy(out, cur)
-		if raw_data(cur) != raw_data(a) do delete(cur, scratch())
-	}
-}
-
-// ---- permute --------------------------------------------------------------
-
 // out.shape[i] = shape[order[i]]. Walks the output in order with an odometer
 // (no divisions); when the last axis stays last, copies contiguous runs.
 // Parts of the output run in parallel, each starting its odometer at lo.
@@ -161,20 +118,27 @@ Permute_Job :: struct {
 }
 
 permute_kernel :: proc(out, a: []f32, shape: []i32, order: []i32) {
-	job := Permute_Job{out = out, a = a, nd = len(shape)}
+	dims, st: [MAX_DIMS]int
 	for o, i in order {
-		job.out_shape[i] = int(shape[o])
-		job.src_stride[i] = int(stride_of(shape, int(o)))
+		dims[i] = int(shape[o])
+		st[i] = int(stride_of(shape, int(o)))
 	}
-	job.run, job.outer_nd = 1, job.nd
-	if int(order[job.nd - 1]) == job.nd - 1 {
-		job.run, job.outer_nd = job.out_shape[job.nd - 1], job.nd - 1
-	}
-	rows := len(out) / job.run
-	parallel_for(rows, max(1, PAR_GRAIN / job.run), permute_range, &job)
+	strided_copy(out, a, dims[:len(order)], st[:len(order)])
 }
 
-@(private)
+// out[i] = a[offset(i)] over dims, offset by per-dim strides (permutes, views).
+strided_copy :: proc(out, a: []f32, dims: []int, strides: []int) {
+	job := Permute_Job{out = out, a = a, nd = len(dims)}
+	copy(job.out_shape[:], dims)
+	copy(job.src_stride[:], strides)
+	job.run, job.outer_nd = 1, job.nd
+	if job.nd > 0 && strides[job.nd - 1] == 1 {
+		job.run, job.outer_nd = dims[job.nd - 1], job.nd - 1
+	}
+	rows := len(out) / max(job.run, 1)
+	parallel_for(rows, max(1, PAR_GRAIN / max(job.run, 1)), permute_range, &job)
+}
+
 permute_range :: proc(data: rawptr, lo, hi: int) {
 	using job := (^Permute_Job)(data)
 	idx: [MAX_DIMS]int

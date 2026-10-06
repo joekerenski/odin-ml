@@ -10,6 +10,14 @@ test:        ; $(ODIN) run tests/tensor_ops -out:$(BUILD)/tensor_ops
 test-gpu:    ; $(ODIN) run tests/parity -o:speed -out:$(BUILD)/parity   # GPU (Metal or CUDA) vs CPU, every kernel path
 test-metal:  ; ML_DEVICE=metal $(MAKE) test-gpu
 test-cuda:   ; ML_DEVICE=cuda $(MAKE) test-gpu
+# CUDA codegen check without a GPU: render every kernel shape, parse it with clang
+CLANG ?= $(shell test -x /opt/homebrew/opt/llvm/bin/clang && echo /opt/homebrew/opt/llvm/bin/clang || echo clang)
+check-cuda-render:
+	@mkdir -p $(BUILD)/cuda_render && rm -f $(BUILD)/cuda_render/*.cu
+	@$(ODIN) run tests/cuda_render -out:$(BUILD)/cuda_render_gen -- $(BUILD)/cuda_render
+	@for f in $(BUILD)/cuda_render/*.cu; do \
+		$(CLANG) -x cuda --cuda-gpu-arch=sm_89 -nocudainc -nocudalib --cuda-device-only -fsyntax-only \
+			-include tests/cuda_render/nvrtc_stub.h $$f || exit 1; echo "  ok $$(basename $$f)"; done
 # tinygrad + MLX oracles; ML_DEVICE=metal|cuda make oracle checks the GPU path
 oracle:
 	$(ODIN) build bench/odin_vs_tiny -o:speed -out:$(BUILD)/odin_vs_tiny

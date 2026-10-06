@@ -22,11 +22,11 @@ package ml
 // Execution. Kernels queue on one stream, in order (each sees the previous
 // results); sync() waits once per realize.
 //
-// Kernels. Fused elementwise groups are rendered to CUDA C from their
-// register program and compiled by NVRTC once per program shape (cached by
-// fused_program_hash, as on Metal). Reduce and permute are fixed kernels;
-// GEMM is cuBLAS in plain fp32 (no TF32). No fast-math and no FMA contraction,
-// so results match the CPU path closely.
+// Kernels. Every scheduler kernel (kernel_ir.odin) is rendered to CUDA C by
+// kernel_render.odin (the same renderer as Metal) and compiled by NVRTC once
+// per structure (cached by kernel_hash). GEMM is cuBLAS in plain fp32 (no
+// TF32), tiny batched GEMMs a hand-written kernel. No fast-math and no FMA
+// contraction, so results match the CPU path closely.
 // ============================================================================
 
 import "core:dynlib"
@@ -195,7 +195,7 @@ Cuda_Context :: struct {
 	sms:         int,
 	fixed:       CUmodule,
 	kernels:     map[string]CUfunction, // fixed kernels, by name
-	programs:    map[u64]CUfunction, // fused groups, by program hash
+	programs:    map[u64]CUfunction, // IR kernels, by structural hash
 	initialized: bool,
 	// memory
 	blocks:      [dynamic]Dev_Block, // managed allocations (cuda_allocator), sorted by base
@@ -219,7 +219,7 @@ cuda_ctx: Cuda_Context
 // p[2+2k] = inner_k; G = 1+2·n_in: p[G] = ndim, p[G+1..] = out shape, then
 // each Generic input's broadcast strides over the out dims (as on Metal).
 @(private = "file")
-PARAMS :: 1 + 2 * MAX_FUSED_INPUTS + 1 + MAX_DIMS * (1 + MAX_FUSED_INPUTS) + 2
+PARAMS :: GPU_PARAMS // the shared parameter block (kernel_render.odin)
 
 @(private = "file")
 BLOCK :: 256
@@ -289,9 +289,7 @@ cuda_backend :: proc() -> (Backend, bool) {
 	return Backend {
 		device    = .CUDA,
 		allocator = cuda_allocator,
-		fused     = cuda_fused,
-		reduce    = cuda_reduce,
-		permute   = cuda_permute,
+		kernel    = cuda_kernel,
 		matmul    = cuda_matmul,
 		sync      = cuda_sync,
 		to_host   = cuda_to_host,
@@ -558,153 +556,52 @@ blocks_for :: proc(n: int) -> int {
 	return max(1, (n + BLOCK - 1) / BLOCK)
 }
 
-// ---- fused elementwise: render the register program to CUDA C -------------
+// ---- kernel IR: rendered by kernel_render.odin, cached by structure ----------
 
 @(private = "file")
-fused_expr :: proc(op: Op, a, b: string) -> string {
-	#partial switch op {
-	case .Add: return fmt.tprintf("%s + %s", a, b)
-	case .Sub: return fmt.tprintf("%s - %s", a, b)
-	case .Mul: return fmt.tprintf("%s * %s", a, b)
-	case .Div: return fmt.tprintf("%s / %s", a, b)
-	case .Max: return fmt.tprintf("(%s > %s ? %s : %s)", a, b, a, b)
-	case .CmpLt: return fmt.tprintf("(%s < %s ? 1.0f : 0.0f)", a, b)
-	case .Neg: return fmt.tprintf("-%s", a)
-	case .Exp: return fmt.tprintf("expf(%s)", a)
-	case .Log: return fmt.tprintf("logf(%s)", a)
-	case .Sqrt: return fmt.tprintf("sqrtf(%s)", a)
-	case .Expand: return a
-	}
-	fmt.panicf("fused_expr: %v", op)
-}
-
-@(private = "file")
-fused_source :: proc(job: ^Fused_Job) -> string {
-	b := strings.builder_make(context.temp_allocator)
-	n_in := len(job.inputs)
-	G := 1 + 2 * n_in
-	nd := len(job.out_shape)
-	strings.write_string(&b, "extern \"C\" __global__ void fused(\n")
-	for inp, k in job.inputs do if inp.mode != .Const do fmt.sbprintf(&b, "    const float* in%d,\n", k)
-	for k in 0 ..< len(job.stores) do fmt.sbprintf(&b, "    float* out%d,\n", k)
-	fmt.sbprintf(&b, "    const P p) {{\n    unsigned int i = blockIdx.x * %du + threadIdx.x;\n    if (i >= p.v[0]) return;\n", BLOCK)
-	gen := 0
-	for inp, k in job.inputs {
-		switch inp.mode {
-		case .Direct: fmt.sbprintf(&b, "    float s%d = in%d[i];\n", k, k)
-		case .Scalar: fmt.sbprintf(&b, "    float s%d = in%d[0];\n", k, k)
-		case .Const: fmt.sbprintf(&b, "    float s%d = __uint_as_float(p.v[%d]);\n", k, 1 + 2 * k)
-		case .Row: fmt.sbprintf(&b, "    float s%d = in%d[i %% p.v[%d]];\n", k, k, 1 + 2 * k)
-		case .Col: fmt.sbprintf(&b, "    float s%d = in%d[i / p.v[%d]];\n", k, k, 2 + 2 * k)
-		case .Block: fmt.sbprintf(&b, "    float s%d = in%d[(i / p.v[%d]) %% p.v[%d]];\n", k, k, 2 + 2 * k, 1 + 2 * k)
-		case .Generic:
-			S := G + 1 + nd + gen * nd
-			fmt.sbprintf(&b, "    float s%d; {{ unsigned int r = i, o = 0;\n", k)
-			fmt.sbprintf(&b, "      for (int d = %d; d >= 0; d--) {{ unsigned int c = r %% p.v[%d + d]; r /= p.v[%d + d]; o += c * p.v[%d + d]; }}\n", nd - 1, G + 1, G + 1, S)
-			fmt.sbprintf(&b, "      s%d = in%d[o]; }}\n", k, k)
-			gen += 1
-		}
-	}
-	for insn, j in job.insns {
-		a, bb := fmt.tprintf("s%d", insn.a), fmt.tprintf("s%d", insn.b)
-		fmt.sbprintf(&b, "    float s%d = %s;\n", n_in + j, fused_expr(insn.op, a, bb))
-	}
-	for st, k in job.stores do fmt.sbprintf(&b, "    out%d[i] = s%d;\n", k, st.slot)
-	strings.write_string(&b, "}\n")
-	return strings.to_string(b)
-}
-
-cuda_fused :: proc(job: ^Fused_Job) {
-	key := fused_program_hash(job)
+program :: proc(k: ^Kernel, variant: GPU_Variant) -> CUfunction {
+	key := kernel_hash(k, int(variant))
 	f, ok := cuda_ctx.programs[key]
 	if !ok {
-		f = get_function(cuda_compile(fused_source(job)), "fused")
+		f = get_function(cuda_compile(gpu_source(k, variant, .CUDA)), "k_main")
 		cuda_ctx.programs[key] = f
 	}
-	n := int(numel(job.out_shape))
-	params: [PARAMS]u32
-	params[0] = u32(n)
-	n_in := len(job.inputs)
-	G := 1 + 2 * n_in
-	nd := len(job.out_shape)
-	params[G] = u32(nd)
-	for d in 0 ..< nd do params[G + 1 + d] = u32(job.out_shape[d])
-	gen := 0
-	bufs: [MAX_FUSED_INPUTS + MAX_FUSED_INSNS]CUdeviceptr
-	nb := 0
-	for inp, k in job.inputs {
-		params[1 + 2 * k] = u32(inp.n)
-		params[2 + 2 * k] = u32(inp.inner)
-		if inp.mode == .Generic {
-			S := G + 1 + nd + gen * nd
-			pad := nd - len(inp.shape)
-			for d in 0 ..< nd {
-				sd := d - pad
-				params[S + d] = sd >= 0 && inp.shape[sd] != 1 ? u32(stride_of(inp.shape, sd)) : 0
-			}
-			gen += 1
-		}
-		if inp.mode == .Const {
-			params[1 + 2 * k] = transmute(u32)inp.value
-			continue // passed by value: no pointer parameter
-		}
-		bufs[nb] = resolve(inp.data)
-		nb += 1
+	return f
+}
+
+// Launch shape of a plan: GPU_GROUP threads per block; groups = one block per output.
+@(private = "file")
+plan_grid :: proc(threads: int) -> [3]int {
+	return {blocks_for(threads), 1, 1}
+}
+
+cuda_kernel :: proc(k: ^Kernel) {
+	plan := gpu_plan(k)
+	bufs: [MAX_KERNEL_BUFS]CUdeviceptr
+	for j in 0 ..< k.n_bufs do bufs[j] = resolve(k.bufs[j], output = j >= k.n_in)
+	if plan.split > 1 {
+		// partial [O·S, I] from k's program, then a plain reduction over S
+		pa, pb, na, nb := gpu_split_params(k, plan.split)
+		O, I := k.dims[0], k.dims[2]
+		partial := scratch_alloc(O * plan.split * I * size_of(f32))
+		in_bufs := bufs
+		in_bufs[k.n_in] = partial
+		label := k.label != "" ? fmt.tprintf("Reduce_Split %s", k.label) : ""
+		launch(program(k, .Reduce_Thread), in_bufs[:k.n_in + 1], pa[:na], plan_grid(plan.threads), {GPU_GROUP, 1, 1}, label)
+		kb := kernel_reduce_run(k.nodes[kernel_reduce_node(k)].op, nil, nil, O, plan.split, I)
+		launch(program(&kb, .Reduce_Thread), {partial, bufs[k.n_in]}, pb[:nb], plan_grid(O * I), {GPU_GROUP, 1, 1}, label)
+		return
 	}
-	for st in job.stores {
-		bufs[nb] = resolve(st.data, output = true)
-		nb += 1
-	}
-	label := ""
-	if kernel_timing() {
-		b := strings.builder_make(context.temp_allocator)
-		strings.write_string(&b, "fused[")
-		for insn, i in job.insns do fmt.sbprintf(&b, "%s%v", i > 0 ? "," : "", insn.op)
-		fmt.sbprintf(&b, "] %v", job.out_shape)
-		label = strings.to_string(b)
-	}
-	launch(f, bufs[:nb], params[:], {blocks_for(n), 1, 1}, {BLOCK, 1, 1}, label)
+	p: [GPU_PARAMS]u32
+	n := gpu_params(k, &p)
+	launch(program(k, plan.variant), bufs[:k.n_bufs], p[:n], plan_grid(plan.threads), {GPU_GROUP, 1, 1},
+		k.label != "" ? fmt.tprintf("%v %s", plan.variant, k.label) : "")
 }
 
 // ---- fixed kernels --------------------------------------------------------
 
 @(private = "file")
 KERNELS :: `
-#define NEG_INF __int_as_float(0xff800000)
-
-// [outer, red, inner] → [outer, inner]. One thread per output...
-#define REDUCE_THREAD(NAME, INIT, ACC)                                          \
-extern "C" __global__ void NAME(const float* a, float* out, const P p) {       \
-    unsigned int outer = p.v[0], red = p.v[1], inner = p.v[2];                 \
-    unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;                    \
-    if (t >= outer * inner) return;                                            \
-    unsigned int o = t / inner, k = t % inner;                                 \
-    float acc = INIT;                                                          \
-    for (unsigned int r = 0; r < red; r++) { float v = a[(o * red + r) * inner + k]; acc = ACC; } \
-    out[t] = acc;                                                              \
-}
-// ...or, for long reductions, one 256-thread block per output.
-#define REDUCE_GROUP(NAME, INIT, ACC, COMB)                                     \
-extern "C" __global__ void NAME(const float* a, float* out, const P p) {       \
-    unsigned int red = p.v[1], inner = p.v[2];                                 \
-    unsigned int g = blockIdx.x, t = threadIdx.x;                              \
-    unsigned int o = g / inner, k = g % inner;                                 \
-    __shared__ float sh[256];                                                  \
-    float acc = INIT;                                                          \
-    for (unsigned int r = t; r < red; r += 256) { float v = a[(o * red + r) * inner + k]; acc = ACC; } \
-    sh[t] = acc;                                                               \
-    __syncthreads();                                                           \
-    for (unsigned int s = 128; s > 0; s >>= 1) {                               \
-        if (t < s) { float x = sh[t], v = sh[t + s]; sh[t] = COMB; }           \
-        __syncthreads();                                                       \
-    }                                                                          \
-    if (t == 0) out[g] = sh[0];                                                \
-}
-REDUCE_THREAD(reduce_sum_thread, 0.0f, acc + v)
-REDUCE_THREAD(reduce_max_thread, NEG_INF, (v > acc ? v : acc))
-REDUCE_GROUP(reduce_sum_group, 0.0f, acc + v, x + v)
-REDUCE_GROUP(reduce_max_group, NEG_INF, (v > acc ? v : acc), (v > x ? v : x))
-
 // Tiny batched matrices (attention heads): one thread per output.
 // cuBLAS takes 60-150 µs for 8192 × [4×8]·[8×4]; this takes a few.
 // p = [M, K, N, trans_a, trans_b, batch]
@@ -721,77 +618,7 @@ extern "C" __global__ void matmul_small(const float* A, const float* B, float* C
     C[t] = acc;
 }
 
-// out.shape[i] = shape[order[i]]; p = [nd, n, out_shape[8], src_stride[8]]
-extern "C" __global__ void permute(const float* a, float* out, const P p) {
-    unsigned int nd = p.v[0];
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= p.v[1]) return;
-    unsigned int r = i, off = 0;
-    for (int d = (int)nd - 1; d >= 0; d--) { unsigned int c = r % p.v[2 + d]; r /= p.v[2 + d]; off += c * p.v[10 + d]; }
-    out[i] = a[off];
-}
 `
-
-// Same run decomposition as the CPU reduce_kernel; temporaries in scratch.
-cuda_reduce :: proc(op: Op, out, a: []f32, shape: []i32, axes: []i32) {
-	red: [MAX_DIMS]bool
-	for ax in axes do red[ax] = true
-	cur_shape: [MAX_DIMS]i32
-	copy(cur_shape[:], shape)
-	nd := len(shape)
-	src := resolve(a)
-	did := false
-	d := nd - 1
-	for d >= 0 {
-		if !red[d] || cur_shape[d] == 1 {
-			d -= 1
-			continue
-		}
-		hi := d + 1
-		for d >= 0 && red[d] do d -= 1
-		lo := d + 1
-		outer := int(numel(cur_shape[:lo]))
-		r := int(numel(cur_shape[lo:hi]))
-		inner := int(numel(cur_shape[hi:nd]))
-		for k in lo ..< hi do cur_shape[k] = 1
-		more := false
-		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
-		dst := more ? scratch_alloc(outer * inner * size_of(f32)) : resolve(out, output = true)
-		rows := outer * inner
-		thread_k := op == .Sum ? "reduce_sum_thread" : "reduce_max_thread"
-		group_k := op == .Sum ? "reduce_sum_group" : "reduce_max_group"
-		split := 1 // chunks of the reduced axis, for long column reductions
-		if inner >= 16 && r >= 512 && rows < 8192 {
-			for s in ([]int{64, 32, 16, 8}) do if r % s == 0 && split == 1 do split = s
-		}
-		label := kernel_timing() ? fmt.tprintf("reduce %v %d×%d×%d", op, outer, r, inner) : ""
-		if split > 1 {
-			// [outer, split, r/split, inner] → partial [outer, split, inner] → dst
-			partial := scratch_alloc(outer * split * inner * size_of(f32))
-			launch(fixed_kernel(thread_k), {src, partial}, {u32(outer * split), u32(r / split), u32(inner)}, {blocks_for(outer * split * inner), 1, 1}, {BLOCK, 1, 1}, label)
-			launch(fixed_kernel(thread_k), {partial, dst}, {u32(outer), u32(split), u32(inner)}, {blocks_for(rows), 1, 1}, {BLOCK, 1, 1}, label)
-		} else if r >= 128 && rows < 8192 {
-			launch(fixed_kernel(group_k), {src, dst}, {u32(outer), u32(r), u32(inner)}, {rows, 1, 1}, {256, 1, 1}, label)
-		} else {
-			launch(fixed_kernel(thread_k), {src, dst}, {u32(outer), u32(r), u32(inner)}, {blocks_for(rows), 1, 1}, {BLOCK, 1, 1}, label)
-		}
-		src = dst
-		did = true
-	}
-	if !did do cuda_permute(out, a, {i32(len(a))}, {0}) // nothing to reduce: copy
-}
-
-cuda_permute :: proc(out, a: []f32, shape: []i32, order: []i32) {
-	params: [18]u32
-	nd := len(shape)
-	params[0], params[1] = u32(nd), u32(len(out))
-	for o, i in order {
-		params[2 + i] = u32(shape[o])
-		params[10 + i] = u32(stride_of(shape, int(o)))
-	}
-	label := kernel_timing() ? fmt.tprintf("permute %v %v", shape, order) : ""
-	launch(fixed_kernel("permute"), {resolve(a), resolve(out, output = true)}, params[:], {blocks_for(len(out)), 1, 1}, {BLOCK, 1, 1}, label)
-}
 
 // Row-major C[M,N] = op(A) @ op(B) is column-major Cᵀ = op(B)ᵀ · op(A)ᵀ: hand
 // cuBLAS B first, each with the transpose flag it was given.
