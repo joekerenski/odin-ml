@@ -50,6 +50,7 @@ Schedule :: struct {
 	refs:        map[^UOp]int, // owner → readers still to run
 	pinned:      map[^UOp]bool, // owner whose buffer must outlive the realize
 	pool:        map[int][dynamic][]f32, // free buffers by length, LIFO
+	temps:       [dynamic][]f32, // kernel scratch (multi-run reductions), freed after the sync
 }
 
 // Reuse dead internal buffers within a realize (ML_REUSE=0 turns it off).
@@ -68,6 +69,7 @@ schedule_make :: proc() -> (s: Schedule) {
 	s.refs = make(map[^UOp]int, scratch())
 	s.pinned = make(map[^UOp]bool, scratch())
 	s.pool = make(map[int][dynamic][]f32, scratch())
+	s.temps = make([dynamic][]f32, scratch())
 	return
 }
 
@@ -82,6 +84,8 @@ schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.pinned)
 	for _, l in s.pool do delete(l)
 	delete(s.pool)
+	for t in s.temps do runtime.mem_free(raw_data(t), backend.allocator())
+	delete(s.temps)
 }
 
 // u just got a buffer (its own, or a view of its src's): count its readers
@@ -291,22 +295,24 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 	if debug_level >= 2 || profiling do t0 = time.tick_now()
 
 	profile_open(.Fused, fused_bytes(group, stores[:]), i64(numel(group[len(group) - 1].shape)) * i64(len(group)), len(group))
-	if !run_fused(group, stores[:]) {
+	if k, ok := kernel_from_group(group, stores[:]); ok {
+		launch_kernel(&k)
+		profile_host_wall(t0, .Fused)
+		counters.kernels += 1
+		counters.fused_ops += len(group) - 1
+	} else {
 		// too big for one kernel: run each node on its own
 		if profiling do pop(&profile_stats)
 		for u in group {
 			single := []^UOp{u}
 			profile_open(.Fused, fused_bytes(single, single), i64(numel(u.shape)))
 			tk := time.tick_now()
-			ok := run_fused(single, single)
-			assert(ok)
+			ks, sok := kernel_from_group(single, single)
+			assert(sok)
+			launch_kernel(&ks)
 			profile_host_wall(tk, .Fused)
 			counters.kernels += 1
 		}
-	} else {
-		profile_host_wall(t0, .Fused)
-		counters.kernels += 1
-		counters.fused_ops += len(group) - 1
 	}
 
 	if debug_level >= 2 {
@@ -349,9 +355,10 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	}
 	#partial switch u.op {
 	case .Sum, .ReduceMax:
-		backend.reduce(u.op, u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
+		run_reduce(s, u)
 	case .Permute:
-		backend.permute(u.data, u.src[0].data, u.src[0].shape, u.arg.([]i32))
+		k := kernel_from_permute(u)
+		launch_kernel(&k)
 	case .MatMul:
 		a, ta := gemm_operand(u.src[0])
 		b, tb := gemm_operand(u.src[1])
@@ -376,6 +383,62 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 		counters.time_ns += dt
 		fmt.printfln("  kernel  %-16v shape=%v  %7.3f ms", u.op, u.shape, f64(dt) / 1e6)
 	}
+}
+
+// ---- kernels -------------------------------------------------------------------
+
+launch_kernel :: proc(k: ^Kernel) {
+	if kernel_timing() do k.label = kernel_describe(k)
+	backend.kernel(k)
+}
+
+// Reduce over the node's axes: each maximal run of adjacent reduced axes is one
+// kernel, rightmost run first. Intermediates are realize temporaries.
+@(private)
+run_reduce :: proc(s: ^Schedule, u: ^UOp) {
+	src := u.src[0]
+	red: [MAX_DIMS]bool
+	for ax in u.arg.([]i32) do red[ax] = true
+	cur_shape: [MAX_DIMS]i32
+	copy(cur_shape[:], src.shape)
+	nd := len(src.shape)
+	cur := src.data
+	did := false
+	d := nd - 1
+	for d >= 0 {
+		if !red[d] || cur_shape[d] == 1 {
+			d -= 1
+			continue
+		}
+		hi := d + 1
+		for d >= 0 && red[d] do d -= 1
+		lo := d + 1
+		outer := int(numel(cur_shape[:lo]))
+		r := int(numel(cur_shape[lo:hi]))
+		inner := int(numel(cur_shape[hi:nd]))
+		for k in lo ..< hi do cur_shape[k] = 1
+		more := false
+		for k in 0 ..< lo do if red[k] && cur_shape[k] != 1 do more = true
+		dst := more ? realize_temp(s, outer * inner) : u.data
+		k := kernel_reduce_run(u.op, dst, cur, outer, r, inner)
+		launch_kernel(&k)
+		cur = dst
+		did = true
+	}
+	if !did { // nothing to reduce (all reduced axes have size 1): a copy
+		k := kernel_copy(u.data, src.data, {len(src.data)}, {1})
+		launch_kernel(&k)
+	}
+}
+
+// Device-visible scratch that lives until the end of the realize (after its sync).
+@(private)
+realize_temp :: proc(s: ^Schedule, n: int) -> []f32 {
+	bytes, err := runtime.mem_alloc_non_zeroed(n * size_of(f32), 64, backend.allocator())
+	assert(err == nil, "realize_temp: out of memory")
+	t := ([^]f32)(raw_data(bytes))[:n]
+	append(&s.temps, t)
+	return t
 }
 
 // ---- profile bookkeeping (profile.odin) -------------------------------------

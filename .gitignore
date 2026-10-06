@@ -45,6 +45,7 @@ examples/*/*
 !examples/*/*.md
 tests/*/*
 !tests/*/*.odin
+!tests/*/*.h
 bench/**/main
 !bench/**/main.odin
 

@@ -34,9 +34,7 @@ Backend :: struct {
 	device:    Device,
 	// memory the device can read and write directly (CPU: the heap)
 	allocator: proc() -> mem.Allocator,
-	fused:     proc(job: ^Fused_Job),
-	reduce:    proc(op: Op, out, a: []f32, shape: []i32, axes: []i32),
-	permute:   proc(out, a: []f32, shape: []i32, order: []i32),
+	kernel:    proc(k: ^Kernel), // any kernel of the IR (kernel_ir.odin)
 	matmul:    proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool),
 	sync:      proc(),
 	// optional: move a buffer's pages to the host before CPU code touches it
@@ -47,9 +45,7 @@ Backend :: struct {
 CPU_BACKEND :: Backend {
 	device    = .CPU,
 	allocator = proc() -> mem.Allocator { return scratch() },
-	fused     = run_fused_kernel,
-	reduce    = reduce_kernel,
-	permute   = permute_kernel,
+	kernel    = cpu_kernel,
 	matmul    = matmul_batched,
 	sync      = proc() {},
 }

@@ -123,7 +123,10 @@ the 4090 before merge:
    M5 baselines in bench/perf/baseline-*.json (Metal: M4 27.5 ms, 1302 kernels;
    45% fused elementwise, 31% GEMM, 15% reduce, 9% permute)
 2. Kernel IR: one representation for every fused kernel (index space, loads,
-   expression DAG, reduce accumulators, stores); all backends render from it
+   expression DAG, reduce accumulators, stores); all backends render from it  [PR 2]
+   ml/kernel_ir.odin, kernel_render.odin (one renderer for Metal + CUDA),
+   kernel_cpu.odin. Same kernels and plans as before; make check-cuda-render
+   parses every generated CUDA source with clang where there is no GPU.
 3. Multi-consumer fusion with a cycle check
 4. Reduction fusion: elementwise into reductions, row kernels
    (softmax/LayerNorm/logsumexp in one)
