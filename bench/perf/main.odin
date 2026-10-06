@@ -268,7 +268,8 @@ machine_name :: proc() -> string {
 load_baseline :: proc(path: string) -> (rec: Record, ok: bool) {
 	data, err := os.read_entire_file_from_path(path, context.allocator)
 	if err != nil do return
-	return rec, json.unmarshal(data, &rec) == nil
+	ok = json.unmarshal(data, &rec) == nil // before returning rec: return values are evaluated left to right
+	return
 }
 
 find :: proc(rec: Record, name: string) -> (Result, bool) {
