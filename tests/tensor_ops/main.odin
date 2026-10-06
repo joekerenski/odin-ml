@@ -752,13 +752,14 @@ test_fusion :: proc() {
 	expect(s.data[0] > 0.49 && s.data[0] < 0.51, "sigmoid(0)≈0.5")
 	expect(s.data[1] > s.data[0] && s.data[0] > s.data[2], "sigmoid monotonic")
 
-	// Longer than one fused kernel's budget (16 insns / 8 inputs): still correct
+	// Longer than one fused kernel's budget (16 ops / 12 inputs): merging stops at
+	// the budget, so the chain splits into in-budget kernels (21 inputs: 11 + 9 ops)
 	v := ml.from_data_copy({1, 2, 3, 4, 5}, {5})
 	acc := v
 	for _ in 0 ..< 20 do acc = ml.add(acc, ml.from_data_copy({1, 1, 1, 1, 1}, {5}))
 	ml.counters_reset()
 	expect_close(acc, ml.from_data_copy({21, 22, 23, 24, 25}, {5}), "20-op chain past fused budget")
-	expect(ml.counters.kernels == 20, "over-budget group runs op by op")
+	expect(ml.counters.kernels == 2, "over-budget chain splits into 2 kernels, not 20")
 
 	// Elided Add still receives grad: relu(a+b) all positive → da=db=1
 	ga := ml.from_data_copy({1, -2, 3, -4}, {2, 2}, requires_grad = true)

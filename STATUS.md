@@ -92,8 +92,7 @@ Numbers (M5, after unification; before in parens)
   matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
 
 Known debt
-- Multi-consumer nodes break fusion (x feeding relu AND its grad = own kernel).
-- Over-budget fused groups (>16 ops / >12 inputs) fall back to op-by-op.
+- Fusion budget: groups stop growing at 16 ops / 12 inputs (perf plan, PR 6).
 - Optimizers update raw buffers outside the graph (fine for now; lazy optim later).
 - Buffer reuse covers backward-built nodes only: forward intermediates may be
   read by the caller after backward, so they keep their (cold) buffers.
@@ -127,7 +126,12 @@ the 4090 before merge:
    ml/kernel_ir.odin, kernel_render.odin (one renderer for Metal + CUDA),
    kernel_cpu.odin. Same kernels and plans as before; make check-cuda-render
    parses every generated CUDA source with clang where there is no GPU.
-3. Multi-consumer fusion with a cycle check
+3. Multi-consumer fusion with a cycle check  [PR 3]
+   A merge must keep "run at the last member" valid: every outside user of a
+   member comes after the group. Budgets checked at merge time (no op-by-op
+   fallback). M4: 1302 → 1089 kernels, Metal 27.5 → 24.6 ms. Left: [B,T,1]
+   per-row values after reductions (PR 4), bias/residual adds around GEMMs
+   (PR 6), 16-op budget hits (PR 6).
 4. Reduction fusion: elementwise into reductions, row kernels
    (softmax/LayerNorm/logsumexp in one)
 5. Views: per-input strides; Permute/Expand become index transforms

@@ -195,17 +195,7 @@ realize_all :: proc(sinks: []^UOp) {
 		}
 	}
 
-	// fusion groups
-	for u in s.topo do if op_is_ewise(u.op) do s.uf[u] = u
-	for u in s.topo {
-		if !op_is_ewise(u.op) do continue
-		for x in u.src {
-			if !(x in s.uf) || s.consumers[x] != 1 do continue
-			if !shapes_equal(x.shape, u.shape) do continue
-			ra, rb := uf_find(&s.uf, x), uf_find(&s.uf, u)
-			if ra != rb do s.uf[ra] = rb
-		}
-	}
+	fuse_groups(&s)
 
 	// members of each group in topo order, gathered in one pass; the last
 	// member runs the group
@@ -252,6 +242,119 @@ realize_all :: proc(sinks: []^UOp) {
 		ms := f64(time.tick_since(step_start)) / 1e6
 		fmt.printfln("  realize: %d kernels  %.3f ms", counters.kernels - k0, ms)
 	}
+}
+
+// ---- fusion groups --------------------------------------------------------------
+//
+// Same-shape elementwise nodes are merged into groups (one kernel each). A group
+// runs at the position of its last member, so a merge is allowed only if that
+// stays valid: every outside user of every member must come after the merged
+// group's last member (then inputs are ready when it runs, outputs before they
+// are read, and no cycle can form). Values with outside users are stored; the
+// rest live in registers. Merges also respect the kernel budget (ops, inputs).
+@(private)
+fuse_groups :: proc(s: ^Schedule) {
+	N := len(s.topo)
+	idx := make(map[^UOp]int, N, scratch())
+	defer delete(idx)
+	for u, i in s.topo do idx[u] = i
+	// users of each node (each user once), by topo index
+	start := make([]int, N + 1, scratch())
+	defer delete(start, scratch())
+	for u in s.topo do for x, i in u.src {
+		j, ok := idx[x]
+		if !ok || src_seen_before(u, i) do continue
+		start[j + 1] += 1
+	}
+	for i in 0 ..< N do start[i + 1] += start[i]
+	users := make([]int, start[N], scratch())
+	defer delete(users, scratch())
+	fill := make([]int, N, scratch())
+	defer delete(fill, scratch())
+	for u, ui in s.topo do for x, i in u.src {
+		j, ok := idx[x]
+		if !ok || src_seen_before(u, i) do continue
+		users[start[j] + fill[j]] = ui
+		fill[j] += 1
+	}
+
+	// union-find over topo indices; per root: size, last member, members (linked)
+	parent := make([]int, N, scratch())
+	size := make([]int, N, scratch())
+	last := make([]int, N, scratch())
+	next := make([]int, N, scratch())
+	tail := make([]int, N, scratch())
+	defer {
+		delete(parent, scratch()); delete(size, scratch()); delete(last, scratch())
+		delete(next, scratch()); delete(tail, scratch())
+	}
+	for u, i in s.topo {
+		parent[i] = op_is_ewise(u.op) ? i : -1
+		size[i], last[i], next[i], tail[i] = 1, i, -1, i
+	}
+	find :: proc(parent: []int, i: int) -> int {
+		r := i
+		for parent[r] != r do r = parent[r]
+		for c := i; parent[c] != r; {
+			n := parent[c]
+			parent[c] = r
+			c = n
+		}
+		return r
+	}
+	inputs: [2 * MAX_FUSED_INSNS * 2]^UOp
+	for u, ui in s.topo {
+		if parent[ui] < 0 do continue
+		for x in u.src {
+			xi, ok := idx[x]
+			if !ok || parent[xi] < 0 || !shapes_equal(x.shape, u.shape) do continue
+			a, b := find(parent, xi), find(parent, ui)
+			if a == b || size[a] + size[b] > MAX_FUSED_INSNS do continue
+			lst := max(last[a], last[b])
+			ok_merge := true
+			n_inputs := 0
+			outer: for r in ([]int{a, b}) {
+				for m := r; m >= 0; m = next[m] {
+					for c in users[start[m]:start[m + 1]] {
+						rc := parent[c] < 0 ? -1 : find(parent, c)
+						if rc != a && rc != b && c < lst {
+							ok_merge = false
+							break outer
+						}
+					}
+					for y in s.topo[m].src { // the merged kernel's inputs
+						yi, inside := idx[y]
+						if inside && parent[yi] >= 0 {
+							ry := find(parent, yi)
+							if ry == a || ry == b do continue
+						}
+						dup := false
+						for z in inputs[:n_inputs] do if z == y do dup = true
+						if dup do continue
+						if n_inputs == MAX_FUSED_INPUTS {
+							ok_merge = false
+							break outer
+						}
+						inputs[n_inputs] = y
+						n_inputs += 1
+					}
+				}
+			}
+			if !ok_merge do continue
+			parent[a] = b
+			size[b] += size[a]
+			last[b] = lst
+			next[tail[b]] = a
+			tail[b] = tail[a]
+		}
+	}
+	for u, i in s.topo do if parent[i] >= 0 do s.uf[u] = s.topo[find(parent, i)]
+}
+
+@(private)
+src_seen_before :: proc(u: ^UOp, i: int) -> bool {
+	for j in 0 ..< i do if u.src[j] == u.src[i] do return true
+	return false
 }
 
 // Does anything outside `group` (or the caller) read u?
