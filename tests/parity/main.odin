@@ -95,6 +95,25 @@ close :: proc(a, b: []f32) -> (ok: bool, worst: f32) {
 	return
 }
 
+gemm_checks: int
+
+// GPU vs CPU only, printed only on failure.
+check_quiet :: proc(c: Case, what: string) {
+	cpu_out, cpu_g := run(c, .CPU)
+	gpu_out, gpu_g := run(c, gpu, true)
+	ok, worst := close(gpu_out, cpu_out)
+	for g, i in cpu_g do if g != nil {
+		gok, gw := close(gpu_g[i], g)
+		ok &&= gok
+		worst = max(worst, gw)
+	}
+	gemm_checks += 1
+	if !ok {
+		failed += 1
+		fmt.printfln("  FAIL  %-36s %s (worst rel %.1e)", c.name, what, worst)
+	}
+}
+
 check :: proc(c: Case) {
 	cpu_out, cpu_g := run(c, .CPU)
 	ml.view_reads, ml.remat_mode = false, .Off
@@ -245,5 +264,15 @@ main :: proc() {
 		}},
 	}
 	for c in cases do check(c)
+	// every GEMM variant the backend has (Metal: 9 kernels, +9 with split-K), not
+	// just the ones the search picks for these shapes
+	if gpu == .Metal {
+		for f in 0 ..< 18 {
+			ml.gemm_force = f
+			for c in cases[:12] do check_quiet(c, fmt.tprintf("variant %d", f))
+		}
+		ml.gemm_force = -1
+		fmt.printfln("  ok    every GEMM variant on the GEMM cases (%d checks)", gemm_checks)
+	}
 	fmt.printfln("\n=== %d passed, %d failed ===", passed, failed)
 }

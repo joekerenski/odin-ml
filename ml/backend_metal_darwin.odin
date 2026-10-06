@@ -17,8 +17,9 @@ package ml
 //
 // Kernels. Every scheduler kernel (kernel_ir.odin) is rendered to MSL by
 // kernel_render.odin and compiled once per structure (cached by kernel_hash);
-// shapes, strides and constants are parameters. Batched GEMM is a hand-written
-// kernel. Fast-math is off so results match the CPU path closely.
+// shapes, strides and constants are parameters. GEMMs are generated per tile
+// shape, picked per problem by timing (backend_metal_gemm_darwin.odin).
+// Fast-math is off so results match the CPU path closely.
 // ============================================================================
 
 import "core:fmt"
@@ -81,6 +82,7 @@ metal_init :: proc() -> bool {
 	metal_ctx.device = MTL.CreateSystemDefaultDevice()
 	if metal_ctx.device == nil do return false
 	metal_ctx.queue = MTL.Device_newCommandQueue(metal_ctx.device)
+	choices_open(fmt.tprintf("metal-%s", MTL.Device_name(metal_ctx.device)->odinString()))
 	metal_ctx.options = MTL.CompileOptions_alloc()->init()
 	MTL.CompileOptions_setFastMathEnabled(metal_ctx.options, false)
 	metal_ctx.shaders = make(map[string]^MTL.ComputePipelineState, scratch())
@@ -187,7 +189,7 @@ metal_allocator_proc :: proc(
 }
 
 // Per-batch scratch (staging, temporaries), reset at sync.
-@(private = "file")
+@(private)
 scratch_alloc :: proc(bytes: int) -> Dev_Ref {
 	n := (bytes + 255) &~ 255
 	for {
@@ -213,7 +215,7 @@ ref_host :: proc(r: Dev_Ref, n: int) -> []f32 {
 
 // Where a host slice lives on the device. Inputs from foreign memory are
 // copied in; outputs to foreign memory are copied back at sync.
-@(private = "file")
+@(private)
 resolve :: proc(s: []f32, output := false) -> Dev_Ref {
 	p := uintptr(raw_data(s))
 	if r, ok := metal_ctx.staged[p]; ok do return r
@@ -273,7 +275,7 @@ metal_sync :: proc() {
 
 // ML_DEBUG >= 2: submit each kernel on its own and print its GPU time
 // (Apple GPUs timestamp per command buffer, not per dispatch). Slow; exact.
-@(private = "file")
+@(private)
 dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32, grid: [3]int, group: [3]int, label := "") {
 	enc := encoder()
 	metal_ctx.n_dispatch += 1
@@ -348,7 +350,7 @@ run_plan :: proc(k: ^Kernel, variant: GPU_Variant, threads, partial_slot: int, p
 
 // ---- fixed kernels --------------------------------------------------------
 
-@(private = "file")
+@(private)
 KERNELS :: `
 #include <metal_stdlib>
 using namespace metal;
@@ -364,94 +366,7 @@ kernel void reduce_sum_thread(device const float* a [[buffer(0)]], device float*
     out[t] = acc;
 }
 
-// GEMMs over strided operands (views read in place): element (z0, z1, i, j)
-// of X at X[z0·b0 + z1·b1 + i·rs + j·cs]. p = [M, K, N, kc, Z1, then rs, cs,
-// b0, b1 for A, B, C]. Grid z = z0·Z1 + z1. kc > 0 (split-K): all z share A
-// and B, z covers K range [z·kc, (z+1)·kc) and writes a dense partial C[z].
-struct Gemm_P {
-    uint M, K, N, kc, Z1;
-    uint a_rs, a_cs, a_b0, a_b1, b_rs, b_cs, b_b0, b_b1, c_rs, c_cs, c_b0, c_b1;
-};
-
-// C[z] = A[z] @ B[z]; 16×16 tiles in threadgroup memory. Grid (N↑16, M↑16, Z), groups 16×16.
-kernel void matmul(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
-                   device float* C [[buffer(2)]], constant Gemm_P& p [[buffer(30)]],
-                   uint3 gid [[thread_position_in_grid]], uint3 lid [[thread_position_in_threadgroup]]) {
-    uint M = p.M, K = p.K, N = p.N, kc = p.kc;
-    uint i = gid.y, j = gid.x, z0 = gid.z / p.Z1, z1 = gid.z % p.Z1;
-    device const float* a = kc ? A : A + z0 * p.a_b0 + z1 * p.a_b1;
-    device const float* b = kc ? B : B + z0 * p.b_b0 + z1 * p.b_b1;
-    device float* c = C + z0 * p.c_b0 + z1 * p.c_b1;
-    uint k_lo = kc ? gid.z * kc : 0, k_hi = kc ? min(K, k_lo + kc) : K;
-    threadgroup float As[16][16];
-    threadgroup float Bs[16][16];
-    float acc = 0.0f;
-    for (uint t0 = k_lo; t0 < k_hi; t0 += 16) {
-        uint pa = t0 + lid.x, pb = t0 + lid.y;
-        As[lid.y][lid.x] = (i < M && pa < k_hi) ? a[i * p.a_rs + pa * p.a_cs] : 0.0f;
-        Bs[lid.y][lid.x] = (pb < k_hi && j < N) ? b[pb * p.b_rs + j * p.b_cs] : 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint q = 0; q < 16; q++) acc += As[lid.y][q] * Bs[q][lid.x];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (i < M && j < N) c[i * p.c_rs + j * p.c_cs] = acc;
-}
-
-// Hardware 8×8 matrix units (simdgroup_matrix — what tinygrad's Metal tensor
-// cores use), fed from threadgroup memory. A 128-thread group computes a 32×32
-// tile of C; per K step of 32 all threads load A[32×32] and B[32×32] with
-// coalesced reads (consecutive threads walk the operand's unit-stride axis),
-// zero-padding the edges, then each of the 4 SIMD groups does 2×2 8×8 tiles
-// × 4 k-steps. Any M, N, K. Grid: (⌈N/32⌉·128, ⌈M/32⌉, Z), groups of 128.
-kernel void matmul_sg(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
-                      device float* C [[buffer(2)]], constant Gemm_P& p [[buffer(30)]],
-                      uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                      uint sg [[simdgroup_index_in_threadgroup]]) {
-    uint M = p.M, K = p.K, N = p.N, kc = p.kc;
-    bool ta = p.a_cs != 1, tb = p.b_cs != 1; // walk i (A) / k (B) with consecutive threads
-    uint z0 = tg.z / p.Z1, z1 = tg.z % p.Z1;
-    device const float* a = kc ? A : A + z0 * p.a_b0 + z1 * p.a_b1;
-    device const float* b = kc ? B : B + z0 * p.b_b0 + z1 * p.b_b1;
-    device float* c = C + z0 * p.c_b0 + z1 * p.c_b1;
-    uint k_lo = kc ? tg.z * kc : 0, k_hi = kc ? min(K, k_lo + kc) : K;
-    uint i0 = tg.y * 32, j0 = tg.x * 32;
-    threadgroup float As[32][32]; // [row i][k]
-    threadgroup float Bs[32][32]; // [k][col j]
-    uint si = (sg / 2) * 16, sj = (sg % 2) * 16; // this SIMD group's 16×16 corner
-    simdgroup_float8x8 acc[2][2];
-    for (uint r = 0; r < 2; r++) for (uint q = 0; q < 2; q++) acc[r][q] = simdgroup_float8x8(0.0f);
-    for (uint k0 = k_lo; k0 < k_hi; k0 += 32) {
-        for (uint e = tid; e < 1024; e += 128) {
-            uint r = ta ? e % 32 : e / 32, kk = ta ? e / 32 : e % 32;
-            uint gi = i0 + r, gk = k0 + kk;
-            As[r][kk] = (gi < M && gk < k_hi) ? a[gi * p.a_rs + gk * p.a_cs] : 0.0f;
-            uint q = tb ? e / 32 : e % 32, kb = tb ? e % 32 : e / 32;
-            uint gj = j0 + q, gkb = k0 + kb;
-            Bs[kb][q] = (gj < N && gkb < k_hi) ? b[gkb * p.b_rs + gj * p.b_cs] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < 32; kk += 8) {
-            simdgroup_float8x8 am0, am1, bm0, bm1;
-            simdgroup_load(am0, &As[si][kk], 32);
-            simdgroup_load(am1, &As[si + 8][kk], 32);
-            simdgroup_load(bm0, &Bs[kk][sj], 32);
-            simdgroup_load(bm1, &Bs[kk][sj + 8], 32);
-            simdgroup_multiply_accumulate(acc[0][0], am0, bm0, acc[0][0]);
-            simdgroup_multiply_accumulate(acc[0][1], am0, bm1, acc[0][1]);
-            simdgroup_multiply_accumulate(acc[1][0], am1, bm0, acc[1][0]);
-            simdgroup_multiply_accumulate(acc[1][1], am1, bm1, acc[1][1]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    // through threadgroup memory, so edges are written with bounds checks
-    for (uint r = 0; r < 2; r++) for (uint q = 0; q < 2; q++) simdgroup_store(acc[r][q], &As[si + 8 * r][sj + 8 * q], 32);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool tc = p.c_cs != 1;
-    for (uint e = tid; e < 1024; e += 128) {
-        uint r = tc ? e % 32 : e / 32, q = tc ? e / 32 : e % 32;
-        if (i0 + r < M && j0 + q < N) c[(i0 + r) * p.c_rs + (j0 + q) * p.c_cs] = As[r][q];
-    }
-}
+` + GEMM_P + `
 
 // Tiny matrices (attention heads): one thread per output, no tiles. Grid (N, M, Z).
 kernel void matmul_small(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
@@ -467,37 +382,7 @@ kernel void matmul_small(device const float* A [[buffer(0)]], device const float
 }
 `
 
-@(private = "file")
+@(private)
 round_up :: proc(x, m: int) -> int {
 	return (x + m - 1) / m * m
-}
-
-metal_matmul :: proc(g: ^Gemm) {
-	m, k, n, batch := g.M, g.K, g.N, g.Z0 * g.Z1
-	a, b, c := resolve(g.a.data), resolve(g.b.data), resolve(g.c.data, output = true)
-	params := gemm_params(g)
-	sg := true // hardware 8×8 tiles; the plain tiled kernel stays as a reference
-	kernel := sg ? "matmul_sg" : "matmul"
-	grid :: proc(sg: bool, m, n, z: int) -> [3]int {
-		return sg ? {(n + 31) / 32 * 128, (m + 31) / 32, z} : {round_up(n, 16), round_up(m, 16), z}
-	}
-	group := sg ? [3]int{128, 1, 1} : [3]int{16, 16, 1}
-	c_dense := g.c.cs == 1 && (m == 1 || g.c.rs == n)
-	switch {
-	case m <= 16 && n <= 16 && k <= 64:
-		// attention-sized: one thread per output
-		dispatch(metal_get_kernel(KERNELS, "matmul_small"), {a, b, c}, params[:], {n, m, batch}, {n, m, 1}, kernel_timing() ? fmt.tprintf("matmul_small %dx%dx%d b%d", m, k, n, batch) : "")
-	case batch == 1 && c_dense && k >= 1024 && m * n <= 64 * 1024:
-		// few outputs, long K (weight grads): split K, then sum the partials
-		splits := min(k / 256, 64)
-		kc := round_up((k + splits - 1) / splits, 32) // whole K tiles per split
-		splits = (k + kc - 1) / kc
-		params[3], params[4] = u32(kc), 1
-		params[13], params[14], params[15] = u32(n), 1, u32(m * n) // dense partial C[z] at z·m·n
-		partial := scratch_alloc(splits * m * n * size_of(f32))
-		dispatch(metal_get_kernel(KERNELS, kernel), {a, b, partial}, params[:], grid(sg, m, n, splits), group, kernel_timing() ? fmt.tprintf("%s splitk %dx%dx%d s%d", kernel, m, k, n, splits) : "")
-		dispatch(metal_get_kernel(KERNELS, "reduce_sum_thread"), {partial, c}, []u32{1, u32(splits), u32(m * n)}, {m * n, 1, 1}, {256, 1, 1}, "splitk_sum")
-	case:
-		dispatch(metal_get_kernel(KERNELS, kernel), {a, b, c}, params[:], grid(sg, m, n, batch), group, kernel_timing() ? fmt.tprintf("%s %dx%dx%d b%d", kernel, m, k, n, batch) : "")
-	}
 }
