@@ -8,7 +8,8 @@ package main
 //
 // Each case builds the same graph (same inputs) once per device, realizes it
 // (with backward where there are grads) and compares all outputs and grads.
-// The CPU also runs it with views copied (ML_VIEWS=0, the reference path).
+// Both devices recompute (ML_REMAT=1); the CPU also runs the reference path:
+// views copied, nothing recomputed (ML_VIEWS=0 ML_REMAT=0).
 // On the GPU it runs twice: tensors on the heap (staged in and copied back)
 // and tensors in an ml.arena_init arena (device-visible memory, zero-copy).
 // Shapes are picked to hit each kernel variant: Metal's hardware 8×8 GEMM,
@@ -96,9 +97,9 @@ close :: proc(a, b: []f32) -> (ok: bool, worst: f32) {
 
 check :: proc(c: Case) {
 	cpu_out, cpu_g := run(c, .CPU)
-	ml.view_reads = false
+	ml.view_reads, ml.remat_mode = false, .Off
 	ref_out, ref_g := run(c, .CPU)
-	ml.view_reads = true
+	ml.view_reads, ml.remat_mode = true, .On
 	ok, worst := close(cpu_out, ref_out)
 	for g, i in ref_g do if g != nil {
 		gok, gw := close(cpu_g[i], g)
@@ -107,7 +108,7 @@ check :: proc(c: Case) {
 	}
 	if !ok {
 		failed += 1
-		fmt.printfln("  FAIL  %-36s views (worst rel %.1e vs copies)", c.name, worst)
+		fmt.printfln("  FAIL  %-36s CPU vs reference path (worst rel %.1e)", c.name, worst)
 	}
 	for arena in ([]bool{false, true}) {
 		gpu_out, gpu_g := run(c, gpu, arena)
@@ -145,6 +146,7 @@ main :: proc() {
 		fmt.println("=== GPU vs CPU backend parity ===\nno GPU backend available")
 		return
 	}
+	ml.remat_mode = .On
 	fmt.printfln("=== %v vs CPU backend parity %s===", gpu, gpu == .CUDA ? fmt.tprintf("(%s) ", ml.cuda_device_name()) : "")
 
 	mm :: proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.matmul(x[0], x[1]) }

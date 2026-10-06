@@ -752,14 +752,14 @@ test_fusion :: proc() {
 	expect(s.data[0] > 0.49 && s.data[0] < 0.51, "sigmoid(0)≈0.5")
 	expect(s.data[1] > s.data[0] && s.data[0] > s.data[2], "sigmoid monotonic")
 
-	// Longer than one fused kernel's budget (16 ops / 12 inputs): merging stops at
-	// the budget, so the chain splits into in-budget kernels (21 inputs: 11 + 9 ops)
+	// Longer than one fused kernel's budget (64 ops / 24 inputs): merging stops at
+	// the budget, so the chain splits into in-budget kernels (41 inputs: 23 + 17 ops)
 	v := ml.from_data_copy({1, 2, 3, 4, 5}, {5})
 	acc := v
-	for _ in 0 ..< 20 do acc = ml.add(acc, ml.from_data_copy({1, 1, 1, 1, 1}, {5}))
+	for _ in 0 ..< 40 do acc = ml.add(acc, ml.from_data_copy({1, 1, 1, 1, 1}, {5}))
 	ml.counters_reset()
-	expect_close(acc, ml.from_data_copy({21, 22, 23, 24, 25}, {5}), "20-op chain past fused budget")
-	expect(ml.counters.kernels == 2, "over-budget chain splits into 2 kernels, not 20")
+	expect_close(acc, ml.from_data_copy({41, 42, 43, 44, 45}, {5}), "40-op chain past fused budget")
+	expect(ml.counters.kernels == 2, "over-budget chain splits into 2 kernels, not 40")
 
 	// Elided Add still receives grad: relu(a+b) all positive → da=db=1
 	ga := ml.from_data_copy({1, -2, 3, -4}, {2, 2}, requires_grad = true)
@@ -1037,6 +1037,28 @@ test_cpu_kernels :: proc() {
 	}
 	expect(views_ok, "attention fwd+bwd: views read in place == copied views (Pure and default GEMM)")
 	expect(k_views < k_copy, fmt.tprintf("attention: views remove the permute copies (%d kernels, %d with copies)", k_views, k_copy))
+
+	// rematerialization: GELU's intermediates recomputed in the backward pass
+	// instead of stored — same grads, fewer bytes written
+	run_gelu_mlp :: proc(mode: ml.Remat_Mode) -> (g: [3][]f32, bytes: i64) {
+		ml.remat_mode = mode
+		defer ml.remat_mode = .Auto
+		rand.reset(11)
+		x := ml.randn({64, 16}, 0, 1)
+		W1 := ml.randn({16, 32}, 0, 0.3, requires_grad = true)
+		b1 := ml.randn({32}, 0, 0.1, requires_grad = true)
+		W2 := ml.randn({32, 4}, 0, 0.3, requires_grad = true)
+		h := ml.gelu(ml.add(ml.matmul(x, W1), b1))
+		ml.counters_reset()
+		ml.backward(ml.sum(ml.square(ml.matmul(ml.layer_norm(h), W2))))
+		return {W1.grad.data, b1.grad.data, W2.grad.data}, ml.counters.bytes_alloc
+	}
+	g_off, bytes_off := run_gelu_mlp(.Off)
+	g_on, bytes_on := run_gelu_mlp(.On)
+	remat_ok := true
+	for i in 0 ..< 3 do for v, j in g_on[i] do if abs(v - g_off[i][j]) > 1e-4 * (1 + abs(g_off[i][j])) do remat_ok = false
+	expect(remat_ok, "gelu + layer_norm fwd+bwd: recomputed == stored")
+	expect(bytes_on < bytes_off, fmt.tprintf("remat writes less (%d vs %d bytes)", bytes_on, bytes_off))
 }
 
 sync_add :: proc(p: ^int, v: int) {

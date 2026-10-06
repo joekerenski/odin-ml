@@ -28,7 +28,7 @@ package ml
 import "core:fmt"
 import "core:strings"
 
-GPU_PARAMS :: 160
+GPU_PARAMS :: 2 + MAX_DIMS + MAX_KERNEL_LOADS * LOAD_WORDS + MAX_FUSED_INPUTS
 GPU_GROUP :: 256
 @(private)
 LOAD_BASE :: 2 + MAX_DIMS

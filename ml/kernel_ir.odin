@@ -30,7 +30,8 @@ package ml
 import "core:fmt"
 import "core:hash"
 
-MAX_KERNEL_BUFS :: MAX_FUSED_INPUTS + MAX_FUSED_INSNS
+MAX_KERNEL_BUFS :: MAX_FUSED_BUFS + 2 // + backend scratch (split partials, CPU temps)
+MAX_KERNEL_LOADS :: MAX_FUSED_INPUTS + 1
 MAX_KERNEL_NODES :: 2 * MAX_FUSED_INPUTS + MAX_FUSED_INSNS + 2
 
 // How a renderer can address a load (picked from its strides over the dims).
@@ -78,11 +79,11 @@ Kernel :: struct {
 	red_lo, red_hi: int, // reduced dims; equal: no reduction
 	bufs:           [MAX_KERNEL_BUFS][]f32,
 	n_bufs, n_in:   int, // bufs[0..n_in) are read, the rest written
-	loads:          [MAX_KERNEL_BUFS]K_View,
+	loads:          [MAX_KERNEL_LOADS]K_View,
 	n_loads:        int,
 	nodes:          [MAX_KERNEL_NODES]K_Node,
 	n_nodes:        int,
-	stores:         [MAX_FUSED_INSNS]K_Store,
+	stores:         [MAX_FUSED_INSNS + 1]K_Store,
 	n_stores:       int,
 	label:          string, // for profiles and ML_DEBUG=2 (only built when timing)
 }
@@ -322,6 +323,7 @@ kernel_from_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil) ->
 		b := op_is_binary(u.op) ? node_of[u.src[1]] : 0
 		node_of[u] = kernel_add_node(&k, K_Node{kind = .ALU, op = u.op, a = node_of[u.src[0]], b = b})
 	}
+	if k.n_bufs + len(stores) > MAX_FUSED_BUFS do return
 	for u in stores {
 		alloc_out(u)
 		k.stores[k.n_stores] = K_Store{node = node_of[u], buf = kernel_add_buf(&k, u.data, false)}
@@ -594,6 +596,7 @@ kernel_from_reduce_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = 
 	}
 	for u in group do if u != r && !shapes_equal(u.shape, X) do alu(&k, &node_of, &epi_in, u)
 	k.n_in = k.n_bufs
+	if k.n_bufs + len(stores) > MAX_FUSED_BUFS do return
 	for u in stores {
 		alloc_out(u)
 		k.stores[k.n_stores] = K_Store{node = node_of[u], buf = kernel_add_buf(&k, u.data, false)}

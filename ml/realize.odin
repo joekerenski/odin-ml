@@ -48,6 +48,9 @@ Schedule :: struct {
 	alias:       map[^UOp]^UOp, // view nodes that are their base's buffer as is
 	store_into:  map[^UOp]Store_Into, // MatMuls writing straight into a view node's buffer
 	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
+	clones:      [dynamic]^UOp, // nodes rematerialization added (remat.odin)
+	rewired:     [dynamic]Rewire, // srcs it pointed at clones, restored afterwards
+	dead:        map[^UOp]bool, // group members nothing reads after rematerialization
 	// buffer reuse
 	owner:       map[^UOp]^UOp, // node → node whose buffer it uses (views)
 	refs:        map[^UOp]int, // owner → readers still to run
@@ -58,6 +61,17 @@ Schedule :: struct {
 
 // Reuse dead internal buffers within a realize (ML_REUSE=0 turns it off).
 buffer_reuse := true
+
+// Recompute cheap elementwise values in each kernel that reads them instead of
+// storing them (remat.odin). Auto: on GPUs (memory-bound), off on the CPU
+// (its interpreter runs exp/log scalar: recompute costs more than the traffic
+// it saves). ML_REMAT=0|1 forces it.
+Remat_Mode :: enum {
+	Auto,
+	On,
+	Off,
+}
+remat_mode: Remat_Mode = .Auto
 
 // Read Permutes / Reshapes in place and let GEMMs store into them (ML_VIEWS=0:
 // copy every non-dense view, the reference path).
@@ -74,6 +88,9 @@ schedule_make :: proc() -> (s: Schedule) {
 	s.alias = make(map[^UOp]^UOp, scratch())
 	s.store_into = make(map[^UOp]Store_Into, scratch())
 	s.uf = make(map[^UOp]^UOp, scratch())
+	s.clones = make([dynamic]^UOp, scratch())
+	s.rewired = make([dynamic]Rewire, scratch())
+	s.dead = make(map[^UOp]bool, scratch())
 	s.owner = make(map[^UOp]^UOp, scratch())
 	s.refs = make(map[^UOp]int, scratch())
 	s.pinned = make(map[^UOp]bool, scratch())
@@ -90,6 +107,8 @@ schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.alias)
 	delete(s.store_into)
 	delete(s.uf)
+	free_clones(s)
+	delete(s.dead)
 	delete(s.owner)
 	delete(s.refs)
 	delete(s.pinned)
@@ -207,10 +226,12 @@ realize_all :: proc(sinks: []^UOp) {
 		}
 		append(m, u)
 	}
+	if remat_mode == .On || remat_mode == .Auto && backend.device != .CPU do remat(&s, &members)
 
 	current_pool = &s.pool
 	defer current_pool = nil
 	for u in s.topo {
+		if u in s.dead do continue
 		if u.op == .Permute || u.op == .Reshape {
 			run_view(&s, u)
 			track_buffer(&s, u)
@@ -549,6 +570,29 @@ fuse_inputs :: proc(f: ^Fuse, a, b: int, shape: []i32, seen: ^[dynamic]^UOp) -> 
 	return len(seen)
 }
 
+// Buffers a kernel for a ∪ b binds: its input buffers (in seen, from
+// fuse_inputs) plus at most one store per member read outside a ∪ b.
+@(private)
+fuse_bufs :: proc(f: ^Fuse, a, b: int, seen: []^UOp) -> (n: int) {
+	for y in seen do if y.op != .Const do n += 1
+	for r in ([]int{a, b}) {
+		for m := r; m >= 0; m = f.next[m] {
+			if f.s.topo[m] in f.s.sinks {
+				n += 1
+				continue
+			}
+			for c in f.users[f.start[m]:f.start[m + 1]] {
+				rc := f.parent[c] < 0 ? -1 : fuse_find(f, c)
+				if rc != a && rc != b {
+					n += 1
+					break
+				}
+			}
+		}
+	}
+	return
+}
+
 @(private)
 fuse_union :: proc(f: ^Fuse, a, b: int) {
 	f.parent[a] = b
@@ -579,6 +623,9 @@ fuse_reduce_ok :: proc(f: ^Fuse, a, b: int) -> bool {
 	n_epi := fuse_inputs(f, a, b, r.shape, &seen)
 	for y in seen do if y != r && y.op != .Const && !reduce_mergeable(r, y, views) do return false
 	if n_pro + n_epi > MAX_FUSED_INPUTS do return false
+	clear(&seen)
+	fuse_inputs(f, a, b, nil, &seen)
+	if fuse_bufs(f, a, b, seen[:]) + 1 > MAX_FUSED_BUFS do return false // + the reduce's own input
 	for g in ([]int{a, b}) {
 		for m := g; m >= 0; m = f.next[m] {
 			u := f.s.topo[m]
@@ -650,7 +697,7 @@ fuse_groups :: proc(s: ^Schedule) {
 			a, b := fuse_find(&f, xi), fuse_find(&f, ui)
 			if a == b || f.size[a] + f.size[b] > MAX_FUSED_INSNS do continue
 			clear(&seen)
-			if fuse_inputs(&f, a, b, nil, &seen) > MAX_FUSED_INPUTS || !fuse_valid(&f, a, b) do continue
+			if fuse_inputs(&f, a, b, nil, &seen) > MAX_FUSED_INPUTS || fuse_bufs(&f, a, b, seen[:]) > MAX_FUSED_BUFS || !fuse_valid(&f, a, b) do continue
 			fuse_union(&f, a, b)
 		}
 	}
@@ -677,6 +724,8 @@ fuse_groups :: proc(s: ^Schedule) {
 	}
 	for u, i in s.topo do if f.parent[i] >= 0 do s.uf[u] = s.topo[fuse_find(&f, i)]
 }
+
+shapes_equal_n :: proc(a, b: ^UOp) -> bool { return numel(a.shape) == numel(b.shape) }
 
 @(private)
 src_seen_before :: proc(u: ^UOp, i: int) -> bool {
@@ -719,6 +768,20 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 	stores := make([dynamic]^UOp, scratch())
 	defer delete(stores)
 	for u in group do if needs_store(s, u, group) do append(&stores, u)
+	if debug_level >= 4 {
+		red := false
+		for u in group do if u.op == .Sum || u.op == .ReduceMax do red = true
+		mm, only := 0, 0
+		for u in group do for x in u.src {
+			y := x
+			for (y.op == .Reshape || y.op == .Permute) && y.data == nil do y = y.src[0]
+			if y.op == .MatMul && shapes_equal_n(y, u) {
+				mm += 1
+				if s.consumers[y] == 1 && s.consumers[x] == 1 do only += 1
+			}
+		}
+		fmt.printfln("GROUP red=%v n=%d mm_in=%d mm_only=%d stores=%d", red, len(group), mm, only, len(stores))
+	}
 	assert(len(stores) > 0, "fused group has no stores")
 
 	t0: time.Tick

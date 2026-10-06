@@ -532,8 +532,8 @@ launch :: proc(f: CUfunction, bufs: []CUdeviceptr, params: []u32, grid: [3]int, 
 	cuda_ctx.n_launch += 1
 	p: [PARAMS]u32
 	copy(p[:], params)
-	ptrs: [MAX_FUSED_INPUTS + MAX_FUSED_INSNS]CUdeviceptr
-	args: [MAX_FUSED_INPUTS + MAX_FUSED_INSNS + 1]rawptr
+	ptrs: [MAX_KERNEL_BUFS]CUdeviceptr
+	args: [MAX_KERNEL_BUFS + 1]rawptr
 	for b, i in bufs {
 		ptrs[i] = b
 		args[i] = &ptrs[i]
