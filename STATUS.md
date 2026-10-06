@@ -25,18 +25,21 @@ Layout
 
 The UOp model (ml/uop.odin)
 - `Tensor :: UOp`. One node type: op, src, arg, shape, data, requires_grad, grad.
-- Buffers are always dense row-major. No strides; Reshape is a view (same buffer),
-  Permute realizes a copy or folds into GEMM (sgemm transpose flags).
+- Buffers are always dense row-major. Permute and Reshape are views: strides
+  over a base buffer, read in place by elementwise kernels, reductions and GEMMs
+  (strided operands); a GEMM whose output is only permuted stores straight into
+  the permuted layout. What can't be addressed is copied (ML_VIEWS=0: always).
 - ops.odin builds nodes; compositions (relu, sigmoid, softmax family,
   layer_norm, cross_entropy) are just ops of ops. detach() stops grads.
 - Axes as in numpy: negative counts from the end. sum(x) / mean(x) / max_all(x)
   reduce everything; sum(x, axis) keeps the reduced dim as 1.
 - MatMul is batched ([..., M, K] @ [..., K, N], batch dims broadcast); a 2D
-  weight folds the batch into one GEMM; mT (last-two swap) folds into sgemm.
+  weight folds the batch into one GEMM. GEMM operands are strided (≤ 2 batch
+  dims), so mT and attention head permutes cost nothing.
 - autograd.odin: grad rules emit UOps; backward realizes loss + all leaf grads
   in ONE schedule, so backward is fused like forward.
-- realize.odin is the only executor: topo → fuse same-shape ewise chains
-  (single consumer) → fold transposes → run fused kernels / primitive kernels.
+- realize.odin is the only executor: topo → plan views → fuse (elementwise
+  groups, reductions with prologue / epilogue) → run kernels.
 - IR ops: Input Const | Add Sub Mul Div Max CmpLt Neg Exp Log Sqrt Expand |
   Sum ReduceMax | Reshape Permute | MatMul Conv2d MaxPool2d (+ conv/pool bwd)
 - checkpoint.odin: save/load params as safetensors (+ string metadata); names default
@@ -85,8 +88,8 @@ Numbers (M5, after unification; before in parens)
   tinygrad on the same GPU 41.6 ms/step (BEAM=0, 1300 kernels).
   MNIST MLP 8.1 s and CNN 16.7 s (conv/pool on the CPU) — slower than the CPU
   backend at these sizes.
-- Checks: tests on CPU, Metal, CUDA (133), GPU-vs-CPU parity over every kernel
-  path, heap and arena memory (tests/parity: 58 on CUDA), tinygrad oracle
+- Checks: tests on CPU, Metal, CUDA (135), GPU-vs-CPU parity over every kernel
+  path, heap and arena memory, CPU views vs copies (tests/parity: 78 on Metal), tinygrad oracle
   41/41 with odin on CPU and CUDA vs tinygrad on CUDA; whole-model DT oracle
   agrees to 1e-6 on both (dt/tinygrad/fusion.py check). MLX's GPU fp32
   matmul is reduced precision on the M5 (~1e-3), so its oracle runs on CPU.
@@ -140,7 +143,14 @@ the 4090 before merge:
    reductions (pass A prologue + partial, pass B combine + epilogue). CPU runs
    fused reductions as prologue pass → reduce_block → epilogue pass.
    M4: 1089 → 802 kernels, Metal 24.6 → 23.7 ms; LayerNorm fwd −34%.
-5. Views: per-input strides; Permute/Expand become index transforms
+5. Views: per-input strides; Permute/Expand become index transforms  [PR 5]
+   Permute / Reshape compose into strides over a base buffer (plan_views);
+   read in place when every consumer can address them (elementwise: any;
+   reductions: merges into [outer, r, inner]; GEMM: strided operands, ≤ 2
+   batch dims on every backend). A GEMM whose output is only rearranged
+   stores into the target layout (attention's head merge). Expand was already
+   an index transform (stride 0) in fused kernels.
+   M4: 802 → 682 kernels, no copies left; Metal 23.7 → 22.1 ms, CPU 42.8 → 40.5 ms.
 6. GEMM epilogues (bias + activation); no op/input budgets
 7. Lowering knobs (workgroup, upcast, unroll, reduce strategy, GEMM tiles) +
    kernel search on device + disk cache of choices and binaries
