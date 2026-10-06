@@ -133,7 +133,13 @@ the 4090 before merge:
    per-row values after reductions (PR 4), bias/residual adds around GEMMs
    (PR 6), 16-op budget hits (PR 6).
 4. Reduction fusion: elementwise into reductions, row kernels
-   (softmax/LayerNorm/logsumexp in one)
+   (softmax/LayerNorm/logsumexp in one)  [PR 4]
+   Prologue (input-shaped producers, values others need stored from inside the
+   loop) and epilogue (output-shaped consumers). New GPU plans: Reduce_Simd (a
+   32-lane group per row, hardware reduce) and the split for fused column
+   reductions (pass A prologue + partial, pass B combine + epilogue). CPU runs
+   fused reductions as prologue pass → reduce_block → epilogue pass.
+   M4: 1089 → 802 kernels, Metal 24.6 → 23.7 ms; LayerNorm fwd −34%.
 5. Views: per-input strides; Permute/Expand become index transforms
 6. GEMM epilogues (bias + activation); no op/input budgets
 7. Lowering knobs (workgroup, upcast, unroll, reduce strategy, GEMM tiles) +

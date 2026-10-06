@@ -156,6 +156,19 @@ main :: proc() {
 		// compositions / model pieces
 		{"softmax + logsumexp [16,5,10]", {{16, 5, 10}}, proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.add(ml.softmax(x[0], -1), ml.logsumexp(x[0], -1)) }},
 		{"layer_norm    [64,5,64]", {{64, 5, 64}}, proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.layer_norm(x[0]) }},
+		// fused reductions (perf plan stage 4): prologue, epilogue, split, SIMD rows, stored prologue values
+		{"fused col reduce, split [5120,64]", {{5120, 64}, {5120, 64}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			return ml.sum(ml.mul(ml.exp(ml.mul(x[0], ml.scalar(0.1))), x[1]), 0)
+		}},
+		{"fused col reduce + epilogue [4096,64]", {{4096, 64}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			return ml.sqrt(ml.add(ml.sum(ml.square(x[0]), 0), ml.scalar(1)))
+		}},
+		{"simd rows: layer_norm [512,256]", {{512, 256}}, proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.layer_norm(x[0]) }},
+		{"simd rows: softmax [64,1024]", {{64, 1024}}, proc(x: []^ml.Tensor) -> ^ml.Tensor { return ml.softmax(x[0], -1) }},
+		{"prologue value stored [128,96]", {{128, 96}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			e := ml.exp(ml.mul(x[0], ml.scalar(0.5)))
+			return ml.add(ml.mul(e, ml.scalar(2)), ml.sum(e, 1))
+		}},
 		{"attention     [32,5,64] x [32,10,64]", {{32, 5, 64}, {32, 10, 64}, {64, 64}, {64, 64}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
 			// projections scaled 1/√64 as in a real init: unit-variance weights
 			// make logits of ±60, a saturated softmax, and an ill-conditioned

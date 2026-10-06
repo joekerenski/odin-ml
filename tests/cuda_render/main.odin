@@ -60,5 +60,19 @@ main :: proc() {
 	emit("copy_generic", &kc, {.Elementwise})
 	kd := ml.kernel_copy(dst[:100], src[:100], {100}, {1})
 	emit("copy_direct", &kd, {.Elementwise})
+	// a fused reduction: prologue (exp, a broadcast load), a stored prologue value,
+	// epilogue (sqrt) — under every plan, plus both passes of a split
+	cx := ml.randn({256, 64}, 0, 1)
+	cw := ml.randn({64}, 0, 1)
+	ce := ml.exp(ml.mul(cx, cw))
+	cs := ml.sum(ce, 0)
+	cq := ml.sqrt(cs)
+	kf, fok := ml.kernel_from_reduce_group({ce.src[0], ce, cs, cq}, {ce, cq})
+	assert(fok)
+	emit("fused_reduce", &kf, {.Reduce_Thread, .Reduce_Group, .Reduce_Simd})
+	pa, pb, _, _ := ml.gpu_split(&kf, 8)
+	emit("fused_split_a", &pa, {.Reduce_Thread})
+	emit("fused_split_b", &pb, {.Reduce_Thread})
+	emit("reduce_sum_simd", &kr, {.Reduce_Simd})
 	fmt.printfln("%d CUDA sources written", n_files)
 }

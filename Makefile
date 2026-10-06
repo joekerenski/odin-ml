@@ -35,8 +35,8 @@ regression:  ; $(ODIN) run examples/regression $(FAST) -out:$(BUILD)/regression
 bench:       ; $(ODIN) run bench/loop $(FAST) -disable-assert -out:$(BUILD)/loop
 # performance plan yardstick (STATUS.md): ML_DEVICE=metal|cuda|cpu make perf; ARGS=<name> runs matching workloads
 GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null)
-perf:          ; $(ODIN) run bench/perf $(FAST) -define:GIT_REV=$(GIT_REV) -out:$(BUILD)/perf -- $(ARGS)
-perf-baseline: ; $(ODIN) run bench/perf $(FAST) -define:GIT_REV=$(GIT_REV) -out:$(BUILD)/perf -- baseline
+perf:          ; $(ODIN) run bench/perf $(FAST) -define:GIT_REV='"$(GIT_REV)"' -out:$(BUILD)/perf -- $(ARGS)
+perf-baseline: ; $(ODIN) run bench/perf $(FAST) -define:GIT_REV='"$(GIT_REV)"' -out:$(BUILD)/perf -- baseline
 # the bar: the same M4 step in tinygrad (local checkout), default and BEAM=2 (first BEAM run searches ~6 min)
 perf-tiny:
 	cd dt/tinygrad && TINYGRAD_PATH=$(TINYGRAD_PATH) uv run --no-project --with numpy python fusion.py bench 30

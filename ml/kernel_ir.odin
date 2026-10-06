@@ -337,3 +337,137 @@ kernel_describe :: proc(k: ^Kernel) -> string {
 	w(&b, "]")
 	return string(b[:])
 }
+
+// ---- fused reductions -----------------------------------------------------------
+//
+// A reduction with its producers (prologue: elementwise members shaped like the
+// reduce input, evaluated per [o, r, k]) and its consumers (epilogue: members
+// shaped like the reduce output, evaluated per [o, k]). The input's axes are
+// merged to the canonical [outer, r, inner]: every tensor read must then have
+// one stride per merged range (reduce_mergeable checks it beforehand).
+
+// The single run of reduced axes [lo, hi) of shape (size-1 axes ignored), if one.
+reduce_run :: proc(shape: []i32, axes: []i32) -> (lo, hi: int, ok: bool) {
+	red: [MAX_DIMS]bool
+	for a in axes do red[a] = true
+	lo, hi = -1, -1
+	for d in 0 ..< len(shape) {
+		if !red[d] || shape[d] == 1 do continue
+		if lo < 0 do lo = d
+		else if hi >= 0 && hi < d {
+			for e in hi ..< d do if shape[e] != 1 do return // a second run
+		}
+		hi = d + 1
+	}
+	return lo, hi, lo >= 0
+}
+
+// Strides over `dims` merged into the ranges [0, lo), [lo, hi), [hi, nd).
+merge3 :: proc(dims: []i32, st: [MAX_DIMS]int, lo, hi: int) -> (m: [3]int, ok: bool) {
+	ranges := [3][2]int{{0, lo}, {lo, hi}, {hi, len(dims)}}
+	for r, i in ranges {
+		inner := -1 // stride of the innermost non-1 dim seen so far (walking left)
+		size := 1
+		zero, moving := false, false
+		for d := r[1] - 1; d >= r[0]; d -= 1 {
+			if dims[d] == 1 do continue
+			if st[d] == 0 {
+				zero = true
+				continue
+			}
+			moving = true
+			if inner < 0 {
+				inner = st[d]
+				m[i] = st[d]
+			} else if st[d] != inner * size {
+				return // not one stride
+			}
+			inner, size = st[d], int(dims[d])
+		}
+		if zero && moving do return // broadcast and moving within one range
+	}
+	return m, true
+}
+
+@(private)
+reduce_dims :: proc(r: ^UOp) -> (X: []i32, lo, hi: int, ok: bool) {
+	X = r.src[0].shape
+	lo, hi, ok = reduce_run(X, r.arg.([]i32))
+	return
+}
+
+// Can tensor t (broadcastable to the reduce input) be read in r's canonical space?
+reduce_mergeable :: proc(r: ^UOp, t: ^UOp) -> bool {
+	X, lo, hi, ok := reduce_dims(r)
+	if !ok do return false
+	_, mok := merge3(X, broadcast_strides(t.shape, len(X)), lo, hi)
+	return mok
+}
+
+// group: topo order, exactly one Sum/ReduceMax; members shaped like its input
+// (prologue) or its output (epilogue).
+kernel_from_reduce_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool) {
+	r: ^UOp
+	for u in group do if u.op == .Sum || u.op == .ReduceMax do r = u
+	X, lo, hi, rok := reduce_dims(r)
+	if !rok do return
+	k.nd = 3
+	k.dims[0], k.dims[1], k.dims[2] = int(numel(X[:lo])), int(numel(X[lo:hi])), int(numel(X[hi:]))
+	k.red_lo, k.red_hi = 1, 2
+	// members by node; outside inputs per phase (prologue values live inside
+	// the reduction loop, so the epilogue loads its own)
+	node_of := make(map[^UOp]int, scratch())
+	pro_in := make(map[^UOp]int, scratch())
+	epi_in := make(map[^UOp]int, scratch())
+	defer {
+		delete(node_of)
+		delete(pro_in)
+		delete(epi_in)
+	}
+	members := make(map[^UOp]bool, scratch())
+	defer delete(members)
+	for u in group do members[u] = true
+	n_inputs := 0
+	operand :: proc(node_of, inputs: ^map[^UOp]int, x: ^UOp) -> int {
+		if n, ok := node_of[x]; ok do return n
+		return inputs[x]
+	}
+	add_inputs :: proc(k: ^Kernel, members: ^map[^UOp]bool, inputs: ^map[^UOp]int, n_inputs: ^int, u: ^UOp, X: []i32, lo, hi: int) -> bool {
+		for x in u.src {
+			if x in members^ || x in inputs^ do continue
+			if n_inputs^ == MAX_FUSED_INPUTS do return false
+			n_inputs^ += 1
+			if x.op == .Const {
+				inputs[x] = kernel_add_node(k, K_Node{kind = .Const, value = x.arg.(f32)})
+				continue
+			}
+			m, ok := merge3(X, broadcast_strides(x.shape, len(X)), lo, hi)
+			if !ok do return false
+			inputs[x] = kernel_add_load(k, x.data, m[:])
+		}
+		return true
+	}
+	alu :: proc(k: ^Kernel, node_of, inputs: ^map[^UOp]int, u: ^UOp) {
+		b := op_is_binary(u.op) ? operand(node_of, inputs, u.src[1]) : 0
+		node_of[u] = kernel_add_node(k, K_Node{kind = .ALU, op = u.op, a = operand(node_of, inputs, u.src[0]), b = b})
+	}
+	// prologue (shaped like the input), the reduce, epilogue (shaped like the output)
+	for u in group do if u != r && shapes_equal(u.shape, X) {
+		if !add_inputs(&k, &members, &pro_in, &n_inputs, u, X, lo, hi) do return
+	}
+	if !add_inputs(&k, &members, &pro_in, &n_inputs, r, X, lo, hi) do return
+	for u in group do if u != r && shapes_equal(u.shape, X) do alu(&k, &node_of, &pro_in, u)
+	node_of[r] = kernel_add_node(&k, K_Node{kind = .Reduce, op = r.op, a = operand(&node_of, &pro_in, r.src[0])})
+	for u in group do if u != r && !shapes_equal(u.shape, X) {
+		if !add_inputs(&k, &members, &epi_in, &n_inputs, u, X, lo, hi) do return
+	}
+	for u in group do if u != r && !shapes_equal(u.shape, X) do alu(&k, &node_of, &epi_in, u)
+	k.n_in = k.n_bufs
+	for u in stores {
+		alloc_out(u)
+		k.stores[k.n_stores] = K_Store{node = node_of[u], buf = kernel_add_buf(&k, u.data, false)}
+		k.n_stores += 1
+	}
+	kernel_finish(&k)
+	return k, true
+}

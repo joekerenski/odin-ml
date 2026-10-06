@@ -19,7 +19,7 @@ import "core:simd"
 
 MAX_FUSED_INSNS :: 16
 MAX_FUSED_INPUTS :: 12 // buffers + constants (Metal: inputs + stores must stay below buffer index 30)
-MAX_FUSED_SLOTS :: MAX_FUSED_INPUTS + MAX_FUSED_INSNS
+MAX_FUSED_SLOTS :: MAX_FUSED_INPUTS + 2 * MAX_FUSED_INSNS // inputs, instructions, identity copies for extra stores
 
 // How input element i of the output maps into an input buffer.
 Load_Mode :: enum {

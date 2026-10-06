@@ -792,7 +792,7 @@ test_milestone1 :: proc() {
 	big := ml.from_data_copy({1000, 1001, 1002, -5, 0, 5}, {2, 3})
 	sm := ml.softmax(big, 1)
 	expect_close(ml.sum(sm, 1), ml.ones({2, 1}), "softmax rows sum to 1")
-	expect(!math.is_nan(sm.data[0]), "softmax stable at 1000")
+	expect(!math.is_nan(ml.realize(sm).data[0]), "softmax stable at 1000")
 
 	// q @ k^T with batch dims: the transpose folds into the batched GEMM
 	q := ml.randn({4, 8, 16}, 0, 1)
