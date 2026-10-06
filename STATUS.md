@@ -5,11 +5,12 @@ inference, prior GMM + observations → posterior GMM, ~0.43M params. Refine the
 UI (odin-ui-v2) comes after the strategy fits.
 
 Decisions
-- One flow: Tensor (lazy) → UOp DAG → fuse → kernels. No second IR, no sketches.
+- One flow: Tensor (lazy) → UOp DAG → fuse → kernels. No second graph IR. Below
+  the scheduler: one kernel IR (performance plan stage 2) that all backends render.
 - MatMul stays a primitive. No mul+sum → GEMM recovery pass.
-- Performance comes from hand-written kernels per primitive / fused group
-  (Accelerate + all cores on CPU, generated/handwritten Metal on GPU), not from a
-  general optimizing compiler (fused groups are rendered to MSL directly).
+- Performance: a lean kernel compiler. Explicit fusion rules, a small knob space
+  searched on the device and cached; GEMM stays a hand-written, parameterized
+  template. No general rewrite engine (tinygrad has one; we take ~20% of it).
 - ReLU/Sigmoid/softmax/LayerNorm etc. are UOp compositions, not primitives.
 
 Layout
@@ -106,10 +107,30 @@ Known debt
   allocator never returns blocks to the driver.
 - A DT step is ~1200 kernels; multi-consumer fusion would cut that a lot.
 
-Plan for today (user)
-1. Work through the milestones  2. Implement the paper (M2–M4)
-3. Clean up ml/ so it imports as a module (Odin collection)
-4. Visualization app on odin-ui-v2 in its own folder
+Performance plan (locked 2026-10-06): proper fusion, then fast kernels by search
+Oracle and bar: tinygrad on the same step (dt/tinygrad), default and BEAM=2.
+Workload: one M4 training step, ~9.3 GFLOP, ~400 MB of activation traffic.
+- M5 (10-core GPU): measured 126 GB/s (spec 153); our fp32 GEMM 2.0 TFLOPS
+  (fp32 shader peak est. ~4–4.5). Floor ~6–8 ms/step.
+  Now 28.5 ms. Target ≤ 15 ms (tinygrad BEAM 16.6); stretch ~8 ms.
+- RTX 4090: 82.6 TFLOPS fp32, 1008 GB/s. Floor ~1.5–2.5 ms/step, set by kernel
+  count × launch cost. Now 13 ms. Target < 6 ms; stretch ~2 ms.
+- Kernels per step 1484 → ~600.
+One branch + PR per stage, measured with `make perf` on the M5; CUDA checked on
+the 4090 before merge:
+1. Measurement: make perf (fixed workloads, per-kernel-type profile with
+   bandwidth/FLOP rates, JSON log), tinygrad comparison
+2. Kernel IR: one representation for every fused kernel (index space, loads,
+   expression DAG, reduce accumulators, stores); all backends render from it
+3. Multi-consumer fusion with a cycle check
+4. Reduction fusion: elementwise into reductions, row kernels
+   (softmax/LayerNorm/logsumexp in one)
+5. Views: per-input strides; Permute/Expand become index transforms
+6. GEMM epilogues (bias + activation); no op/input budgets
+7. Lowering knobs (workgroup, upcast, unroll, reduce strategy, GEMM tiles) +
+   kernel search on device + disk cache of choices and binaries
+8. Record and replay (Metal indirect command buffers, CUDA Graphs) + optimizer
+   as UOps on the device
 
 Milestones
 0. Cleanup ✓  One UOp model: one executor, autograd emits UOps ✓
@@ -133,3 +154,4 @@ References
 - Paper: https://arxiv.org/html/2502.02463v3
 - Reference impl (PyTorch, MIT): https://github.com/GWhittle110/distribution-transformers
 - docs/tiny-inspo.md
+- docs/research-directions.md — later: continual learning, latent world models, scene memory

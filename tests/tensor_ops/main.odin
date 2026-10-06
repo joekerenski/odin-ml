@@ -974,9 +974,11 @@ test_cpu_kernels :: proc() {
 	expect(counter_pf == total, "parallel_for covers every index once")
 	nested := 0
 	ml.parallel_for(64, 1, proc(data: rawptr, lo, hi: int) {
-		ml.parallel_for(1000, 1, proc(data: rawptr, lo, hi: int) {
-			sync_add((^int)(data), hi - lo)
-		}, data)
+		for _ in lo ..< hi { // a part may hold several indices (parts ≤ 4 × threads)
+			ml.parallel_for(1000, 1, proc(data: rawptr, lo, hi: int) {
+				sync_add((^int)(data), hi - lo)
+			}, data)
+		}
 	}, &nested)
 	expect(nested == 64 * 1000, "nested parallel_for runs inline")
 
