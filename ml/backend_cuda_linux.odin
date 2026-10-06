@@ -603,60 +603,83 @@ run_plan :: proc(k: ^Kernel, variant: GPU_Variant, threads, partial_slot: int, p
 
 @(private = "file")
 KERNELS :: `
-// Tiny batched matrices (attention heads): one thread per output.
-// cuBLAS takes 60-150 µs for 8192 × [4×8]·[8×4]; this takes a few.
-// p = [M, K, N, trans_a, trans_b, batch]
+// GEMM over strided operands, one thread per output: tiny batched matrices
+// (attention heads; cuBLAS takes 60-150 µs for 8192 × [4×8]·[8×4], this a few)
+// and layouts cuBLAS can't take. Element (z0, z1, i, j) of X at
+// X[z0·b0 + z1·b1 + i·rs + j·cs]; p = [M, K, N, kc, Z1, then rs, cs, b0, b1 of A, B, C, Z].
 extern "C" __global__ void matmul_small(const float* A, const float* B, float* C, const P p) {
-    unsigned int M = p.v[0], K = p.v[1], N = p.v[2], batch = p.v[5];
-    bool ta = p.v[3] != 0, tb = p.v[4] != 0;
+    unsigned int M = p.v[0], K = p.v[1], N = p.v[2], Z1 = p.v[4], Z = p.v[17];
     unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= batch * M * N) return;
-    unsigned int z = t / (M * N), r = t % (M * N), i = r / N, j = r % N;
-    const float* a = A + z * M * K;
-    const float* b = B + z * K * N;
+    if (t >= Z * M * N) return;
+    unsigned int z = t / (M * N), r = t % (M * N), i = r / N, j = r % N, z0 = z / Z1, z1 = z % Z1;
+    const float* a = A + z0 * p.v[7] + z1 * p.v[8] + i * p.v[5];
+    const float* b = B + z0 * p.v[11] + z1 * p.v[12] + j * p.v[10];
     float acc = 0.0f;
-    for (unsigned int k = 0; k < K; k++) acc += (ta ? a[k * M + i] : a[i * K + k]) * (tb ? b[j * K + k] : b[k * N + j]);
-    C[t] = acc;
+    for (unsigned int k = 0; k < K; k++) acc += a[k * p.v[6]] * b[k * p.v[9]];
+    C[z0 * p.v[15] + z1 * p.v[16] + i * p.v[13] + j * p.v[14]] = acc;
 }
 
 `
 
-// Row-major C[M,N] = op(A) @ op(B) is column-major Cᵀ = op(B)ᵀ · op(A)ᵀ: hand
-// cuBLAS B first, each with the transpose flag it was given.
-cuda_matmul :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool) {
-	if batch > 1 && M <= 16 && N <= 16 && K <= 64 {
-		n := batch * int(M) * int(N)
-		label := kernel_timing() ? fmt.tprintf("matmul_small %dx%dx%d b%d", M, K, N, batch) : ""
-		launch(fixed_kernel("matmul_small"), {resolve(A), resolve(B), resolve(C, output = true)},
-			{u32(M), u32(K), u32(N), u32(trans_a), u32(trans_b), u32(batch)}, {blocks_for(n), 1, 1}, {BLOCK, 1, 1}, label)
+// Row-major C = A·B is column-major Cᵀ = Bᵀ·Aᵀ: hand cuBLAS B first. A
+// column-major C is row-major Cᵀ = Bᵀ·Aᵀ: swap the operands and transpose
+// them. Batches: strided-batched over z1, one call per z0. Layouts without a
+// unit stride go to the one-thread-per-output kernel.
+cuda_matmul :: proc(g: ^Gemm) {
+	M, K, N, Z := g.M, g.K, g.N, g.Z0 * g.Z1
+	ta, lda, aok := gemm_layout(g.a, M, K)
+	tb, ldb, bok := gemm_layout(g.b, K, N)
+	tc, ldc, cok := gemm_layout(g.c, M, N)
+	if (Z > 1 && M <= 16 && N <= 16 && K <= 64) || !(aok && bok && cok) {
+		n := Z * M * N
+		label := kernel_timing() ? fmt.tprintf("matmul_small %dx%dx%d b%d", M, K, N, Z) : ""
+		p: [18]u32
+		gp := gemm_params(g)
+		copy(p[:], gp[:])
+		p[17] = u32(Z)
+		launch(fixed_kernel("matmul_small"), {resolve(g.a.data), resolve(g.b.data), resolve(g.c.data, output = true)},
+			p[:], {blocks_for(n), 1, 1}, {BLOCK, 1, 1}, label)
 		return
 	}
 	if cuda_ctx.n_launch == 0 {
 		cuda_ctx.opened = time.tick_now()
 		if debug_level == 1 do cu.cuEventRecord(cuda_ctx.ev_start, cuda_ctx.stream)
 	}
-	a, b, c := resolve(A), resolve(B), resolve(C, output = true)
+	a, b, c := resolve(g.a.data), resolve(g.b.data), resolve(g.c.data, output = true)
+	// column-major (first) operand X·Y with X [m, k]: cuBLAS op and leading dim
+	x, y := b, a
+	tx, ty, ldx, ldy := tb, ta, ldb, lda
+	bx, by := g.b.bs, g.a.bs
+	m, n := N, M
+	if tc { // Cᵀ row-major = C column-major: Aᵀ… swap roles
+		x, y = a, b
+		tx, ty, ldx, ldy = !ta, !tb, lda, ldb
+		bx, by = g.a.bs, g.b.bs
+		m, n = M, N
+	}
 	alpha, beta: f32 = 1, 0
-	op_b := i32(trans_b ? CUBLAS_OP_T : CUBLAS_OP_N)
-	op_a := i32(trans_a ? CUBLAS_OP_T : CUBLAS_OP_N)
-	ldb := trans_b ? K : N
-	lda := trans_a ? M : K
+	op_x := i32(tx ? CUBLAS_OP_T : CUBLAS_OP_N)
+	op_y := i32(ty ? CUBLAS_OP_T : CUBLAS_OP_N)
 	if kernel_timing() do cu.cuEventRecord(cuda_ctx.ev_a, cuda_ctx.stream)
 	st: i32
-	if batch == 1 {
-		st = cublas.cublasSgemm(cuda_ctx.blas, op_b, op_a, N, M, K, &alpha, b, ldb, a, lda, &beta, c, N)
-	} else {
-		st = cublas.cublasSgemmStridedBatched(cuda_ctx.blas, op_b, op_a, N, M, K, &alpha,
-			b, ldb, i64(K) * i64(N), a, lda, i64(M) * i64(K), &beta, c, N, i64(M) * i64(N), i32(batch))
+	for z0 in 0 ..< g.Z0 {
+		off :: proc(p: CUdeviceptr, e: int) -> CUdeviceptr { return p + CUdeviceptr(e * size_of(f32)) }
+		xp, yp, cp := off(x, z0 * bx[0]), off(y, z0 * by[0]), off(c, z0 * g.c.bs[0])
+		if g.Z1 == 1 {
+			st = cublas.cublasSgemm(cuda_ctx.blas, op_x, op_y, i32(m), i32(n), i32(K), &alpha, xp, i32(ldx), yp, i32(ldy), &beta, cp, i32(ldc))
+		} else {
+			st = cublas.cublasSgemmStridedBatched(cuda_ctx.blas, op_x, op_y, i32(m), i32(n), i32(K), &alpha,
+				xp, i32(ldx), i64(bx[1]), yp, i32(ldy), i64(by[1]), &beta, cp, i32(ldc), i64(g.c.bs[1]), i32(g.Z1))
+		}
+		if st != 0 do fmt.panicf("cuBLAS: sgemm failed (%d) %dx%dx%d batch %d", st, M, K, N, Z)
+		cuda_ctx.n_launch += 1
 	}
-	if st != 0 do fmt.panicf("cuBLAS: sgemm failed (%d) %dx%dx%d batch %d", st, M, K, N, batch)
-	cuda_ctx.n_launch += 1
 	if kernel_timing() {
 		cu.cuEventRecord(cuda_ctx.ev_b, cuda_ctx.stream)
 		check(cu.cuEventSynchronize(cuda_ctx.ev_b), "sgemm")
 		ms: f32
 		cu.cuEventElapsedTime(&ms, cuda_ctx.ev_a, cuda_ctx.ev_b)
-		profile_add_ms(f64(ms), batch == 1 ? "cublas_sgemm" : "cublas_sgemm_batched")
-		if debug_level >= 2 do fmt.printfln("  gpu     %-40s %8.4f ms", fmt.tprintf("sgemm %dx%dx%d b%d", M, K, N, batch), ms)
+		profile_add_ms(f64(ms), Z == 1 ? "cublas_sgemm" : "cublas_sgemm_batched")
+		if debug_level >= 2 do fmt.printfln("  gpu     %-40s %8.4f ms", fmt.tprintf("sgemm %dx%dx%d b%d", M, K, N, Z), ms)
 	}
 }

@@ -241,3 +241,71 @@ matmul_batched :: proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_
 		}
 	}, &job)
 }
+
+// Backend.matmul on the CPU. The dense batched layout goes to matmul_batched;
+// strided operands (views read in place) run item by item: through BLAS
+// leading dims (Accelerate), else packed into dense copies.
+cpu_gemm :: proc(g: ^Gemm) {
+	ta, lda, aok := gemm_layout(g.a, g.M, g.K)
+	tb, ldb, bok := gemm_layout(g.b, g.K, g.N)
+	tc, ldc, cok := gemm_layout(g.c, g.M, g.N)
+	if aok && bok && cok && !tc && lda == (ta ? g.M : g.K) && ldb == (tb ? g.K : g.N) && ldc == g.N &&
+	   gemm_batch_flat(g, g.a, g.M, g.K) && gemm_batch_flat(g, g.b, g.K, g.N) && gemm_batch_flat(g, g.c, g.M, g.N) {
+		matmul_batched(g.c.data, g.a.data, g.b.data, g.Z0 * g.Z1, i32(g.M), i32(g.K), i32(g.N), ta, tb)
+		return
+	}
+	Z := g.Z0 * g.Z1
+	if Z == 1 {
+		gemm_item(g, 0)
+		return
+	}
+	parallel_for(Z, max(1, PAR_GRAIN / (g.M * g.K * g.N)), proc(data: rawptr, lo, hi: int) {
+		g := (^Gemm)(data)
+		for z in lo ..< hi do gemm_item(g, z)
+	}, g)
+}
+
+// One batch item of a strided GEMM.
+@(private = "file")
+gemm_item :: proc(g: ^Gemm, z: int) {
+	M, K, N := g.M, g.K, g.N
+	a := g.a.data[gemm_offset(g, g.a, z):]
+	b := g.b.data[gemm_offset(g, g.b, z):]
+	c := g.c.data[gemm_offset(g, g.c, z):]
+	ta, lda, aok := gemm_layout(g.a, M, K)
+	tb, ldb, bok := gemm_layout(g.b, K, N)
+	tc, ldc, cok := gemm_layout(g.c, M, N)
+	when ODIN_OS == .Darwin {
+		if matmul_backend == .Accelerate && aok && bok && cok {
+			op :: proc(t: bool) -> i32 { return t ? CblasTrans : CblasNoTrans }
+			if !tc {
+				cblas_sgemm(CblasRowMajor, op(ta), op(tb), i32(M), i32(N), i32(K), 1, raw_data(a), i32(lda), raw_data(b), i32(ldb), 0, raw_data(c), i32(ldc))
+			} else { // C column-major: Cᵀ = Bᵀ·Aᵀ, row-major
+				cblas_sgemm(CblasRowMajor, op(!tb), op(!ta), i32(N), i32(M), i32(K), 1, raw_data(b), i32(ldb), raw_data(a), i32(lda), 0, raw_data(c), i32(ldc))
+			}
+			return
+		}
+	}
+	// operands that aren't plain dense matrices go through dense copies
+	plain :: proc(t: bool, ld, R, C: int, ok: bool) -> bool { return ok && ld == (t ? R : C) }
+	pa, pb := a, b
+	if !plain(ta, lda, M, K, aok) {
+		pa = make([]f32, M * K, scratch())
+		strided_copy(pa, a, {M, K}, {g.a.rs, g.a.cs})
+		ta = false
+	}
+	if !plain(tb, ldb, K, N, bok) {
+		pb = make([]f32, K * N, scratch())
+		strided_copy(pb, b, {K, N}, {g.b.rs, g.b.cs})
+		tb = false
+	}
+	direct := plain(tc, ldc, M, N, cok) && !tc
+	pc := direct ? c : make([]f32, M * N, scratch())
+	matmul_f32(pc, pa, pb, i32(M), i32(K), i32(N), ta, tb)
+	if !direct {
+		for i in 0 ..< M do for j in 0 ..< N do c[i * g.c.rs + j * g.c.cs] = pc[i * N + j]
+		delete(pc, scratch())
+	}
+	if raw_data(pa) != raw_data(a) do delete(pa, scratch())
+	if raw_data(pb) != raw_data(b) do delete(pb, scratch())
+}

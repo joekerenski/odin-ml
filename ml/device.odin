@@ -35,7 +35,7 @@ Backend :: struct {
 	// memory the device can read and write directly (CPU: the heap)
 	allocator: proc() -> mem.Allocator,
 	kernel:    proc(k: ^Kernel), // any kernel of the IR (kernel_ir.odin)
-	matmul:    proc(C, A, B: []f32, batch: int, M, K, N: i32, trans_a, trans_b: bool),
+	matmul:    proc(g: ^Gemm), // strided operands (kernel_ir.odin)
 	sync:      proc(),
 	// optional: move a buffer's pages to the host before CPU code touches it
 	// (CUDA managed memory; one bulk migration instead of a fault per page)
@@ -46,7 +46,7 @@ CPU_BACKEND :: Backend {
 	device    = .CPU,
 	allocator = proc() -> mem.Allocator { return scratch() },
 	kernel    = cpu_kernel,
-	matmul    = matmul_batched,
+	matmul    = cpu_gemm,
 	sync      = proc() {},
 }
 
@@ -87,11 +87,12 @@ arena_init :: proc(a: ^mem.Dynamic_Arena, block_size := 64 * mem.Megabyte) {
 }
 
 // ML_DEBUG=0..3, ML_DEVICE=cpu|metal|cuda|gpu, ML_THREADS=n (CPU threads, default
-// all logical cores) and ML_REUSE=0|1 (buffer reuse, realize.odin) from the
-// environment.
+// all logical cores), ML_REUSE=0|1 (buffer reuse) and ML_VIEWS=0|1 (views read
+// in place, realize.odin) from the environment.
 setup_from_env :: proc() {
 	debug_from_env()
 	if v, ok := os.lookup_env_alloc("ML_REUSE", context.temp_allocator); ok do buffer_reuse = v != "0"
+	if v, ok := os.lookup_env_alloc("ML_VIEWS", context.temp_allocator); ok do view_reads = v != "0"
 	if v, ok := os.lookup_env_alloc("ML_THREADS", context.temp_allocator); ok && !pool_ready {
 		if n, ok2 := strconv.parse_int(v); ok2 && n > 0 do num_threads = n
 	}

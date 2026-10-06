@@ -1002,6 +1002,41 @@ test_cpu_kernels :: proc() {
 	for v, i in a1 do if v != b1[i] do same = false
 	for v, i in a2 do if v != b2[i] do same = false
 	expect(same, "backward with buffer reuse == without (and forward still readable)")
+
+	// views read in place (strided GEMM operands, GEMMs storing into permuted
+	// layouts) == copied views, on every CPU GEMM path (Pure packs strided operands)
+	run_mha :: proc(views: bool, mb: ml.Matmul_Backend) -> (g: [3][]f32, kernels: int) {
+		ml.view_reads = views
+		prev := ml.matmul_get_backend()
+		ml.matmul_set_backend(mb)
+		defer {
+			ml.view_reads = true
+			ml.matmul_set_backend(prev)
+		}
+		rand.reset(9)
+		B, T, H, dh: i32 = 3, 5, 2, 4
+		D := H * dh
+		x := ml.randn({B, T, D}, 0, 1, requires_grad = true)
+		Wq := ml.randn({D, D}, 0, 0.3, requires_grad = true)
+		Wo := ml.randn({D, D}, 0, 0.3, requires_grad = true)
+		heads :: proc(t: ^ml.Tensor, B, T, H, dh: i32) -> ^ml.Tensor { return ml.permute(ml.reshape(t, {B, T, H, dh}), {0, 2, 1, 3}) }
+		q := heads(ml.matmul(x, Wq), B, T, H, dh)
+		att := ml.softmax(ml.matmul(q, ml.mT(q)), -1)
+		o := ml.reshape(ml.permute(ml.matmul(att, q), {0, 2, 1, 3}), {B, T, D})
+		ml.counters_reset()
+		ml.backward(ml.sum(ml.square(ml.matmul(o, Wo))))
+		return {x.grad.data, Wq.grad.data, Wo.grad.data}, ml.counters.kernels
+	}
+	ref, k_copy := run_mha(false, .Pure)
+	views_ok := true
+	k_views := 0
+	for mb in ([]ml.Matmul_Backend{.Pure, ml.matmul_get_backend()}) {
+		got, k := run_mha(true, mb)
+		k_views = k
+		for i in 0 ..< 3 do for v, j in got[i] do if abs(v - ref[i][j]) > 1e-4 * (1 + abs(ref[i][j])) do views_ok = false
+	}
+	expect(views_ok, "attention fwd+bwd: views read in place == copied views (Pure and default GEMM)")
+	expect(k_views < k_copy, fmt.tprintf("attention: views remove the permute copies (%d kernels, %d with copies)", k_views, k_copy))
 }
 
 sync_add :: proc(p: ^int, v: int) {

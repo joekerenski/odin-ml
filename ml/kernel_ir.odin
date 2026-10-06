@@ -18,10 +18,13 @@ package ml
 // Reduce, Consts and loads with zero strides on the reduced dims).
 //
 // A fused elementwise group is a kernel without a reduce; a reduction is
-// Load → Reduce; a permute is a single Load through a permuted view. Stage 3+
-// of the performance plan grow these (prologues, epilogues, views) without new
-// kernel types. Programs are shape-generic: dims, strides, offsets and Const
-// values travel as parameters, so the compiled program is cached by structure.
+// Load → Reduce (with its fused prologue / epilogue); a copy is a single Load
+// through a strided view. Permutes and reshapes the scheduler reads in place
+// (View) are loads with their strides. Programs are shape-generic: dims,
+// strides, offsets and Const values travel as parameters, so the compiled
+// program is cached by structure.
+//
+// GEMMs have their own descriptor (Gemm): strided operands, ≤ 2 batch dims.
 // ============================================================================
 
 import "core:fmt"
@@ -143,6 +146,142 @@ broadcast_strides :: proc(shape: []i32, nd: int) -> (st: [MAX_DIMS]int) {
 	return
 }
 
+// Strides `st` over `shape`, broadcast (right-aligned) to nd dims.
+@(private)
+broadcast_view :: proc(shape: []i32, st: [MAX_DIMS]int, nd: int) -> (out: [MAX_DIMS]int) {
+	pad := nd - len(shape)
+	for d in 0 ..< len(shape) do if shape[d] != 1 do out[pad + d] = st[d]
+	return
+}
+
+// ---- views ----------------------------------------------------------------------
+//
+// A Permute or Reshape the scheduler reads in place: element idx of the viewed
+// node is base.data[Σ idx·st]. Kernels load it with those strides instead of
+// reading a copied buffer.
+
+View :: struct {
+	base: ^UOp,
+	st:   [MAX_DIMS]int, // over the viewed node's shape
+}
+
+// x's buffer and its strides over x.shape: x's own dense buffer, or its base's
+// through a view.
+src_view :: proc(views: ^map[^UOp]View, x: ^UOp) -> (data: []f32, st: [MAX_DIMS]int) {
+	if views != nil do if v, ok := views[x]; ok do return v.base.data, v.st
+	return x.data, broadcast_strides(x.shape, len(x.shape))
+}
+
+// Strides that view (shape, st) as new_shape without moving data, if any:
+// each group of old dims that becomes a group of new dims must be contiguous
+// within itself.
+reshape_strides :: proc(shape: []i32, st: [MAX_DIMS]int, new_shape: []i32) -> (out: [MAX_DIMS]int, ok: bool) {
+	os, ost: [MAX_DIMS]int
+	on := 0
+	for d in 0 ..< len(shape) do if shape[d] != 1 {
+		os[on], ost[on] = int(shape[d]), st[d]
+		on += 1
+	}
+	oi, ni, nn := 0, 0, len(new_shape)
+	for ni < nn {
+		if new_shape[ni] == 1 {
+			ni += 1
+			continue
+		}
+		np, op := int(new_shape[ni]), os[oi]
+		nj, oj := ni + 1, oi + 1
+		for np != op {
+			if np < op {
+				np *= int(new_shape[nj])
+				nj += 1
+			} else {
+				op *= os[oj]
+				oj += 1
+			}
+		}
+		for k in oi ..< oj - 1 do if ost[k] != ost[k + 1] * os[k + 1] do return
+		s := ost[oj - 1]
+		for k := nj - 1; k >= ni; k -= 1 {
+			out[k] = s
+			s *= int(new_shape[k])
+		}
+		ni, oi = nj, oj
+	}
+	return out, true
+}
+
+// Row-major strides of a shape.
+shape_strides :: proc(shape: []i32) -> (st: [MAX_DIMS]int) {
+	s := 1
+	for d := len(shape) - 1; d >= 0; d -= 1 {
+		st[d] = s
+		s *= int(shape[d])
+	}
+	return
+}
+
+// Strides equal to the dense layout (size-1 dims don't matter)?
+strides_dense :: proc(shape: []i32, st: [MAX_DIMS]int) -> bool {
+	d := shape_strides(shape)
+	for i in 0 ..< len(shape) do if shape[i] != 1 && st[i] != d[i] do return false
+	return true
+}
+
+// ---- GEMM -------------------------------------------------------------------------
+
+// One operand: element (z0, z1, i, j) at data[z0·bs[0] + z1·bs[1] + i·rs + j·cs].
+Gemm_Operand :: struct {
+	data:   []f32,
+	rs, cs: int,
+	bs:     [2]int,
+}
+
+// C[z] = A[z] @ B[z] over batch z = (z0, z1) ∈ [Z0] × [Z1]; A [M, K], B [K, N], C [M, N].
+Gemm :: struct {
+	a, b, c:         Gemm_Operand,
+	Z0, Z1, M, K, N: int,
+}
+
+// The dense batched layout: X[z] at z·R·C, row-major or (trans) column-major.
+gemm_dense :: proc(C, A, B: []f32, batch, M, K, N: int, trans_a, trans_b: bool) -> Gemm {
+	op :: proc(d: []f32, R, C: int, trans: bool) -> Gemm_Operand {
+		return trans ? {d, 1, R, {0, R * C}} : {d, C, 1, {0, R * C}}
+	}
+	return Gemm{op(A, M, K, trans_a), op(B, K, N, trans_b), op(C, M, N, false), 1, batch, M, K, N}
+}
+
+// As a BLAS matrix: row-major (or trans: column-major) with leading dim ld.
+gemm_layout :: proc(o: Gemm_Operand, R, C: int) -> (trans: bool, ld: int, ok: bool) {
+	if C == 1 || o.cs == 1 {
+		ld = R == 1 ? C : o.rs
+		if ld >= C do return false, ld, true
+	}
+	if R == 1 || o.rs == 1 {
+		ld = C == 1 ? R : o.cs
+		if ld >= R do return true, ld, true
+	}
+	return
+}
+
+// Is item z at z·R·C, for every z?
+gemm_batch_flat :: proc(g: ^Gemm, o: Gemm_Operand, R, C: int) -> bool {
+	return (g.Z1 == 1 || o.bs[1] == R * C) && (g.Z0 == 1 || o.bs[0] == g.Z1 * R * C)
+}
+
+// The GPU GEMM parameter block: [M, K, N, kc, Z1, then rs, cs, b0, b1 of A, B, C].
+gemm_params :: proc(g: ^Gemm) -> (p: [17]u32) {
+	p[0], p[1], p[2], p[3], p[4] = u32(g.M), u32(g.K), u32(g.N), 0, u32(g.Z1)
+	for o, i in ([3]Gemm_Operand{g.a, g.b, g.c}) {
+		p[5 + 4 * i], p[6 + 4 * i], p[7 + 4 * i], p[8 + 4 * i] = u32(o.rs), u32(o.cs), u32(o.bs[0]), u32(o.bs[1])
+	}
+	return
+}
+
+// Offset of batch item z (flat over Z0 × Z1).
+gemm_offset :: #force_inline proc(g: ^Gemm, o: Gemm_Operand, z: int) -> int {
+	return (z / g.Z1) * o.bs[0] + (z % g.Z1) * o.bs[1]
+}
+
 @(private)
 dense_strides :: proc(dims: []int) -> (st: [MAX_DIMS]int) {
 	s := 1
@@ -155,7 +294,7 @@ dense_strides :: proc(dims: []int) -> (st: [MAX_DIMS]int) {
 
 // A fused elementwise group → one kernel. false: over the budget (the caller
 // runs the nodes one by one).
-kernel_from_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool) {
+kernel_from_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil) -> (k: Kernel, ok: bool) {
 	if len(group) > MAX_FUSED_INSNS do return
 	out := group[len(group) - 1].shape
 	k.nd = len(out)
@@ -173,8 +312,9 @@ kernel_from_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool) {
 				node_of[x] = kernel_add_node(&k, K_Node{kind = .Const, value = x.arg.(f32)})
 				continue
 			}
-			st := broadcast_strides(x.shape, k.nd)
-			node_of[x] = kernel_add_load(&k, x.data, st[:k.nd])
+			data, vst := src_view(views, x)
+			st := broadcast_view(x.shape, vst, k.nd)
+			node_of[x] = kernel_add_load(&k, data, st[:k.nd])
 		}
 	}
 	k.n_in = k.n_bufs
@@ -201,17 +341,6 @@ kernel_copy :: proc(out, src: []f32, dims: []int, strides: []int) -> (k: Kernel)
 	k.n_stores = 1
 	kernel_finish(&k)
 	return
-}
-
-kernel_from_permute :: proc(u: ^UOp) -> Kernel {
-	src := u.src[0]
-	order := u.arg.([]i32)
-	dims, st: [MAX_DIMS]int
-	for o, i in order {
-		dims[i] = int(src.shape[o])
-		st[i] = int(stride_of(src.shape, int(o)))
-	}
-	return kernel_copy(u.data, src.data, dims[:len(order)], st[:len(order)])
 }
 
 // [outer, r, inner] → [outer, inner]: one run of adjacent reduced axes.
@@ -397,16 +526,17 @@ reduce_dims :: proc(r: ^UOp) -> (X: []i32, lo, hi: int, ok: bool) {
 }
 
 // Can tensor t (broadcastable to the reduce input) be read in r's canonical space?
-reduce_mergeable :: proc(r: ^UOp, t: ^UOp) -> bool {
+reduce_mergeable :: proc(r: ^UOp, t: ^UOp, views: ^map[^UOp]View = nil) -> bool {
 	X, lo, hi, ok := reduce_dims(r)
 	if !ok do return false
-	_, mok := merge3(X, broadcast_strides(t.shape, len(X)), lo, hi)
+	_, st := src_view(views, t)
+	_, mok := merge3(X, broadcast_view(t.shape, st, len(X)), lo, hi)
 	return mok
 }
 
 // group: topo order, exactly one Sum/ReduceMax; members shaped like its input
 // (prologue) or its output (epilogue).
-kernel_from_reduce_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool) {
+kernel_from_reduce_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil) -> (k: Kernel, ok: bool) {
 	r: ^UOp
 	for u in group do if u.op == .Sum || u.op == .ReduceMax do r = u
 	X, lo, hi, rok := reduce_dims(r)
@@ -432,7 +562,7 @@ kernel_from_reduce_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool)
 		if n, ok := node_of[x]; ok do return n
 		return inputs[x]
 	}
-	add_inputs :: proc(k: ^Kernel, members: ^map[^UOp]bool, inputs: ^map[^UOp]int, n_inputs: ^int, u: ^UOp, X: []i32, lo, hi: int) -> bool {
+	add_inputs :: proc(k: ^Kernel, views: ^map[^UOp]View, members: ^map[^UOp]bool, inputs: ^map[^UOp]int, n_inputs: ^int, u: ^UOp, X: []i32, lo, hi: int) -> bool {
 		for x in u.src {
 			if x in members^ || x in inputs^ do continue
 			if n_inputs^ == MAX_FUSED_INPUTS do return false
@@ -441,9 +571,10 @@ kernel_from_reduce_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool)
 				inputs[x] = kernel_add_node(k, K_Node{kind = .Const, value = x.arg.(f32)})
 				continue
 			}
-			m, ok := merge3(X, broadcast_strides(x.shape, len(X)), lo, hi)
+			data, st := src_view(views, x)
+			m, ok := merge3(X, broadcast_view(x.shape, st, len(X)), lo, hi)
 			if !ok do return false
-			inputs[x] = kernel_add_load(k, x.data, m[:])
+			inputs[x] = kernel_add_load(k, data, m[:])
 		}
 		return true
 	}
@@ -453,13 +584,13 @@ kernel_from_reduce_group :: proc(group, stores: []^UOp) -> (k: Kernel, ok: bool)
 	}
 	// prologue (shaped like the input), the reduce, epilogue (shaped like the output)
 	for u in group do if u != r && shapes_equal(u.shape, X) {
-		if !add_inputs(&k, &members, &pro_in, &n_inputs, u, X, lo, hi) do return
+		if !add_inputs(&k, views, &members, &pro_in, &n_inputs, u, X, lo, hi) do return
 	}
-	if !add_inputs(&k, &members, &pro_in, &n_inputs, r, X, lo, hi) do return
+	if !add_inputs(&k, views, &members, &pro_in, &n_inputs, r, X, lo, hi) do return
 	for u in group do if u != r && shapes_equal(u.shape, X) do alu(&k, &node_of, &pro_in, u)
 	node_of[r] = kernel_add_node(&k, K_Node{kind = .Reduce, op = r.op, a = operand(&node_of, &pro_in, r.src[0])})
 	for u in group do if u != r && !shapes_equal(u.shape, X) {
-		if !add_inputs(&k, &members, &epi_in, &n_inputs, u, X, lo, hi) do return
+		if !add_inputs(&k, views, &members, &epi_in, &n_inputs, u, X, lo, hi) do return
 	}
 	for u in group do if u != r && !shapes_equal(u.shape, X) do alu(&k, &node_of, &epi_in, u)
 	k.n_in = k.n_bufs

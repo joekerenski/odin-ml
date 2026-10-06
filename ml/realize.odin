@@ -5,17 +5,18 @@ package ml
 //
 // realize_all(sinks):
 //   1. topo-sort unrealized nodes (realized nodes are buffers: stop there),
-//   2. fuse: an ewise node joins its ewise src when shapes match and the src
-//      has exactly one consumer → one loop, intermediates never stored,
-//   3. fold: a last-two-axes Permute feeding only MatMuls → GEMM transpose flag,
+//   2. views: Permutes and Reshapes become strides over a base buffer, read in
+//      place by their consumers (plan_views),
+//   3. fuse: same-shape elementwise nodes into groups, reductions with their
+//      producers and consumers (fuse_groups) → one kernel each,
 //   4. run in topo order on the current backend (device.odin): fused groups,
 //      views, primitive kernels; then sync so results are visible on the host.
 //
 // Buffer reuse: once every reader of an internal (backward-built, see uop.odin)
 // buffer has run, it goes to a pool and the next output of the same size
 // takes it — memory still hot in cache instead of fresh arena memory, which
-// on x86 costs a DRAM read before the write. Views (Reshape, folded
-// transposes) share their source's buffer and count as its readers' readers.
+// on x86 costs a DRAM read before the write. Views read in place (and aliases)
+// share their base's buffer and count as its readers' readers.
 // Kernels run in order on every backend, so a buffer is never written while
 // an earlier kernel could still read it.
 //
@@ -43,7 +44,9 @@ Schedule :: struct {
 	topo:        [dynamic]^UOp,
 	consumers:   map[^UOp]int, // distinct unrealized consumers
 	sinks:       map[^UOp]bool,
-	folded:      map[^UOp]bool, // Permutes absorbed into MatMul
+	views:       map[^UOp]View, // Permutes / Reshapes read in place (no buffer)
+	alias:       map[^UOp]^UOp, // view nodes that are their base's buffer as is
+	store_into:  map[^UOp]Store_Into, // MatMuls writing straight into a view node's buffer
 	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
 	// buffer reuse
 	owner:       map[^UOp]^UOp, // node → node whose buffer it uses (views)
@@ -56,6 +59,10 @@ Schedule :: struct {
 // Reuse dead internal buffers within a realize (ML_REUSE=0 turns it off).
 buffer_reuse := true
 
+// Read Permutes / Reshapes in place and let GEMMs store into them (ML_VIEWS=0:
+// copy every non-dense view, the reference path).
+view_reads := true
+
 @(private)
 current_pool: ^map[int][dynamic][]f32
 
@@ -63,7 +70,9 @@ schedule_make :: proc() -> (s: Schedule) {
 	s.topo = make([dynamic]^UOp, scratch())
 	s.consumers = make(map[^UOp]int, scratch())
 	s.sinks = make(map[^UOp]bool, scratch())
-	s.folded = make(map[^UOp]bool, scratch())
+	s.views = make(map[^UOp]View, scratch())
+	s.alias = make(map[^UOp]^UOp, scratch())
+	s.store_into = make(map[^UOp]Store_Into, scratch())
 	s.uf = make(map[^UOp]^UOp, scratch())
 	s.owner = make(map[^UOp]^UOp, scratch())
 	s.refs = make(map[^UOp]int, scratch())
@@ -77,7 +86,9 @@ schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.topo)
 	delete(s.consumers)
 	delete(s.sinks)
-	delete(s.folded)
+	delete(s.views)
+	delete(s.alias)
+	delete(s.store_into)
 	delete(s.uf)
 	delete(s.owner)
 	delete(s.refs)
@@ -93,8 +104,11 @@ schedule_destroy :: proc(s: ^Schedule) {
 @(private)
 track_buffer :: proc(s: ^Schedule, u: ^UOp) {
 	o := u
-	if (u.op == .Reshape || u in s.folded) {
-		if src_o, ok := s.owner[u.src[0]]; ok do o = src_o
+	base: ^UOp
+	if v, ok := s.views[u]; ok do base = v.base
+	if b, ok := s.alias[u]; ok do base = b
+	if base != nil {
+		if base_o, ok := s.owner[base]; ok do o = base_o
 		else do return // a view of something realized before: not ours
 	}
 	s.owner[u] = o
@@ -147,15 +161,6 @@ uf_find :: proc(uf: ^map[^UOp]^UOp, x: ^UOp) -> ^UOp {
 	return p
 }
 
-// Permute that only swaps the last two axes (a batched matrix transpose).
-is_mt :: proc(u: ^UOp) -> bool {
-	if u.op != .Permute do return false
-	o := u.arg.([]i32)
-	n := len(o)
-	for i in 0 ..< n - 2 do if o[i] != i32(i) do return false
-	return o[n - 2] == i32(n - 1) && o[n - 1] == i32(n - 2)
-}
-
 realize_all :: proc(sinks: []^UOp) {
 	s := schedule_make()
 	defer schedule_destroy(&s)
@@ -175,26 +180,14 @@ realize_all :: proc(sinks: []^UOp) {
 	k0 := counters.kernels
 
 	// consumers (each consumer counted once per distinct src)
-	matmul_uses := make(map[^UOp]int, scratch())
-	defer delete(matmul_uses)
 	for u in s.topo {
 		for x, i in u.src {
-			if x.data != nil do continue
-			dup := false
-			for j in 0 ..< i do if u.src[j] == x do dup = true
-			if dup do continue
+			if x.data != nil || src_seen_before(u, i) do continue
 			s.consumers[x] += 1
-			if u.op == .MatMul do matmul_uses[x] += 1
 		}
 	}
 
-	// fold transposes into GEMM
-	for u in s.topo {
-		if is_mt(u) && !(u in s.sinks) && matmul_uses[u] == s.consumers[u] {
-			s.folded[u] = true
-		}
-	}
-
+	plan_views(&s)
 	fuse_groups(&s)
 
 	// members of each group in topo order, gathered in one pass; the last
@@ -218,8 +211,8 @@ realize_all :: proc(sinks: []^UOp) {
 	current_pool = &s.pool
 	defer current_pool = nil
 	for u in s.topo {
-		if u in s.folded {
-			// a transpose read in place by its MatMuls: a view of its src
+		if u.op == .Permute || u.op == .Reshape {
+			run_view(&s, u)
 			track_buffer(&s, u)
 			release_srcs(&s, u)
 			continue
@@ -233,7 +226,7 @@ realize_all :: proc(sinks: []^UOp) {
 			continue
 		}
 		run_node(&s, u)
-		track_buffer(&s, u)
+		if !(u in s.store_into) do track_buffer(&s, u) // else its view node owns the buffer
 		release_srcs(&s, u)
 	}
 	backend.sync()
@@ -242,6 +235,250 @@ realize_all :: proc(sinks: []^UOp) {
 		ms := f64(time.tick_since(step_start)) / 1e6
 		fmt.printfln("  realize: %d kernels  %.3f ms", counters.kernels - k0, ms)
 	}
+}
+
+// ---- views ----------------------------------------------------------------------
+//
+// Permutes and Reshapes compose into strides over a base buffer: the nearest
+// node with a buffer of its own (not a view, or a view that was copied). A
+// view is read in place by its consumers (s.views, no kernel) when each can
+// address it: elementwise kernels and other views always, reductions when it
+// merges into [outer, r, inner], GEMMs when its batch dims merge into ≤ 2.
+// Otherwise it is materialized:
+//   alias       dense over its base: the base's buffer as is (no kernel)
+//   store_into  a rearrangement of a MatMul's output nothing else reads: the
+//               GEMM writes straight into the view's layout (no kernel)
+//   copy        anything else: one strided copy kernel (a Reshape strides
+//               can't express copies over its src's shape)
+
+Store_Into :: struct {
+	v:  ^UOp,          // the view node that owns the buffer
+	st: [MAX_DIMS]int, // where the MatMul's elements go, over its shape
+}
+
+// Per view node: its strides over its base and, if materialized, how.
+@(private)
+View_Plan :: struct {
+	using view: View,
+	cut:        bool, // a Reshape strides can't express (copy over its src's shape)
+	copied:     bool, // has its own buffer (copy or store_into)
+}
+
+@(private)
+plan_views :: proc(s: ^Schedule) {
+	plan := make(map[^UOp]View_Plan, scratch())
+	defer delete(plan)
+	users := make(map[^UOp][dynamic]^UOp, scratch())
+	defer {
+		for _, l in users do delete(l)
+		delete(users)
+	}
+	for c in s.topo do for x, i in c.src {
+		if (x.op != .Permute && x.op != .Reshape) || x.data != nil || src_seen_before(c, i) do continue
+		l, ok := &users[x]
+		if !ok {
+			users[x] = make([dynamic]^UOp, scratch())
+			l = &users[x]
+		}
+		append(l, c)
+	}
+	// in topo order: a view's base is its src's base unless the src has a buffer
+	for u in s.topo {
+		if u.op != .Permute && u.op != .Reshape do continue
+		src := u.src[0]
+		sv := View{src, shape_strides(src.shape)}
+		if p, ok := plan[src]; ok && !p.copied do sv = p.view
+		p := View_Plan{view = View{base = sv.base}}
+		if u.op == .Permute {
+			for o, i in u.arg.([]i32) do p.st[i] = sv.st[o]
+		} else {
+			st, ok := reshape_strides(src.shape, sv.st, u.shape)
+			if ok do p.st = st
+			else do p.cut = true
+		}
+		readable := view_reads && !p.cut && !(u in s.sinks)
+		if readable do for c in users[u] {
+			for x, i in c.src do if x == u && !view_readable(c, i, p.view) do readable = false
+		}
+		switch {
+		case readable: s.views[u] = p.view
+		case !p.cut && strides_dense(u.shape, p.st): s.alias[u] = p.base
+		case: p.copied = true
+		}
+		plan[u] = p
+	}
+	if len(plan) == 0 do return
+
+	// a MatMul reading two views: their batch dims must merge together
+	for c in s.topo {
+		if c.op != .MatMul || !(c.src[0] in s.views || c.src[1] in s.views) do continue
+		ops: [3][MAX_DIMS]int
+		for j in 0 ..< 2 do _, ops[j] = src_view(&s.views, c.src[j])
+		ops[2] = shape_strides(c.shape)
+		if _, _, _, ok := gemm_batch(c.shape, ops); ok do continue
+		for j in 0 ..< 2 do if v, ok := s.views[c.src[j]]; ok {
+			delete_key(&s.views, c.src[j])
+			p := &plan[c.src[j]]
+			if strides_dense(c.src[j].shape, v.st) do s.alias[c.src[j]] = v.base
+			else do p.copied = true
+		}
+	}
+	if view_reads do for u, p in plan do if p.copied do plan_store_into(s, &plan, u)
+}
+
+// Can consumer c read its src i through view v?
+@(private)
+view_readable :: proc(c: ^UOp, i: int, v: View) -> bool {
+	x := c.src[i]
+	switch {
+	case c.op == .Permute || c.op == .Reshape || op_is_ewise(c.op):
+		return true
+	case c.op == .Sum || c.op == .ReduceMax:
+		lo, hi, ok := reduce_run(x.shape, c.arg.([]i32))
+		if !ok do return false
+		_, mok := merge3(x.shape, broadcast_view(x.shape, v.st, len(x.shape)), lo, hi)
+		return mok
+	case c.op == .MatMul:
+		ops: [3][MAX_DIMS]int
+		for j in 0 ..< 2 do ops[j] = shape_strides(c.src[j].shape)
+		ops[i] = v.st
+		ops[2] = shape_strides(c.shape)
+		_, _, _, ok := gemm_batch(c.shape, ops)
+		return ok
+	}
+	return false
+}
+
+// A copied view u whose base is a MatMul output read by nothing else: the
+// MatMul stores into u's layout instead. The copy reads the MatMul's dense
+// output through strides; each copy dim is one or more MatMul dims (inner to
+// outer), and each MatMul dim lands where its copy dim (part) goes.
+@(private)
+plan_store_into :: proc(s: ^Schedule, plan: ^map[^UOp]View_Plan, u: ^UOp) {
+	// the copy: over u's shape, or (cut) over its src's shape through the src's view
+	dims := u.shape
+	src := plan[u].view
+	if plan[u].cut {
+		dims = u.src[0].shape
+		p, ok := plan[u.src[0]]
+		if !ok || p.copied do return
+		src = p.view
+	}
+	m := src.base
+	if m.op != .MatMul || m in s.sinks || m in s.store_into || s.consumers[m] != 1 do return
+	for x := u.src[0]; x != m; x = x.src[0] {
+		if s.consumers[x] != 1 || x in s.sinks do return // a single chain of views
+	}
+	mst := shape_strides(m.shape)
+	ust := shape_strides(dims)
+	into := Store_Into{v = u}
+	used: [MAX_DIMS]bool
+	for d in 0 ..< len(dims) {
+		n, st, dest := int(dims[d]), src.st[d], ust[d]
+		for n > 1 {
+			j := -1
+			for k in 0 ..< len(m.shape) do if !used[k] && m.shape[k] != 1 && mst[k] == st && n % int(m.shape[k]) == 0 do j = k
+			if j < 0 do return
+			used[j] = true
+			into.st[j] = dest
+			n /= int(m.shape[j])
+			st *= int(m.shape[j])
+			dest *= int(m.shape[j])
+		}
+	}
+	for k in 0 ..< len(m.shape) do if m.shape[k] != 1 && !used[k] do return
+	ops: [3][MAX_DIMS]int
+	for j in 0 ..< 2 do _, ops[j] = src_view(&s.views, m.src[j])
+	ops[2] = into.st
+	if _, _, _, ok := gemm_batch(m.shape, ops); !ok do return
+	s.store_into[m] = into
+}
+
+// A view node's turn: read in place (nothing to do), an alias, already written
+// by its MatMul, or a copy.
+@(private)
+run_view :: proc(s: ^Schedule, u: ^UOp) {
+	if u in s.views || u.data != nil do return
+	if b, ok := s.alias[u]; ok {
+		u.data = b.data
+		return
+	}
+	// copy: over u's shape through its view, or (a cut reshape) over its src's
+	dims := u.shape
+	data, st := src_view(&s.views, u.src[0])
+	if u.op == .Permute {
+		pst := st
+		for o, i in u.arg.([]i32) do st[i] = pst[o]
+	} else {
+		dims = u.src[0].shape
+	}
+	t0: time.Tick
+	if profiling || debug_level >= 2 do t0 = time.tick_now()
+	alloc_out(u)
+	profile_open(.Permute, 2 * i64(numel(u.shape)) * 4, 0)
+	d: [MAX_DIMS]int
+	for x, i in dims do d[i] = int(x)
+	k := kernel_copy(u.data, data, d[:len(dims)], st[:len(dims)])
+	launch_kernel(&k)
+	profile_host_wall(t0, .Permute)
+	counters.kernels += 1
+	if debug_level >= 2 {
+		dt := i64(time.tick_since(t0))
+		counters.time_ns += dt
+		fmt.printfln("  kernel  copy %-11v shape=%v  %7.3f ms", u.op, u.shape, f64(dt) / 1e6)
+	}
+}
+
+// Batch dims of a MatMul (shape [batch..., M, N]) merged across the operands'
+// strides (A, B, C over their own shapes): ≤ 2 left, else false.
+gemm_batch :: proc(shape: []i32, ops: [3][MAX_DIMS]int) -> (Z: [2]int, bs: [3][2]int, n: int, ok: bool) {
+	nb := len(shape) - 2
+	size: [MAX_DIMS]int
+	st: [MAX_DIMS][3]int
+	for d in 0 ..< nb {
+		if shape[d] == 1 do continue
+		if n > 0 {
+			merge := true
+			for j in 0 ..< 3 do if st[n - 1][j] != ops[j][d] * int(shape[d]) do merge = false
+			if merge {
+				size[n - 1] *= int(shape[d])
+				for j in 0 ..< 3 do st[n - 1][j] = ops[j][d]
+				continue
+			}
+		}
+		size[n] = int(shape[d])
+		for j in 0 ..< 3 do st[n][j] = ops[j][d]
+		n += 1
+	}
+	if n > 2 do return
+	Z = {1, 1}
+	for d in 0 ..< n {
+		e := d + 2 - n // one dim: z1; two: z0, z1
+		Z[e] = size[d]
+		for j in 0 ..< 3 do bs[j][e] = st[d][j]
+	}
+	return Z, bs, n, true
+}
+
+// The GEMM of MatMul u: operands through their views, C into u's buffer or
+// the view it stores into.
+@(private)
+gemm_from_node :: proc(s: ^Schedule, u: ^UOp) -> Gemm {
+	ops: [3][MAX_DIMS]int
+	data: [3][]f32
+	for j in 0 ..< 2 do data[j], ops[j] = src_view(&s.views, u.src[j])
+	if into, ok := s.store_into[u]; ok {
+		data[2], ops[2] = into.v.data, into.st
+	} else {
+		data[2], ops[2] = u.data, shape_strides(u.shape)
+	}
+	Z, bs, _, ok := gemm_batch(u.shape, ops)
+	assert(ok, "gemm_from_node: batch dims don't merge (plan_views should have copied)")
+	n := len(u.shape)
+	g := Gemm{Z0 = Z[0], Z1 = Z[1], M = int(u.shape[n - 2]), K = int(u.src[0].shape[n - 1]), N = int(u.shape[n - 1])}
+	o := [3]^Gemm_Operand{&g.a, &g.b, &g.c}
+	for j in 0 ..< 3 do o[j]^ = Gemm_Operand{data[j], ops[j][n - 2], ops[j][n - 1], bs[j]}
+	return g
 }
 
 // ---- fusion groups --------------------------------------------------------------
@@ -332,14 +569,15 @@ fuse_reduce_ok :: proc(f: ^Fuse, a, b: int) -> bool {
 	seen := make([dynamic]^UOp, scratch())
 	defer delete(seen)
 	n_pro := fuse_inputs(f, a, b, X, &seen)
-	for y in seen do if y.op != .Const && !reduce_mergeable(r, y) do return false
+	views := &f.s.views
+	for y in seen do if y.op != .Const && !reduce_mergeable(r, y, views) do return false
 	for y in r.src do if _, inside := f.idx[y]; !inside || f.parent[f.idx[y]] < 0 || (fuse_find(f, f.idx[y]) != a && fuse_find(f, f.idx[y]) != b) {
-		if y.op != .Const && !reduce_mergeable(r, y) do return false
+		if y.op != .Const && !reduce_mergeable(r, y, views) do return false
 		n_pro += 1
 	}
 	clear(&seen)
 	n_epi := fuse_inputs(f, a, b, r.shape, &seen)
-	for y in seen do if y != r && y.op != .Const && !reduce_mergeable(r, y) do return false
+	for y in seen do if y != r && y.op != .Const && !reduce_mergeable(r, y, views) do return false
 	if n_pro + n_epi > MAX_FUSED_INPUTS do return false
 	for g in ([]int{a, b}) {
 		for m := g; m >= 0; m = f.next[m] {
@@ -491,7 +729,7 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 		return
 	}
 	profile_open(.Fused, fused_bytes(group, stores[:]), i64(numel(group[len(group) - 1].shape)) * i64(len(group)), len(group))
-	if k, ok := kernel_from_group(group, stores[:]); ok {
+	if k, ok := kernel_from_group(group, stores[:], &s.views); ok {
 		launch_kernel(&k)
 		profile_host_wall(t0, .Fused)
 		counters.kernels += 1
@@ -503,7 +741,7 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 			single := []^UOp{u}
 			profile_open(.Fused, fused_bytes(single, single), i64(numel(u.shape)))
 			tk := time.tick_now()
-			ks, sok := kernel_from_group(single, single)
+			ks, sok := kernel_from_group(single, single, &s.views)
 			assert(sok)
 			launch_kernel(&ks)
 			profile_host_wall(tk, .Fused)
@@ -526,7 +764,7 @@ run_reduce_group :: proc(s: ^Schedule, group, stores: []^UOp, t0: time.Tick) {
 	flops: i64
 	for u in group do flops += i64(numel(u.op == .Sum || u.op == .ReduceMax ? u.src[0].shape : u.shape))
 	profile_open(.Reduce, fused_bytes(group, stores), flops, len(group))
-	k, ok := kernel_from_reduce_group(group, stores)
+	k, ok := kernel_from_reduce_group(group, stores, &s.views)
 	assert(ok, "fused reduction over budget (fuse_groups should have refused it)")
 	launch_kernel(&k)
 	profile_host_wall(t0, .Reduce)
@@ -539,30 +777,14 @@ run_reduce_group :: proc(s: ^Schedule, group, stores: []^UOp, t0: time.Tick) {
 	}
 }
 
-// The buffer behind a src (a folded transpose reads its own src's).
-gemm_operand_data :: proc(u: ^UOp) -> []f32 {
-	d, _ := gemm_operand(u)
-	return d
-}
-
-// Operand for GEMM: a realized buffer, or a folded transpose of one.
-gemm_operand :: proc(u: ^UOp) -> (data: []f32, trans: bool) {
-	if u.data == nil && is_mt(u) do return u.src[0].data, true
-	return u.data, false
-}
-
 run_node :: proc(s: ^Schedule, u: ^UOp) {
-	for x in u.src do assert(x.data != nil || is_mt(x), "run_node: src not realized")
+	for x in u.src do assert(x.data != nil || x in s.views, "run_node: src not realized")
 
 	t0: time.Tick
 	if debug_level >= 2 do t0 = time.tick_now()
 
-	if u.op == .Reshape {
-		u.data = u.src[0].data // view: same dense buffer
-		return
-	}
-
-	alloc_out(u)
+	if into, ok := s.store_into[u]; ok do alloc_out(into.v)
+	else do alloc_out(u)
 	kind := profile_kind(u)
 	if profiling {
 		profile_open(kind, node_bytes(u), node_flops(u))
@@ -571,19 +793,13 @@ run_node :: proc(s: ^Schedule, u: ^UOp) {
 	#partial switch u.op {
 	case .Sum, .ReduceMax:
 		run_reduce(s, u)
-	case .Permute:
-		k := kernel_from_permute(u)
-		launch_kernel(&k)
 	case .MatMul:
-		a, ta := gemm_operand(u.src[0])
-		b, tb := gemm_operand(u.src[1])
-		n := len(u.shape)
-		M, N, K := u.shape[n - 2], u.shape[n - 1], u.src[0].shape[n - 1]
-		backend.matmul(u.data, a, b, int(numel(u.shape[:n - 2])), M, K, N, ta, tb)
+		g := gemm_from_node(s, u)
+		backend.matmul(&g)
 	case .Conv2d, .Conv2dBwdInput, .Conv2dBwdWeight, .MaxPool2d, .MaxPool2dBwd:
 		backend.sync() // CPU-only ops: inputs must be ready on the host
 		if backend.to_host != nil {
-			for x in u.src do backend.to_host(gemm_operand_data(x))
+			for x in u.src do backend.to_host(x.data)
 			backend.to_host(u.data)
 		}
 		run_cpu_node(u)
@@ -670,7 +886,6 @@ profile_host_wall :: proc(t0: time.Tick, kind: Kernel_Kind) {
 profile_kind :: proc(u: ^UOp) -> Kernel_Kind {
 	#partial switch u.op {
 	case .Sum, .ReduceMax: return .Reduce
-	case .Permute: return .Permute
 	case .MatMul: return .GEMM
 	}
 	return .Conv_Pool

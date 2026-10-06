@@ -8,6 +8,7 @@ package main
 //
 // Each case builds the same graph (same inputs) once per device, realizes it
 // (with backward where there are grads) and compares all outputs and grads.
+// The CPU also runs it with views copied (ML_VIEWS=0, the reference path).
 // On the GPU it runs twice: tensors on the heap (staged in and copied back)
 // and tensors in an ml.arena_init arena (device-visible memory, zero-copy).
 // Shapes are picked to hit each kernel variant: Metal's hardware 8×8 GEMM,
@@ -52,10 +53,25 @@ run :: proc(c: Case, dev: ml.Device, arena := false) -> (out: []f32, grads: [][]
 	for s, i in c.shapes do xs[i] = ml.randn(s, 0, 1, requires_grad = true)
 	y := c.build(xs)
 	ml.backward(ml.sum(ml.mul(y, ml.randn(y.shape, 0, 1))))
-	out = clone(y.data, heap)
+	out = clone(ml.realize(y).data, heap) // fused away or read in place: recomputed
 	grads = make([][]f32, len(xs), heap)
 	for x, i in xs do grads[i] = x.grad != nil ? clone(x.grad.data, heap) : nil
 	return
+}
+
+// Multi-head self-attention as in ml.attention_forward, weights as inputs:
+// x [B, T, D], then Wq, Wk, Wv, Wo [D, D].
+mha :: proc(x: []^ml.Tensor, H: i32) -> ^ml.Tensor {
+	B, T, D := x[0].shape[0], x[0].shape[1], x[0].shape[2]
+	dh := D / H
+	s := ml.scalar(1 / f32(math.sqrt(f64(D))))
+	heads :: proc(t: ^ml.Tensor, B, T, H, dh: i32) -> ^ml.Tensor { return ml.permute(ml.reshape(t, {B, T, H, dh}), {0, 2, 1, 3}) }
+	q := heads(ml.matmul(x[0], ml.mul(x[1], s)), B, T, H, dh)
+	k := heads(ml.matmul(x[0], ml.mul(x[2], s)), B, T, H, dh)
+	v := heads(ml.matmul(x[0], ml.mul(x[3], s)), B, T, H, dh)
+	att := ml.softmax(ml.mul(ml.matmul(q, ml.mT(k)), ml.scalar(1 / f32(math.sqrt(f64(dh))))), -1)
+	o := ml.reshape(ml.permute(ml.matmul(att, v), {0, 2, 1, 3}), {B, T, D})
+	return ml.matmul(o, ml.mul(x[4], s))
 }
 
 clone :: proc(s: []f32, allocator: mem.Allocator) -> []f32 {
@@ -65,11 +81,14 @@ clone :: proc(s: []f32, allocator: mem.Allocator) -> []f32 {
 }
 
 close :: proc(a, b: []f32) -> (ok: bool, worst: f32) {
-	if len(a) != len(b) do return false, math.inf_f32(1)
+	if len(a) != len(b) {
+		fmt.printfln("    length %d vs %d", len(a), len(b))
+		return false, math.inf_f32(1)
+	}
 	ok = true
 	for i in 0 ..< len(a) {
 		d := abs(a[i] - b[i])
-		if d > 1e-3 + 1e-3 * abs(b[i]) do ok = false
+		if d > 1e-3 + 1e-3 * abs(b[i]) || d != d do ok = false
 		worst = max(worst, d / (1e-3 + abs(b[i])))
 	}
 	return
@@ -77,6 +96,19 @@ close :: proc(a, b: []f32) -> (ok: bool, worst: f32) {
 
 check :: proc(c: Case) {
 	cpu_out, cpu_g := run(c, .CPU)
+	ml.view_reads = false
+	ref_out, ref_g := run(c, .CPU)
+	ml.view_reads = true
+	ok, worst := close(cpu_out, ref_out)
+	for g, i in ref_g do if g != nil {
+		gok, gw := close(cpu_g[i], g)
+		ok &&= gok
+		worst = max(worst, gw)
+	}
+	if !ok {
+		failed += 1
+		fmt.printfln("  FAIL  %-36s views (worst rel %.1e vs copies)", c.name, worst)
+	}
 	for arena in ([]bool{false, true}) {
 		gpu_out, gpu_g := run(c, gpu, arena)
 		ok, worst := close(gpu_out, cpu_out)
@@ -180,6 +212,26 @@ main :: proc() {
 			k = ml.permute(k, {0, 2, 1, 3})
 			att := ml.softmax(ml.mul(ml.matmul(q, ml.mT(k)), ml.scalar(0.35)), -1)
 			return ml.matmul(att, k)
+		}},
+		// views read in place (perf plan stage 5): strided GEMM operands, GEMMs
+		// storing into a permuted layout, permuted ewise / reduce inputs
+		{"views: mha tiny [8,6,32] h4", {{8, 6, 32}, {32, 32}, {32, 32}, {32, 32}, {32, 32}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			return mha(x, 4)
+		}},
+		{"views: mha hw   [4,40,128] h4", {{4, 40, 128}, {128, 128}, {128, 128}, {128, 128}, {128, 128}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			return mha(x, 4)
+		}},
+		{"views: permute -> ewise, reduce", {{6, 7, 8}, {8, 6, 7}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			p := ml.permute(x[0], {2, 0, 1}) // [8, 6, 7]
+			e := ml.exp(ml.mul(ml.add(p, x[1]), ml.scalar(0.3)))
+			return ml.add(ml.sum(ml.mul(p, p), 2), ml.sum(e, 2))
+		}},
+		{"views: reshape(permute) -> sum, mm", {{4, 5, 6}, {20, 3}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			t := ml.reshape(ml.permute(x[0], {2, 0, 1}), {6, 20})
+			return ml.add(ml.matmul(t, x[1]), ml.sum(t, 1))
+		}},
+		{"views: permuted sink + mT twice", {{3, 4, 5}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
+			return ml.permute(ml.mT(ml.mT(ml.exp(x[0]))), {1, 2, 0})
 		}},
 		{"cross_entropy [256,10]", {{256, 10}}, proc(x: []^ml.Tensor) -> ^ml.Tensor {
 			labels := make([]u8, 256)
