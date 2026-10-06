@@ -212,7 +212,7 @@ cpu_reduce_generic :: proc(k: ^Kernel, red: int) {
 				case .Log: vals[i] = math.ln(a)
 				case: vals[i] = fused_eval(n.op, a, b)
 				}
-			case .Reduce:
+			case .Reduce, .Acc: // Acc: GEMM epilogues run on GPU backends only
 			}
 		}
 	}

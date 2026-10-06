@@ -181,11 +181,12 @@ Render :: struct {
 	d:       GPU_Dialect,
 	k:       ^Kernel,
 	consts:  [MAX_KERNEL_NODES]int, // node → const index
+	pname:   string, // the parameter block (Metal: a pointer)
 }
 
 @(private = "file")
 P :: proc(r: ^Render, i: int) -> string {
-	return r.d == .Metal ? fmt.tprintf("p[%d]", i) : fmt.tprintf("p.v[%d]", i)
+	return r.d == .Metal ? fmt.tprintf("%s[%d]", r.pname, i) : fmt.tprintf("p.v[%d]", i)
 }
 
 @(private = "file")
@@ -239,9 +240,9 @@ emit_nodes :: proc(r: ^Render, from, to: int, variant: GPU_Variant, rr: string, 
 			if variant == .Elementwise && v.mode == .Generic {
 				B := LOAD_BASE + n.load * LOAD_WORDS
 				fmt.sbprintf(&r.b, "%suint g%d = %s; {{ uint rem = i;\n", indent, n.load, P(r, B))
+				dim := r.d == .Metal ? fmt.tprintf("%s[2 + d]", r.pname) : "p.v[2 + d]"
 				fmt.sbprintf(&r.b, "%s  for (int d = %d; d >= 0; d--) {{ uint c = rem %% %s; rem /= %s; g%d += c * %s; }} }}\n",
-					indent, k.nd - 1, fmt.tprintf(r.d == .Metal ? "p[2 + d]" : "p.v[2 + d]"), fmt.tprintf(r.d == .Metal ? "p[2 + d]" : "p.v[2 + d]"),
-					n.load, fmt.tprintf(r.d == .Metal ? "p[%d + d]" : "p.v[%d + d]", B + 3))
+					indent, k.nd - 1, dim, dim, n.load, r.d == .Metal ? fmt.tprintf("%s[%d + d]", r.pname, B + 3) : fmt.tprintf("p.v[%d + d]", B + 3))
 			}
 			fmt.sbprintf(&r.b, "%sfloat v%d = b%d[%s];\n", indent, i, v.buf, load_index(r, n.load, variant, rr))
 		case .Const:
@@ -250,6 +251,8 @@ emit_nodes :: proc(r: ^Render, from, to: int, variant: GPU_Variant, rr: string, 
 		case .ALU:
 			a, b := fmt.tprintf("v%d", n.a), fmt.tprintf("v%d", n.b)
 			fmt.sbprintf(&r.b, "%sfloat v%d = %s;\n", indent, i, alu(r, n.op, a, b))
+		case .Acc:
+			fmt.sbprintf(&r.b, "%sfloat v%d = acc;\n", indent, i)
 		case .Reduce:
 		}
 	}
@@ -269,7 +272,7 @@ reduce_combine :: proc(op: Op, acc, v: string) -> string {
 
 // Source of k under a plan variant; the entry point is "k_main".
 gpu_source :: proc(k: ^Kernel, variant: GPU_Variant, d: GPU_Dialect) -> string {
-	r := Render{b = strings.builder_make(context.temp_allocator), d = d, k = k}
+	r := Render{b = strings.builder_make(context.temp_allocator), d = d, k = k, pname = "p"}
 	c := 0
 	for n, i in k.nodes[:k.n_nodes] do if n.kind == .Const {
 		r.consts[i] = c
@@ -355,4 +358,34 @@ gpu_source :: proc(k: ^Kernel, variant: GPU_Variant, d: GPU_Dialect) -> string {
 	}
 	strings.write_string(b, "}\n")
 	return strings.to_string(r.b)
+}
+
+// A GEMM epilogue (Metal): k is elementwise over the GEMM's output, its .Acc
+// nodes the accumulator. Returns the function
+//   inline void epi(uint i, float acc, <k's buffers>, constant uint* ep)
+// (i: the output element), the kernel parameters for those buffers (slots
+// first_slot.., the block at ep_slot) and the call's argument list.
+gpu_epilogue_metal :: proc(k: ^Kernel, first_slot, ep_slot: int) -> (fn, params, args: string) {
+	r := Render{b = strings.builder_make(context.temp_allocator), d = .Metal, k = k, pname = "ep"}
+	c := 0
+	for n, i in k.nodes[:k.n_nodes] do if n.kind == .Const {
+		r.consts[i] = c
+		c += 1
+	}
+	pb := strings.builder_make(context.temp_allocator)
+	ab := strings.builder_make(context.temp_allocator)
+	strings.write_string(&r.b, "inline void epi(uint i, float acc")
+	for j in 0 ..< k.n_bufs {
+		cst := j < k.n_in ? "const " : ""
+		fmt.sbprintf(&r.b, ", device %sfloat* b%d", cst, j)
+		fmt.sbprintf(&pb, "device %sfloat* b%d [[buffer(%d)]], ", cst, j, first_slot + j)
+		fmt.sbprintf(&ab, "b%d, ", j)
+	}
+	strings.write_string(&r.b, ", constant uint* ep) {\n")
+	fmt.sbprintf(&pb, "constant uint* ep [[buffer(%d)]], ", ep_slot)
+	strings.write_string(&ab, "ep")
+	emit_nodes(&r, 0, k.n_nodes, .Elementwise, "", "    ")
+	for s in k.stores[:k.n_stores] do fmt.sbprintf(&r.b, "    b%d[i] = v%d;\n", s.buf, s.node)
+	strings.write_string(&r.b, "}\n")
+	return strings.to_string(r.b), strings.to_string(pb), strings.to_string(ab)
 }

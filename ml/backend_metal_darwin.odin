@@ -85,6 +85,9 @@ metal_concurrent := true
 // CPU keeps encoding. Same queue + tracked buffers keep them in order.
 @(private = "file")
 COMMIT_EVERY :: 128
+// The first commit comes early, so the GPU starts while the rest is encoded.
+@(private = "file")
+COMMIT_FIRST :: 16
 
 metal_ctx: Metal_Context
 
@@ -116,13 +119,14 @@ metal_backend :: proc() -> (Backend, bool) {
 		allocator = metal_allocator,
 		kernel    = metal_kernel,
 		matmul    = metal_matmul,
+		matmul_epi = metal_matmul_epi,
 		sync      = metal_sync,
 	}, true
 }
 
 // ---- compile --------------------------------------------------------------
 
-@(private = "file")
+@(private)
 metal_compile :: proc(source, fn_name: string) -> ^MTL.ComputePipelineState {
 	ns_source := NS.String_alloc()->initWithOdinString(source)
 	defer ns_source->release()
@@ -327,10 +331,10 @@ barrier_if_needed :: proc(enc: ^MTL.ComputeCommandEncoder, bufs: []Dev_Ref, n_in
 
 // n_in: bufs[:n_in] are read, the rest written (for the barriers).
 @(private)
-dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32, grid: [3]int, group: [3]int, n_in: int, label := "") {
+dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32, grid: [3]int, group: [3]int, n_in: int, label := "", params2: []u32 = nil) {
 	enc := encoder()
 	metal_ctx.n_dispatch += 1
-	if metal_ctx.n_dispatch % COMMIT_EVERY == 0 && !kernel_timing() {
+	if (metal_ctx.n_dispatch == COMMIT_FIRST || metal_ctx.n_dispatch % COMMIT_EVERY == 0) && !kernel_timing() {
 		MTL.CommandEncoder_endEncoding(enc)
 		MTL.CommandBuffer_commit(metal_ctx.cmd)
 		append(&metal_ctx.in_flight, metal_ctx.cmd)
@@ -342,6 +346,7 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 	MTL.ComputeCommandEncoder_setComputePipelineState(enc, pso)
 	for r, i in bufs do if r.buf != nil do MTL.ComputeCommandEncoder_setBuffer(enc, r.buf, NS.UInteger(r.off), NS.UInteger(i))
 	MTL.ComputeCommandEncoder_setBytes(enc, ([^]byte)(raw_data(params))[:len(params) * 4], 30)
+	if params2 != nil do MTL.ComputeCommandEncoder_setBytes(enc, ([^]byte)(raw_data(params2))[:len(params2) * 4], 29)
 	MTL.ComputeCommandEncoder_dispatchThreads(
 		enc,
 		{NS.Integer(grid[0]), NS.Integer(grid[1]), NS.Integer(grid[2])},

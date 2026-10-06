@@ -58,6 +58,7 @@ K_Kind :: enum u8 {
 	Const,
 	ALU,
 	Reduce,
+	Acc, // a GEMM epilogue's input: the accumulator of the output element
 }
 
 K_Node :: struct {
@@ -295,7 +296,9 @@ dense_strides :: proc(dims: []int) -> (st: [MAX_DIMS]int) {
 
 // A fused elementwise group → one kernel. false: over the budget (the caller
 // runs the nodes one by one).
-kernel_from_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil) -> (k: Kernel, ok: bool) {
+// acc: a MatMul whose output (read directly or through dense views) becomes
+// .Acc nodes — the kernel is that GEMM's epilogue.
+kernel_from_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil, acc: ^UOp = nil) -> (k: Kernel, ok: bool) {
 	if len(group) > MAX_FUSED_INSNS do return
 	out := group[len(group) - 1].shape
 	k.nd = len(out)
@@ -313,6 +316,10 @@ kernel_from_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil) ->
 				node_of[x] = kernel_add_node(&k, K_Node{kind = .Const, value = x.arg.(f32)})
 				continue
 			}
+			if acc != nil && (x == acc || views != nil && x in views^ && views[x].base == acc) {
+				node_of[x] = kernel_add_node(&k, K_Node{kind = .Acc})
+				continue
+			}
 			data, vst := src_view(views, x)
 			st := broadcast_view(x.shape, vst, k.nd)
 			node_of[x] = kernel_add_load(&k, data, st[:k.nd])
@@ -325,7 +332,7 @@ kernel_from_group :: proc(group, stores: []^UOp, views: ^map[^UOp]View = nil) ->
 	}
 	if k.n_bufs + len(stores) > MAX_FUSED_BUFS do return
 	for u in stores {
-		alloc_out(u)
+		if u.data == nil do alloc_out(u) // (a GEMM epilogue that fell back builds twice)
 		k.stores[k.n_stores] = K_Store{node = node_of[u], buf = kernel_add_buf(&k, u.data, false)}
 		k.n_stores += 1
 	}

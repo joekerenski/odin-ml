@@ -36,6 +36,9 @@ Backend :: struct {
 	allocator: proc() -> mem.Allocator,
 	kernel:    proc(k: ^Kernel), // any kernel of the IR (kernel_ir.odin)
 	matmul:    proc(g: ^Gemm), // strided operands (kernel_ir.odin)
+	// optional: the GEMM with an elementwise epilogue k (its .Acc nodes: the
+	// result; C unused). false: can't, the caller runs them separately.
+	matmul_epi: proc(g: ^Gemm, k: ^Kernel) -> bool,
 	sync:      proc(),
 	// optional: move a buffer's pages to the host before CPU code touches it
 	// (CUDA managed memory; one bulk migration instead of a fault per page)

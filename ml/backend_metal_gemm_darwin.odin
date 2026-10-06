@@ -53,18 +53,50 @@ decode_choice :: proc(v: int) -> Gemm_Choice { return {v / 1000, v % 1000} }
 // unit-stride axis), zero-padding the edges; each SIMD group then multiplies
 // its (BM/2) × (BN/2) corner as 8×8 tiles. C goes out through threadgroup
 // memory, so edges and any C layout are written with plain bounds checks.
+// epi: an epilogue kernel (gpu_epilogue_metal) applied to each element of C
+// instead of storing it; nil: plain.
 @(private = "file")
-gemm_source :: proc(bm, bn: int, direct: bool) -> string {
-	src := strings.concatenate({"#include <metal_stdlib>\nusing namespace metal;\n", GEMM_P, direct ? GEMM_DIRECT_TEMPLATE : GEMM_TEMPLATE}, context.temp_allocator)
+gemm_source :: proc(bm, bn: int, direct: bool, epi: ^Kernel = nil) -> string {
+	fn, params, args: string
+	if epi != nil do fn, params, args = gpu_epilogue_metal(epi, GEMM_EPI_SLOT, 29)
+	src := strings.concatenate({"#include <metal_stdlib>\nusing namespace metal;\n", GEMM_P, "\n", fn, direct ? GEMM_DIRECT_TEMPLATE : GEMM_TEMPLATE}, context.temp_allocator)
+	store := "c[(i0 + r) * p.c_rs + (j0 + q) * p.c_cs] = sh[r * BN + q];"
+	direct_out := `for (uint r = 0; r < TM; r++) for (uint q = 0; q < TN; q++) {
+        uint i = i0 + 8 * r, j = j0 + 8 * q;
+        if (i >= M || j >= N) continue;
+        if (tc) simdgroup_store(acc[r][q], c, ldc, ulong2(i, j), true);
+        else simdgroup_store(acc[r][q], c, ldc, ulong2(j, i), false);
+    }`
+	if epi != nil {
+		store = fmt.tprintf("epi((tg.z * M + i0 + r) * N + j0 + q, sh[r * BN + q], %s);", args)
+		// through threadgroup memory: each element's index for the epilogue
+		direct_out = fmt.tprintf(`threadgroup float sh[BM * BN];
+    uint ti = tg.y * BM, tj = tg.x * BN;
+    for (uint r = 0; r < TM; r++) for (uint q = 0; q < TN; q++)
+        simdgroup_store(acc[r][q], &sh[(i0 - ti + 8 * r) * BN + j0 - tj + 8 * q], BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < BM * BN; e += 128) {{
+        uint r = e / BN, q = e %% BN;
+        if (ti + r < M && tj + q < N) epi((tg.z * M + ti + r) * N + tj + q, sh[e], %s);
+    }}`, args)
+	}
+	src, _ = strings.replace_all(src, "@EPI_PARAMS@", params, context.temp_allocator)
+	src, _ = strings.replace_all(src, "@STORE@", store, context.temp_allocator)
+	src, _ = strings.replace_all(src, "@DIRECT_OUT@", direct_out, context.temp_allocator)
 	src, _ = strings.replace_all(src, "@BM@", fmt.tprint(bm), context.temp_allocator)
 	src, _ = strings.replace_all(src, "@BN@", fmt.tprint(bn), context.temp_allocator)
 	return src
 }
 
+// Epilogue buffers bind from this slot (0-2: A, B, C; 29: the epilogue's
+// parameters, 30: the GEMM's).
+@(private = "file")
+GEMM_EPI_SLOT :: 3
+
 @(private = "file")
 GEMM_TEMPLATE :: `
 kernel void gemm_@BM@x@BN@(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
-                      device float* C [[buffer(2)]], constant Gemm_P& p [[buffer(30)]],
+                      device float* C [[buffer(2)]], constant Gemm_P& p [[buffer(30)]], @EPI_PARAMS@
                       uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint BM = @BM@, BN = @BN@, BK = 32, TM = BM / 16, TN = BN / 16;
@@ -108,7 +140,7 @@ kernel void gemm_@BM@x@BN@(device const float* A [[buffer(0)]], device const flo
     bool tc = p.c_cs != 1;
     for (uint e = tid; e < BM * BN; e += 128) {
         uint r = tc ? e % BM : e / BN, q = tc ? e / BM : e % BN;
-        if (i0 + r < M && j0 + q < N) c[(i0 + r) * p.c_rs + (j0 + q) * p.c_cs] = sh[r * BN + q];
+        if (i0 + r < M && j0 + q < N) @STORE@
     }
 }
 `
@@ -120,8 +152,9 @@ kernel void gemm_@BM@x@BN@(device const float* A [[buffer(0)]], device const flo
 @(private = "file")
 GEMM_DIRECT_TEMPLATE :: `
 kernel void gemmd_@BM@x@BN@(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
-                      device float* C [[buffer(2)]], constant Gemm_P& p [[buffer(30)]],
-                      uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]]) {
+                      device float* C [[buffer(2)]], constant Gemm_P& p [[buffer(30)]], @EPI_PARAMS@
+                      uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint BM = @BM@, BN = @BN@, TM = BM / 16, TN = BN / 16;
     uint M = p.M, K = p.K, N = p.N, kc = p.kc;
     bool ta = p.a_cs != 1, tb = p.b_cs != 1, tc = p.c_cs != 1;
@@ -148,12 +181,7 @@ kernel void gemmd_@BM@x@BN@(device const float* A [[buffer(0)]], device const fl
         }
         for (uint r = 0; r < TM; r++) for (uint q = 0; q < TN; q++) simdgroup_multiply_accumulate(acc[r][q], am[r], bm[q], acc[r][q]);
     }
-    for (uint r = 0; r < TM; r++) for (uint q = 0; q < TN; q++) {
-        uint i = i0 + 8 * r, j = j0 + 8 * q;
-        if (i >= M || j >= N) continue;
-        if (tc) simdgroup_store(acc[r][q], c, ldc, ulong2(i, j), true);
-        else simdgroup_store(acc[r][q], c, ldc, ulong2(j, i), false);
-    }
+    @DIRECT_OUT@
 }
 `
 
@@ -213,8 +241,7 @@ gemm_candidates :: proc(g: ^Gemm, out: ^[dynamic]Gemm_Choice) {
 	Z := g.Z0 * g.Z1
 	if g.M <= 32 && g.N <= 32 && g.K <= 256 do append(out, Gemm_Choice{GEMM_SMALL, 1})
 	c_dense := g.c.cs == 1 && (g.M == 1 || g.c.rs == g.N)
-	unit :: proc(o: Gemm_Operand) -> bool { return o.rs == 1 || o.cs == 1 }
-	direct := g.M % 8 == 0 && g.N % 8 == 0 && g.K % 8 == 0 && unit(g.a) && unit(g.b) && unit(g.c)
+	direct := gemm_direct_ok(g)
 	for t in 0 ..< 2 * len(GEMM_TILES) {
 		if t >= GEMM_DIRECT && !direct do break
 		append(out, Gemm_Choice{t, 1})
@@ -223,6 +250,13 @@ gemm_candidates :: proc(g: ^Gemm, out: ^[dynamic]Gemm_Choice) {
 			for s := 2; s <= 64 && g.K / s >= 64; s *= 2 do append(out, Gemm_Choice{t, s})
 		}
 	}
+}
+
+// The direct kernels need whole 8×8 fragments and a unit stride per operand.
+@(private = "file")
+gemm_direct_ok :: proc(g: ^Gemm) -> bool {
+	unit :: proc(o: Gemm_Operand) -> bool { return o.rs == 1 || o.cs == 1 }
+	return g.M % 8 == 0 && g.N % 8 == 0 && g.K % 8 == 0 && unit(g.a) && unit(g.b) && unit(g.c)
 }
 
 // Without a search: what the backend did before searching existed.
@@ -344,4 +378,44 @@ encode_one :: proc(enc: ^MTL.ComputeCommandEncoder, pso: ^MTL.ComputePipelineSta
 	MTL.ComputeCommandEncoder_dispatchThreads(enc,
 		{NS.Integer(grid[0]), NS.Integer(grid[1]), NS.Integer(grid[2])},
 		{NS.Integer(group[0]), NS.Integer(group[1]), NS.Integer(group[2])})
+}
+
+// GEMM + elementwise epilogue in one kernel: C is never stored, each element
+// goes through k. Tiled kernels only (not the tiny one, not split-K).
+metal_matmul_epi :: proc(g: ^Gemm, k: ^Kernel) -> bool {
+	if GEMM_EPI_SLOT + k.n_bufs > 29 do return false
+	key := gemm_key(g)
+	ch: Gemm_Choice
+	if gemm_force >= 0 {
+		ch = {gemm_force % (GEMM_SMALL + 1), 1}
+		if ch.tile == GEMM_SMALL || ch.tile >= GEMM_DIRECT && !gemm_direct_ok(g) do return false
+	} else if v, ok := choice_get(key); ok {
+		ch = decode_choice(v)
+	} else if search_enabled {
+		ch = gemm_search(g)
+		choice_put(key, encode_choice(ch))
+	} else {
+		ch = gemm_default(g)
+	}
+	if ch.tile == GEMM_SMALL || ch.splits > 1 do return false
+	@(static) psos: map[u64]^MTL.ComputePipelineState
+	if psos == nil do psos = make(map[u64]^MTL.ComputePipelineState, scratch())
+	h := kernel_hash(k, 1000 + ch.tile)
+	pso, ok := psos[h]
+	if !ok {
+		t := GEMM_TILES[ch.tile % GEMM_DIRECT]
+		pso = metal_compile(gemm_source(t[0], t[1], ch.tile >= GEMM_DIRECT, k), gemm_name(ch.tile))
+		psos[h] = pso
+	}
+	l := gemm_launch(g, ch)
+	bufs: [GEMM_EPI_SLOT + MAX_KERNEL_BUFS]Dev_Ref
+	bufs[0], bufs[1] = resolve(g.a.data), resolve(g.b.data)
+	bufs[2] = bufs[0] // C is not used
+	for j in 0 ..< k.n_bufs do bufs[GEMM_EPI_SLOT + j] = resolve(k.bufs[j], output = j >= k.n_in)
+	ep: [GPU_PARAMS]u32
+	n := gpu_params(k, &ep)
+	label := ""
+	if kernel_timing() do label = fmt.tprintf("%s+epi %dx%dx%d b%d %s", gemm_name(ch.tile), g.M, g.K, g.N, g.Z0 * g.Z1, kernel_describe(k))
+	dispatch(pso, bufs[:GEMM_EPI_SLOT + k.n_bufs], l.params[:], l.grid, l.group, GEMM_EPI_SLOT + k.n_in, label, ep[:n])
+	return true
 }
