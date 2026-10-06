@@ -40,6 +40,7 @@ Sched_Record :: struct {
 	dead:       [dynamic]Ref,
 	consumers:  [dynamic][2]Ref, // node, count
 	order:      [dynamic]Ref,
+	epilogue:   [dynamic][2]Ref, // group root, MatMul
 }
 
 @(private)
@@ -66,10 +67,10 @@ Rec_Clone :: struct {
 	srcs: []Ref,
 }
 
-// Positions of this schedule's nodes: topo index, leaves by first use.
+// Positions of this schedule's nodes: topo index and leaf numbers live on the
+// nodes (UOp.pos); the leaves in order, and clones when recording.
 @(private)
 Sched_Index :: struct {
-	of:     map[^UOp]Ref,
 	leaves: [dynamic]^UOp,
 	clones: map[^UOp]Ref,
 }
@@ -83,10 +84,8 @@ SCHED_RECORDS_MAX :: 8
 // The structure key of s (and the index that maps nodes to positions).
 @(private)
 sched_key :: proc(s: ^Schedule, ix: ^Sched_Index) -> []u8 {
-	ix.of = make(map[^UOp]Ref, len(s.topo), scratch())
 	ix.leaves = make([dynamic]^UOp, scratch())
 	ix.clones = make(map[^UOp]Ref, scratch())
-	for u, i in s.topo do ix.of[u] = Ref(i)
 	key := make([dynamic]u8, 0, 64 * len(s.topo), scratch())
 	put :: proc(key: ^[dynamic]u8, v: int) {
 		x := u32(v)
@@ -111,13 +110,13 @@ sched_key :: proc(s: ^Schedule, ix: ^Sched_Index) -> []u8 {
 		put(&key, int(u.internal) | int(u in s.sinks) << 1)
 		put(&key, len(u.src))
 		for x in u.src {
-			if r, ok := ix.of[x]; ok {
-				put(&key, int(r))
+			if x.pos != LEAF_UNNUMBERED {
+				put(&key, int(x.pos))
 				continue
 			}
-			ix.of[x] = Ref(-len(ix.leaves) - 1)
+			x.pos = Ref(-len(ix.leaves) - 1)
 			append(&ix.leaves, x)
-			put(&key, int(ix.of[x]))
+			put(&key, int(x.pos))
 			put(&key, int(x.op))
 			put(&key, len(x.shape))
 			for d in x.shape do put(&key, int(d))
@@ -128,7 +127,6 @@ sched_key :: proc(s: ^Schedule, ix: ^Sched_Index) -> []u8 {
 
 @(private)
 sched_index_destroy :: proc(ix: ^Sched_Index) {
-	delete(ix.of)
 	delete(ix.leaves)
 	delete(ix.clones)
 }
@@ -151,9 +149,8 @@ sched_record :: proc(s: ^Schedule, ix: ^Sched_Index, key: []u8, members: ^map[^U
 	for c, i in s.clones do ix.clones[c] = REF_CLONE + Ref(i)
 	ref :: proc(ix: ^Sched_Index, x: ^UOp) -> Ref {
 		if r, ok := ix.clones[x]; ok do return r
-		r, ok := ix.of[x]
-		assert(ok, "sched_record: node outside the schedule")
-		return r
+		assert(x.epoch == sched_epoch && x.pos != LEAF_UNNUMBERED, "sched_record: node outside the schedule")
+		return x.pos
 	}
 	r.views = make([dynamic]Rec_View, a)
 	for u, v in s.views do append(&r.views, Rec_View{ref(ix, u), ref(ix, v.base), v.st})
@@ -182,12 +179,14 @@ sched_record :: proc(s: ^Schedule, ix: ^Sched_Index, key: []u8, members: ^map[^U
 	r.consumers = make([dynamic][2]Ref, a)
 	for u, n in s.consumers {
 		x, ok := ix.clones[u]
-		if !ok do x, ok = ix.of[u]
-		if !ok || x < 0 do continue // leaves are never tracked
+		if !ok && in_topo(u) do x, ok = u.pos, true
+		if !ok do continue // leaves are never tracked
 		append(&r.consumers, [2]Ref{x, Ref(n)})
 	}
 	r.order = make([dynamic]Ref, a)
 	for u in s.order do append(&r.order, ref(ix, u))
+	r.epilogue = make([dynamic][2]Ref, a)
+	for G, m in s.epilogue do append(&r.epilogue, [2]Ref{ref(ix, G), ref(ix, m)})
 	if len(sched_records) == SCHED_RECORDS_MAX {
 		sched_record_free(sched_records[0])
 		ordered_remove(&sched_records, 0)
@@ -212,6 +211,7 @@ sched_record_free :: proc(r: ^Sched_Record) {
 	delete(r.dead)
 	delete(r.consumers)
 	delete(r.order)
+	delete(r.epilogue)
 	free(r, a)
 }
 
@@ -254,4 +254,9 @@ sched_replay :: proc(s: ^Schedule, ix: ^Sched_Index, r: ^Sched_Record, members: 
 	clear(&s.consumers)
 	for p in r.consumers do s.consumers[node(s, ix, clones, p[0])] = int(p[1])
 	for x in r.order do append(&s.order, node(s, ix, clones, x))
+	for p in r.epilogue {
+		G, m := node(s, ix, clones, p[0]), node(s, ix, clones, p[1])
+		s.epilogue[G] = m
+		s.epi_gemm[m] = G
+	}
 }

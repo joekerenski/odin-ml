@@ -48,6 +48,8 @@ Schedule :: struct {
 	views:       map[^UOp]View, // Permutes / Reshapes read in place (no buffer)
 	alias:       map[^UOp]^UOp, // view nodes that are their base's buffer as is
 	store_into:  map[^UOp]Store_Into, // MatMuls writing straight into a view node's buffer
+	epilogue:    map[^UOp]^UOp, // group root → the MatMul it is the epilogue of
+	epi_gemm:    map[^UOp]^UOp, // that MatMul → its epilogue group's root
 	uf:          map[^UOp]^UOp, // fusion groups (union-find over ewise nodes)
 	order:       [dynamic]^UOp, // what the run loop visits: views, nodes, groups' last members
 	clones:      [dynamic]^UOp, // nodes rematerialization added (remat.odin)
@@ -90,6 +92,8 @@ schedule_make :: proc() -> (s: Schedule) {
 	s.views = make(map[^UOp]View, scratch())
 	s.alias = make(map[^UOp]^UOp, scratch())
 	s.store_into = make(map[^UOp]Store_Into, scratch())
+	s.epilogue = make(map[^UOp]^UOp, scratch())
+	s.epi_gemm = make(map[^UOp]^UOp, scratch())
 	s.uf = make(map[^UOp]^UOp, scratch())
 	s.clones = make([dynamic]^UOp, scratch())
 	s.order = make([dynamic]^UOp, scratch())
@@ -111,6 +115,8 @@ schedule_destroy :: proc(s: ^Schedule) {
 	delete(s.views)
 	delete(s.alias)
 	delete(s.store_into)
+	delete(s.epilogue)
+	delete(s.epi_gemm)
 	delete(s.uf)
 	delete(s.order)
 	free_clones(s)
@@ -169,12 +175,29 @@ release_srcs :: proc(s: ^Schedule, u: ^UOp) {
 }
 
 // Post-order over unrealized nodes; realized nodes are leaves of the schedule.
-schedule_visit :: proc(s: ^Schedule, u: ^UOp, visited: ^map[^UOp]bool) {
-	if u in visited^ do return
-	visited^[u] = true
-	if u.data != nil do return
-	for x in u.src do schedule_visit(s, x, visited)
+schedule_visit :: proc(s: ^Schedule, u: ^UOp) {
+	if u.epoch == sched_epoch do return
+	u.epoch = sched_epoch
+	if u.data != nil {
+		u.pos = LEAF_UNNUMBERED
+		return
+	}
+	for x in u.src do schedule_visit(s, x)
+	u.pos = i32(len(s.topo))
 	append(&s.topo, u)
+}
+
+// Bumped per realize: UOp.epoch == sched_epoch marks this realize's nodes.
+@(private)
+sched_epoch: u32
+
+@(private)
+LEAF_UNNUMBERED :: max(i32)
+
+// Is x a node this realize schedules (unrealized, in s.topo)?
+@(private)
+in_topo :: #force_inline proc(x: ^UOp) -> bool {
+	return x.epoch == sched_epoch && x.pos >= 0 && x.pos != LEAF_UNNUMBERED
 }
 
 uf_find :: proc(uf: ^map[^UOp]^UOp, x: ^UOp) -> ^UOp {
@@ -190,10 +213,9 @@ realize_all :: proc(sinks: []^UOp) {
 	s := schedule_make()
 	defer schedule_destroy(&s)
 
-	visited := make(map[^UOp]bool, scratch())
-	defer delete(visited)
+	sched_epoch += 1
 	for u in sinks {
-		schedule_visit(&s, u, &visited)
+		schedule_visit(&s, u)
 		s.sinks[u] = true
 	}
 	if len(s.topo) == 0 do return
@@ -203,14 +225,6 @@ realize_all :: proc(sinks: []^UOp) {
 	step_start: time.Tick
 	if debug_level >= 1 do step_start = time.tick_now()
 	k0 := counters.kernels
-
-	// consumers (each consumer counted once per distinct src)
-	for u in s.topo {
-		for x, i in u.src {
-			if x.data != nil || src_seen_before(u, i) do continue
-			s.consumers[x] += 1
-		}
-	}
 
 	// members of each group in topo order; the last member runs the group
 	members := make(map[^UOp][dynamic]^UOp, scratch())
@@ -233,6 +247,13 @@ realize_all :: proc(sinks: []^UOp) {
 	if rec != nil {
 		sched_replay(&s, &ix, rec, &members)
 	} else {
+		// consumers (each consumer counted once per distinct src)
+		for u in s.topo {
+			for x, i in u.src {
+				if x.data != nil || src_seen_before(u, i) do continue
+				s.consumers[x] += 1
+			}
+		}
 		plan_views(&s)
 		fuse_groups(&s)
 		for u in s.topo {
@@ -246,6 +267,7 @@ realize_all :: proc(sinks: []^UOp) {
 			append(m, u)
 		}
 		if remat_mode == .On || remat_mode == .Auto && backend.device != .CPU do remat(&s, &members)
+		plan_epilogues(&s, &members)
 		delete(s.order)
 		s.order = run_order(&s, &members, backend.device == .Metal && metal_concurrent)
 		if sched_cache_enabled do sched_record(&s, &ix, key, &members)
@@ -256,6 +278,7 @@ realize_all :: proc(sinks: []^UOp) {
 	current_pool = &s.pool
 	defer current_pool = nil
 	for u in s.order {
+		if u in s.epi_gemm do continue // runs with its epilogue group
 		if u.op == .Permute || u.op == .Reshape {
 			run_view(&s, u)
 			track_buffer(&s, u)
@@ -268,6 +291,10 @@ realize_all :: proc(sinks: []^UOp) {
 			run_group(&s, group)
 			for v in group do if v.data != nil do track_buffer(&s, v)
 			for v in group do release_srcs(&s, v)
+			if m, ok := s.epilogue[uf_find(&s.uf, u)]; ok {
+				if m.data != nil do track_buffer(&s, m)
+				release_srcs(&s, m)
+			}
 			continue
 		}
 		run_node(&s, u)
@@ -279,6 +306,47 @@ realize_all :: proc(sinks: []^UOp) {
 	if debug_level == 1 {
 		ms := f64(time.tick_since(step_start)) / 1e6
 		fmt.printfln("  realize: %d kernels  %.3f ms (schedule %.3f ms)", counters.kernels - k0, ms, sched_ms)
+	}
+}
+
+// ---- GEMM epilogues ----------------------------------------------------------------
+//
+// A MatMul whose result only one elementwise group reads — directly or through
+// dense views (same element order) — runs as one kernel with that group as its
+// epilogue (backend.matmul_epi), at the group's turn: the result is never
+// stored. Typical: the bias add after a projection, a grad added to another.
+@(private)
+plan_epilogues :: proc(s: ^Schedule, members: ^map[^UOp][dynamic]^UOp) {
+	if backend.matmul_epi == nil do return
+	reader := make(map[^UOp]^UOp, scratch()) // some consumer of each node
+	defer delete(reader)
+	for c in s.topo do if !(c in s.dead) do for x in c.src do reader[x] = c
+	for c in s.clones do if !(c in s.dead) do for x in c.src do reader[x] = c
+	for m in s.topo {
+		if m.op != .MatMul || m in s.dead || m in s.sinks || m in s.store_into || s.consumers[m] != 1 do continue
+		// through single-reader dense views of m
+		x := m
+		c := reader[m]
+		for ((c.op == .Permute || c.op == .Reshape) && c in s.views && s.consumers[x] == 1) {
+			v := s.views[c]
+			if v.base != m || c in s.sinks || !strides_dense(c.shape, v.st) do break
+			x = c
+			c = reader[c]
+			if c == nil do break
+		}
+		if c == nil || !(c in s.uf) do continue
+		G := uf_find(&s.uf, c)
+		if G in s.epilogue do continue
+		group := members[G][:]
+		ok := numel(group[len(group) - 1].shape) == numel(m.shape)
+		inside := 0
+		for v in group {
+			if v.op == .Sum || v.op == .ReduceMax do ok = false
+			for y, i in v.src do if y == x && !src_seen_before(v, i) do inside += 1
+		}
+		if !ok || inside != s.consumers[x] do continue
+		s.epilogue[G] = m
+		s.epi_gemm[m] = G
 	}
 }
 
@@ -297,7 +365,7 @@ run_order :: proc(s: ^Schedule, members: ^map[^UOp][dynamic]^UOp, by_level: bool
 		return u
 	}
 	for u in s.topo {
-		if u in s.dead do continue
+		if u in s.dead || u in s.epi_gemm do continue
 		if u in s.uf {
 			g := members[uf_find(&s.uf, u)]
 			if g[len(g) - 1] != u do continue
@@ -324,6 +392,10 @@ run_order :: proc(s: ^Schedule, members: ^map[^UOp][dynamic]^UOp, by_level: bool
 			if x.data != nil do continue
 			ux := unit(s, x)
 			if ux != me do lv = max(lv, level[ux])
+		}
+		if m, ok := s.epilogue[me]; ok do for x in m.src { // the GEMM runs with this group
+			if x.data != nil do continue
+			lv = max(lv, level[unit(s, x)])
 		}
 		kernel := !((t.op == .Permute || t.op == .Reshape) && (t in s.views || t in s.alias || t in stored))
 		level[me] = lv + (kernel ? 1 : 0)
@@ -866,6 +938,27 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 	for u in group do if u.op == .Sum || u.op == .ReduceMax {
 		run_reduce_group(s, group, stores[:], t0)
 		return
+	}
+	if m, ok := s.epilogue[uf_find(&s.uf, group[0])]; ok {
+		profile_open(.GEMM, node_bytes(m) + fused_bytes(group, stores[:]), node_flops(m), len(group))
+		g := gemm_from_node(s, m) // C unused
+		if k, kok := kernel_from_group(group, stores[:], &s.views, m); kok {
+			if kernel_timing() do k.label = kernel_describe(&k)
+			if backend.matmul_epi(&g, &k) {
+				profile_host_wall(t0, .GEMM)
+				counters.kernels += 1
+				counters.fused_ops += len(group)
+				return
+			}
+		}
+		// the backend can't: the GEMM into its own buffer, then the group as usual
+		if profiling do pop(&profile_stats)
+		profile_open(.GEMM, node_bytes(m), node_flops(m))
+		alloc_out(m)
+		g = gemm_from_node(s, m)
+		backend.matmul(&g)
+		profile_host_wall(t0, .GEMM)
+		counters.kernels += 1
 	}
 	profile_open(.Fused, fused_bytes(group, stores[:]), i64(numel(group[len(group) - 1].shape)) * i64(len(group)), len(group))
 	if k, ok := kernel_from_group(group, stores[:], &s.views); ok {

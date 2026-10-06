@@ -83,6 +83,10 @@ UOp :: struct {
 	grad:          ^UOp, // leaves only, filled by backward()
 	internal:      bool, // built by backward(): nobody outside holds it, so its
 	                     // buffer can be reused once its readers ran
+	// scheduler scratch, valid while epoch is the current realize's: topo
+	// position (≥ 0), leaf number -(k + 1), or LEAF_UNNUMBERED
+	epoch:         u32,
+	pos:           i32,
 }
 
 // Set while backward() builds the grad graph: new nodes are internal.

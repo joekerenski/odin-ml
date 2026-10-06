@@ -118,7 +118,8 @@ Oracle and bar: tinygrad on the same step (dt/tinygrad), default and BEAM=2.
 Workload: one M4 training step, ~9.3 GFLOP, ~400 MB of activation traffic.
 - M5 (10-core GPU): measured 126 GB/s (spec 153); our fp32 GEMM 2.0 TFLOPS
   (fp32 shader peak est. ~4–4.5). Floor ~6–8 ms/step.
-  Now 28.5 ms. Target ≤ 15 ms (tinygrad BEAM 16.6); stretch ~8 ms.
+  Was 28.5 ms; now ~15.4 ms (PR 9). Target ≤ 15 ms (tinygrad BEAM 16.6);
+  stretch ~8 ms.
 - RTX 4090: 82.6 TFLOPS fp32, 1008 GB/s. Floor ~1.5–2.5 ms/step, set by kernel
   count × launch cost. Now 13 ms. Target < 6 ms; stretch ~2 ms.
 - Kernels per step 1484 → ~600.
@@ -183,8 +184,8 @@ the 4090 before merge:
    M4: GEMM GPU time 9.2 → 7.8 ms; step ~20 → 19.6 ms. The step moves less
    than the kernels: ~4 ms of host scheduling runs before the GPU starts, and
    854 dispatches on a serial encoder each wait for the previous one (stage 8).
-   Not done: reduce / elementwise knobs, GEMM epilogues (< 1 ms upside
-   measured), CUDA (cuBLAS stays), on-disk binaries.
+   Not done: reduce / elementwise knobs, CUDA (cuBLAS stays), on-disk
+   binaries. GEMM epilogues: stage 8 / PR 9.
 8. Record and replay (Metal indirect command buffers, CUDA Graphs) + optimizer
    as UOps on the device  [PR 8: replay of scheduling, concurrent dispatch]
    Schedule cache (schedule_cache.odin): a step's graph has the same structure
@@ -199,8 +200,15 @@ the 4090 before merge:
    ML_METAL_SERIAL=1 for the serial encoder.
    M4: Metal 19.6 → 16.65 ms (≈ 12.9 ms GPU window + ~1 ms scheduling +
    ~2.5 ms sampling, graph building, encoding of the first batch, Adam).
+   Then [PR 9]: GEMM epilogues on Metal — a MatMul whose result only one
+   elementwise group reads (directly or through dense views) runs with the
+   group in its store loop (Backend.matmul_epi; the result is never stored):
+   the q/k/v projection bias adds, 672 → 634 kernels. Replay without maps
+   (UOp.epoch / pos), the first command buffer committed after 16 kernels.
+   M4: Metal 16.65 → ~15.4 ms; M3 22.4 → 20.5 ms.
    Not done: kernel-list replay (ICB / CUDA Graphs), Adam on the device (0.16
-   ms on the M5's unified memory; matters on CUDA).
+   ms on the M5's unified memory; matters on CUDA), epilogues on CUDA
+   (cuBLAS) and after split-K / tiny GEMMs.
 
 Milestones
 0. Cleanup ✓  One UOp model: one executor, autograd emits UOps ✓
