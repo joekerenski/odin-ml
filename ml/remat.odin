@@ -249,6 +249,7 @@ remat_inline :: proc(r: ^Remat, B, u: ^UOp, cone: []^UOp) {
 		s.uf[c] = B
 		append(&fresh, c)
 		append(&s.clones, c)
+		append(&s.clone_of, x)
 	}
 	// B's readers of u now read the clone
 	cu := have[u]
@@ -318,6 +319,7 @@ Rewire :: struct {
 free_clones :: proc(s: ^Schedule) {
 	for w in s.rewired do w.node.src[w.i] = w.src
 	delete(s.rewired)
+	delete(s.clone_of)
 	for c in s.clones {
 		delete(c.src, scratch())
 		free(c, scratch())

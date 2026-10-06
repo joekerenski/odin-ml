@@ -30,8 +30,9 @@ import NS "core:sys/darwin/Foundation"
 import MTL "vendor:darwin/Metal"
 
 Dev_Ref :: struct {
-	buf: ^MTL.Buffer,
-	off: int, // bytes
+	buf:  ^MTL.Buffer,
+	off:  int, // bytes
+	size: int, // bytes (0: unknown, the whole buffer)
 }
 
 @(private = "file")
@@ -68,7 +69,17 @@ Metal_Context :: struct {
 	opened:      time.Tick, // for ML_DEBUG timing
 	n_dispatch:  int,
 	in_flight:   [dynamic]^MTL.CommandBuffer, // committed, not yet waited on
+	// concurrent encoder: ranges read / written since the last barrier
+	reads:       [dynamic]Dev_Ref,
+	writes:      [dynamic]Dev_Ref,
+	n_barrier:   int,
 }
+
+// Kernels in a batch may overlap on the GPU (a concurrent encoder); a memory
+// barrier goes in only before a kernel that reads a range written since the
+// last barrier, or writes a range read or written since then.
+// ML_METAL_SERIAL=1: a serial encoder (each kernel waits for the previous one).
+metal_concurrent := true
 
 // Commit every this many kernels without waiting, so the GPU runs while the
 // CPU keeps encoding. Same queue + tracked buffers keep them in order.
@@ -92,6 +103,8 @@ metal_init :: proc() -> bool {
 	metal_ctx.staged = make(map[uintptr]Dev_Ref, scratch())
 	metal_ctx.copy_backs = make([dynamic]Copy_Back, scratch())
 	metal_ctx.in_flight = make([dynamic]^MTL.CommandBuffer, scratch())
+	metal_ctx.reads = make([dynamic]Dev_Ref, scratch())
+	metal_ctx.writes = make([dynamic]Dev_Ref, scratch())
 	metal_ctx.initialized = true
 	return true
 }
@@ -199,7 +212,7 @@ scratch_alloc :: proc(bytes: int) -> Dev_Ref {
 		}
 		buf := metal_ctx.scratch[metal_ctx.scratch_i]
 		if metal_ctx.scratch_off + n <= int(MTL.Buffer_length(buf)) {
-			ref := Dev_Ref{buf, metal_ctx.scratch_off}
+			ref := Dev_Ref{buf, metal_ctx.scratch_off, n}
 			metal_ctx.scratch_off += n
 			return ref
 		}
@@ -220,7 +233,7 @@ resolve :: proc(s: []f32, output := false) -> Dev_Ref {
 	p := uintptr(raw_data(s))
 	if r, ok := metal_ctx.staged[p]; ok do return r
 	for b in metal_ctx.blocks {
-		if p >= b.base && p < b.base + uintptr(b.size) do return {b.buf, int(p - b.base)}
+		if p >= b.base && p < b.base + uintptr(b.size) do return {b.buf, int(p - b.base), len(s) * size_of(f32)}
 	}
 	r := scratch_alloc(len(s) * size_of(f32))
 	if output {
@@ -239,9 +252,10 @@ encoder :: proc() -> ^MTL.ComputeCommandEncoder {
 	if metal_ctx.enc == nil {
 		metal_ctx.pool = NS.AutoreleasePool_alloc()->init()
 		metal_ctx.cmd = MTL.CommandQueue_commandBuffer(metal_ctx.queue)
-		metal_ctx.enc = MTL.CommandBuffer_computeCommandEncoder(metal_ctx.cmd)
+		metal_ctx.enc = new_encoder(metal_ctx.cmd)
 		metal_ctx.opened = time.tick_now()
 		metal_ctx.n_dispatch = 0
+		metal_ctx.n_barrier = 0
 	}
 	return metal_ctx.enc
 }
@@ -261,8 +275,8 @@ metal_sync :: proc() {
 	if debug_level >= 1 {
 		first, last := metal_ctx.in_flight[0], metal_ctx.in_flight[len(metal_ctx.in_flight) - 1]
 		gpu_ms := f64(MTL.CommandBuffer_GPUEndTime(last) - MTL.CommandBuffer_GPUStartTime(first)) * 1000
-		fmt.printfln("  metal: %d dispatches  encode %.2f ms  gpu %.2f ms  staged %d  copy-backs %d",
-			metal_ctx.n_dispatch, encode_ms, gpu_ms, len(metal_ctx.staged), len(metal_ctx.copy_backs))
+		fmt.printfln("  metal: %d dispatches  %d barriers  encode %.2f ms  gpu %.2f ms  staged %d  copy-backs %d",
+			metal_ctx.n_dispatch, metal_ctx.n_barrier, encode_ms, gpu_ms, len(metal_ctx.staged), len(metal_ctx.copy_backs))
 	}
 	clear(&metal_ctx.in_flight)
 	for cb in metal_ctx.copy_backs do copy(cb.host, ref_host(cb.ref, len(cb.host)))
@@ -275,8 +289,45 @@ metal_sync :: proc() {
 
 // ML_DEBUG >= 2: submit each kernel on its own and print its GPU time
 // (Apple GPUs timestamp per command buffer, not per dispatch). Slow; exact.
+@(private = "file")
+new_encoder :: proc(cmd: ^MTL.CommandBuffer) -> ^MTL.ComputeCommandEncoder {
+	clear(&metal_ctx.reads)
+	clear(&metal_ctx.writes)
+	return MTL.CommandBuffer_computeCommandEncoderWithDispatchType(cmd, metal_concurrent ? .Concurrent : .Serial)
+}
+
+// A barrier before this kernel if it touches what earlier kernels since the
+// last barrier wrote (or, for its outputs, read). bufs[:n_in] are read, the rest written.
+@(private = "file")
+barrier_if_needed :: proc(enc: ^MTL.ComputeCommandEncoder, bufs: []Dev_Ref, n_in: int) {
+	if !metal_concurrent do return
+	overlaps :: proc(a, b: Dev_Ref) -> bool {
+		return a.buf == b.buf && (a.size == 0 || b.size == 0 || a.off < b.off + b.size && b.off < a.off + a.size)
+	}
+	need := false
+	check: for r, i in bufs {
+		if r.buf == nil do continue
+		for w in metal_ctx.writes do if overlaps(r, w) {
+			need = true
+			break check
+		}
+		if i >= n_in do for x in metal_ctx.reads do if overlaps(r, x) {
+			need = true
+			break check
+		}
+	}
+	if need {
+		MTL.ComputeCommandEncoder_memoryBarrierWithScope(enc, {.Buffers})
+		clear(&metal_ctx.reads)
+		clear(&metal_ctx.writes)
+		metal_ctx.n_barrier += 1
+	}
+	for r, i in bufs do if r.buf != nil do append(i < n_in ? &metal_ctx.reads : &metal_ctx.writes, r)
+}
+
+// n_in: bufs[:n_in] are read, the rest written (for the barriers).
 @(private)
-dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32, grid: [3]int, group: [3]int, label := "") {
+dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32, grid: [3]int, group: [3]int, n_in: int, label := "") {
 	enc := encoder()
 	metal_ctx.n_dispatch += 1
 	if metal_ctx.n_dispatch % COMMIT_EVERY == 0 && !kernel_timing() {
@@ -284,9 +335,10 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 		MTL.CommandBuffer_commit(metal_ctx.cmd)
 		append(&metal_ctx.in_flight, metal_ctx.cmd)
 		metal_ctx.cmd = MTL.CommandQueue_commandBuffer(metal_ctx.queue)
-		metal_ctx.enc = MTL.CommandBuffer_computeCommandEncoder(metal_ctx.cmd)
+		metal_ctx.enc = new_encoder(metal_ctx.cmd)
 		enc = metal_ctx.enc
 	}
+	barrier_if_needed(enc, bufs, n_in)
 	MTL.ComputeCommandEncoder_setComputePipelineState(enc, pso)
 	for r, i in bufs do if r.buf != nil do MTL.ComputeCommandEncoder_setBuffer(enc, r.buf, NS.UInteger(r.off), NS.UInteger(i))
 	MTL.ComputeCommandEncoder_setBytes(enc, ([^]byte)(raw_data(params))[:len(params) * 4], 30)
@@ -307,7 +359,7 @@ dispatch :: proc(pso: ^MTL.ComputePipelineState, bufs: []Dev_Ref, params: []u32,
 		NS.AutoreleasePool_drain(metal_ctx.pool)
 		metal_ctx.pool = NS.AutoreleasePool_alloc()->init()
 		metal_ctx.cmd = MTL.CommandQueue_commandBuffer(metal_ctx.queue)
-		metal_ctx.enc = MTL.CommandBuffer_computeCommandEncoder(metal_ctx.cmd)
+		metal_ctx.enc = new_encoder(metal_ctx.cmd)
 	}
 }
 
@@ -344,7 +396,7 @@ run_plan :: proc(k: ^Kernel, variant: GPU_Variant, threads, partial_slot: int, p
 	for j in 0 ..< k.n_bufs do bufs[j] = j == partial_slot ? partial : resolve(k.bufs[j], output = j >= k.n_in)
 	p: [GPU_PARAMS]u32
 	n := gpu_params(k, &p)
-	dispatch(program(k, variant), bufs[:k.n_bufs], p[:n], {threads, 1, 1}, {GPU_GROUP, 1, 1},
+	dispatch(program(k, variant), bufs[:k.n_bufs], p[:n], {threads, 1, 1}, {GPU_GROUP, 1, 1}, k.n_in,
 		k.label != "" ? fmt.tprintf("%v %s", variant, k.label) : "")
 }
 

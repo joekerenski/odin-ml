@@ -1059,6 +1059,39 @@ test_cpu_kernels :: proc() {
 	for i in 0 ..< 3 do for v, j in g_on[i] do if abs(v - g_off[i][j]) > 1e-4 * (1 + abs(g_off[i][j])) do remat_ok = false
 	expect(remat_ok, "gelu + layer_norm fwd+bwd: recomputed == stored")
 	expect(bytes_on < bytes_off, fmt.tprintf("remat writes less (%d vs %d bytes)", bytes_on, bytes_off))
+
+	// schedule replay: steps 2+ reuse step 1's decisions (same structure, new
+	// nodes) — same parameters after 5 Adam steps as scheduling every step
+	train_steps :: proc(cache: bool) -> []f32 {
+		ml.sched_cache_enabled = cache
+		ml.remat_mode = .On // replay clones and rewires too
+		defer {
+			ml.sched_cache_enabled = true
+			ml.remat_mode = .Auto
+		}
+		rand.reset(13)
+		W1 := ml.randn({16, 32}, 0, 0.3, requires_grad = true)
+		b1 := ml.zeros({32}, requires_grad = true)
+		W2 := ml.randn({32, 4}, 0, 0.3, requires_grad = true)
+		opt := ml.new_adam({W1, b1, W2}, lr = 0.01)
+		for _ in 0 ..< 5 {
+			x := ml.randn({64, 16}, 0, 1)
+			h := ml.permute(ml.reshape(ml.gelu(ml.add(ml.matmul(x, W1), b1)), {64, 4, 8}), {1, 0, 2})
+			y := ml.matmul(ml.reshape(ml.permute(ml.layer_norm(h), {1, 0, 2}), {64, 32}), W2)
+			ml.backward(ml.sum(ml.square(y)))
+			ml.adam_step(opt)
+			ml.clear_grads(W1, b1, W2)
+		}
+		out := make([]f32, len(W1.data) + len(W2.data))
+		copy(out, W1.data)
+		copy(out[len(W1.data):], W2.data)
+		return out
+	}
+	p_off := train_steps(false)
+	p_on := train_steps(true)
+	replay_ok := true
+	for v, i in p_on do if abs(v - p_off[i]) > 1e-5 * (1 + abs(p_off[i])) do replay_ok = false
+	expect(replay_ok, "5 Adam steps: schedule replay == scheduling every step")
 }
 
 sync_add :: proc(p: ^int, v: int) {
