@@ -253,102 +253,191 @@ realize_all :: proc(sinks: []^UOp) {
 // are read, and no cycle can form). Values with outside users are stored; the
 // rest live in registers. Merges also respect the kernel budget (ops, inputs).
 @(private)
+Fuse :: struct {
+	s:                       ^Schedule,
+	idx:                     map[^UOp]int,
+	start, users:            []int, // users of node i: users[start[i]:start[i+1]] (topo indices)
+	parent, size, last:      []int, // union-find; per root: members, last member
+	next, tail:              []int, // members of a root, linked
+	red:                     []int, // per root: its reduce node, or -1
+}
+
+@(private)
+fuse_find :: proc(f: ^Fuse, i: int) -> int {
+	r := i
+	for f.parent[r] != r do r = f.parent[r]
+	for c := i; f.parent[c] != r; {
+		n := f.parent[c]
+		f.parent[c] = r
+		c = n
+	}
+	return r
+}
+
+// Would merging groups a and b keep "run at the last member" valid (every
+// outside user of a member after the merged group's last member)?
+@(private)
+fuse_valid :: proc(f: ^Fuse, a, b: int) -> bool {
+	lst := max(f.last[a], f.last[b])
+	for r in ([]int{a, b}) {
+		for m := r; m >= 0; m = f.next[m] {
+			for c in f.users[f.start[m]:f.start[m + 1]] {
+				rc := f.parent[c] < 0 ? -1 : fuse_find(f, c)
+				if rc != a && rc != b && c < lst do return false
+			}
+		}
+	}
+	return true
+}
+
+// Distinct outside inputs (buffers and constants) of the members of a ∪ b with
+// the given shape (nil: any), plus each in `extra` not already counted.
+@(private)
+fuse_inputs :: proc(f: ^Fuse, a, b: int, shape: []i32, seen: ^[dynamic]^UOp) -> int {
+	for r in ([]int{a, b}) {
+		for m := r; m >= 0; m = f.next[m] {
+			u := f.s.topo[m]
+			if shape != nil && !shapes_equal(u.shape, shape) do continue
+			for y in u.src {
+				if yi, inside := f.idx[y]; inside && f.parent[yi] >= 0 {
+					ry := fuse_find(f, yi)
+					if ry == a || ry == b do continue
+				}
+				dup := false
+				for z in seen do if z == y do dup = true
+				if !dup do append(seen, y)
+			}
+		}
+	}
+	return len(seen)
+}
+
+@(private)
+fuse_union :: proc(f: ^Fuse, a, b: int) {
+	f.parent[a] = b
+	f.size[b] += f.size[a]
+	f.last[b] = max(f.last[a], f.last[b])
+	f.next[f.tail[b]] = a
+	f.tail[b] = f.tail[a]
+	if f.red[a] >= 0 do f.red[b] = f.red[a]
+}
+
+// A reduction absorbing group a (its prologue or epilogue) into its group b:
+// inputs addressable in the canonical space, per-phase input budget, and no
+// input-shaped member reading the reduce or an output-shaped member.
+@(private)
+fuse_reduce_ok :: proc(f: ^Fuse, a, b: int) -> bool {
+	r := f.s.topo[f.red[b]]
+	X := r.src[0].shape
+	seen := make([dynamic]^UOp, scratch())
+	defer delete(seen)
+	n_pro := fuse_inputs(f, a, b, X, &seen)
+	for y in seen do if y.op != .Const && !reduce_mergeable(r, y) do return false
+	for y in r.src do if _, inside := f.idx[y]; !inside || f.parent[f.idx[y]] < 0 || (fuse_find(f, f.idx[y]) != a && fuse_find(f, f.idx[y]) != b) {
+		if y.op != .Const && !reduce_mergeable(r, y) do return false
+		n_pro += 1
+	}
+	clear(&seen)
+	n_epi := fuse_inputs(f, a, b, r.shape, &seen)
+	for y in seen do if y != r && y.op != .Const && !reduce_mergeable(r, y) do return false
+	if n_pro + n_epi > MAX_FUSED_INPUTS do return false
+	for g in ([]int{a, b}) {
+		for m := g; m >= 0; m = f.next[m] {
+			u := f.s.topo[m]
+			if u == r || !shapes_equal(u.shape, X) do continue
+			for y in u.src {
+				if y == r do return false
+				yi, inside := f.idx[y]
+				if !inside || f.parent[yi] < 0 do continue
+				ry := fuse_find(f, yi)
+				if (ry == a || ry == b) && y != r && shapes_equal(y.shape, r.shape) && !shapes_equal(y.shape, X) do return false
+			}
+		}
+	}
+	return true
+}
+
+// ---- grouping ---------------------------------------------------------------------
+//
+// 1. Same-shape elementwise nodes merge into groups (one kernel each). A group
+//    runs at the position of its last member, so a merge is allowed only if
+//    that stays valid (fuse_valid). Values with outside users are stored; the
+//    rest live in registers. Merges respect the kernel budget (ops, inputs).
+// 2. Each single-run reduction absorbs the group producing its input (prologue,
+//    evaluated per [o, r, k]) and groups consuming its result at its shape
+//    (epilogue, once per output), under the same rule (fuse_reduce_ok).
+@(private)
 fuse_groups :: proc(s: ^Schedule) {
 	N := len(s.topo)
-	idx := make(map[^UOp]int, N, scratch())
-	defer delete(idx)
-	for u, i in s.topo do idx[u] = i
-	// users of each node (each user once), by topo index
-	start := make([]int, N + 1, scratch())
-	defer delete(start, scratch())
+	f := Fuse{s = s}
+	f.idx = make(map[^UOp]int, N, scratch())
+	for u, i in s.topo do f.idx[u] = i
+	f.start = make([]int, N + 1, scratch())
 	for u in s.topo do for x, i in u.src {
-		j, ok := idx[x]
+		j, ok := f.idx[x]
 		if !ok || src_seen_before(u, i) do continue
-		start[j + 1] += 1
+		f.start[j + 1] += 1
 	}
-	for i in 0 ..< N do start[i + 1] += start[i]
-	users := make([]int, start[N], scratch())
-	defer delete(users, scratch())
+	for i in 0 ..< N do f.start[i + 1] += f.start[i]
+	f.users = make([]int, f.start[N], scratch())
 	fill := make([]int, N, scratch())
-	defer delete(fill, scratch())
 	for u, ui in s.topo do for x, i in u.src {
-		j, ok := idx[x]
+		j, ok := f.idx[x]
 		if !ok || src_seen_before(u, i) do continue
-		users[start[j] + fill[j]] = ui
+		f.users[f.start[j] + fill[j]] = ui
 		fill[j] += 1
 	}
-
-	// union-find over topo indices; per root: size, last member, members (linked)
-	parent := make([]int, N, scratch())
-	size := make([]int, N, scratch())
-	last := make([]int, N, scratch())
-	next := make([]int, N, scratch())
-	tail := make([]int, N, scratch())
+	f.parent = make([]int, N, scratch())
+	f.size = make([]int, N, scratch())
+	f.last = make([]int, N, scratch())
+	f.next = make([]int, N, scratch())
+	f.tail = make([]int, N, scratch())
+	f.red = make([]int, N, scratch())
 	defer {
-		delete(parent, scratch()); delete(size, scratch()); delete(last, scratch())
-		delete(next, scratch()); delete(tail, scratch())
+		delete(f.idx)
+		for a in ([][]int{f.start, f.users, fill, f.parent, f.size, f.last, f.next, f.tail, f.red}) do delete(a, scratch())
 	}
 	for u, i in s.topo {
-		parent[i] = op_is_ewise(u.op) ? i : -1
-		size[i], last[i], next[i], tail[i] = 1, i, -1, i
+		f.parent[i] = op_is_ewise(u.op) ? i : -1
+		f.size[i], f.last[i], f.next[i], f.tail[i], f.red[i] = 1, i, -1, i, -1
 	}
-	find :: proc(parent: []int, i: int) -> int {
-		r := i
-		for parent[r] != r do r = parent[r]
-		for c := i; parent[c] != r; {
-			n := parent[c]
-			parent[c] = r
-			c = n
-		}
-		return r
-	}
-	inputs: [2 * MAX_FUSED_INSNS * 2]^UOp
+
+	seen := make([dynamic]^UOp, scratch())
+	defer delete(seen)
 	for u, ui in s.topo {
-		if parent[ui] < 0 do continue
+		if f.parent[ui] < 0 do continue
 		for x in u.src {
-			xi, ok := idx[x]
-			if !ok || parent[xi] < 0 || !shapes_equal(x.shape, u.shape) do continue
-			a, b := find(parent, xi), find(parent, ui)
-			if a == b || size[a] + size[b] > MAX_FUSED_INSNS do continue
-			lst := max(last[a], last[b])
-			ok_merge := true
-			n_inputs := 0
-			outer: for r in ([]int{a, b}) {
-				for m := r; m >= 0; m = next[m] {
-					for c in users[start[m]:start[m + 1]] {
-						rc := parent[c] < 0 ? -1 : find(parent, c)
-						if rc != a && rc != b && c < lst {
-							ok_merge = false
-							break outer
-						}
-					}
-					for y in s.topo[m].src { // the merged kernel's inputs
-						yi, inside := idx[y]
-						if inside && parent[yi] >= 0 {
-							ry := find(parent, yi)
-							if ry == a || ry == b do continue
-						}
-						dup := false
-						for z in inputs[:n_inputs] do if z == y do dup = true
-						if dup do continue
-						if n_inputs == MAX_FUSED_INPUTS {
-							ok_merge = false
-							break outer
-						}
-						inputs[n_inputs] = y
-						n_inputs += 1
-					}
-				}
-			}
-			if !ok_merge do continue
-			parent[a] = b
-			size[b] += size[a]
-			last[b] = lst
-			next[tail[b]] = a
-			tail[b] = tail[a]
+			xi, ok := f.idx[x]
+			if !ok || f.parent[xi] < 0 || !shapes_equal(x.shape, u.shape) do continue
+			a, b := fuse_find(&f, xi), fuse_find(&f, ui)
+			if a == b || f.size[a] + f.size[b] > MAX_FUSED_INSNS do continue
+			clear(&seen)
+			if fuse_inputs(&f, a, b, nil, &seen) > MAX_FUSED_INPUTS || !fuse_valid(&f, a, b) do continue
+			fuse_union(&f, a, b)
 		}
 	}
-	for u, i in s.topo do if parent[i] >= 0 do s.uf[u] = s.topo[find(parent, i)]
+
+	for u, ui in s.topo {
+		if u.op != .Sum && u.op != .ReduceMax do continue
+		if _, _, ok := reduce_run(u.src[0].shape, u.arg.([]i32)); !ok do continue
+		f.parent[ui], f.red[ui] = ui, ui
+		// prologue: the group producing the input
+		if xi, ok := f.idx[u.src[0]]; ok && f.parent[xi] >= 0 {
+			a, b := fuse_find(&f, xi), fuse_find(&f, ui)
+			if a != b && f.red[a] < 0 && f.size[a] + f.size[b] <= MAX_FUSED_INSNS + 1 && fuse_valid(&f, a, b) && fuse_reduce_ok(&f, a, b) {
+				fuse_union(&f, a, b)
+			}
+		}
+		// epilogue: groups consuming the result at its shape
+		for c in f.users[f.start[ui]:f.start[ui + 1]] {
+			if f.parent[c] < 0 || !shapes_equal(s.topo[c].shape, u.shape) do continue
+			a, b := fuse_find(&f, c), fuse_find(&f, ui)
+			if a != b && f.red[a] < 0 && f.size[a] + f.size[b] <= MAX_FUSED_INSNS + 1 && fuse_valid(&f, a, b) && fuse_reduce_ok(&f, a, b) {
+				fuse_union(&f, a, b)
+			}
+		}
+	}
+	for u, i in s.topo do if f.parent[i] >= 0 do s.uf[u] = s.topo[fuse_find(&f, i)]
 }
 
 @(private)
@@ -397,6 +486,10 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 	t0: time.Tick
 	if debug_level >= 2 || profiling do t0 = time.tick_now()
 
+	for u in group do if u.op == .Sum || u.op == .ReduceMax {
+		run_reduce_group(s, group, stores[:], t0)
+		return
+	}
 	profile_open(.Fused, fused_bytes(group, stores[:]), i64(numel(group[len(group) - 1].shape)) * i64(len(group)), len(group))
 	if k, ok := kernel_from_group(group, stores[:]); ok {
 		launch_kernel(&k)
@@ -424,6 +517,25 @@ run_group :: proc(s: ^Schedule, group: []^UOp) {
 		fmt.printf("  kernel  fused[")
 		for u, i in group do fmt.printf("%s%v", i > 0 ? "," : "", u.op)
 		fmt.printfln("] shape=%v  %7.3f ms", group[len(group) - 1].shape, f64(dt) / 1e6)
+	}
+}
+
+// A reduction with its fused prologue / epilogue: one kernel.
+@(private)
+run_reduce_group :: proc(s: ^Schedule, group, stores: []^UOp, t0: time.Tick) {
+	flops: i64
+	for u in group do flops += i64(numel(u.op == .Sum || u.op == .ReduceMax ? u.src[0].shape : u.shape))
+	profile_open(.Reduce, fused_bytes(group, stores), flops, len(group))
+	k, ok := kernel_from_reduce_group(group, stores)
+	assert(ok, "fused reduction over budget (fuse_groups should have refused it)")
+	launch_kernel(&k)
+	profile_host_wall(t0, .Reduce)
+	counters.kernels += 1
+	counters.fused_ops += len(group) - 1
+	if debug_level >= 2 {
+		fmt.printf("  kernel  reduce-group[")
+		for u, i in group do fmt.printf("%s%v", i > 0 ? "," : "", u.op)
+		fmt.printfln("]")
 	}
 }
 

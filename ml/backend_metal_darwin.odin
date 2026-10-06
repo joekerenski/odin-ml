@@ -324,25 +324,26 @@ program :: proc(k: ^Kernel, variant: GPU_Variant) -> ^MTL.ComputePipelineState {
 
 metal_kernel :: proc(k: ^Kernel) {
 	plan := gpu_plan(k)
-	bufs: [MAX_KERNEL_BUFS]Dev_Ref
-	for j in 0 ..< k.n_bufs do bufs[j] = resolve(k.bufs[j], output = j >= k.n_in)
 	if plan.split > 1 {
-		// partial [O·S, I] from k's program, then a plain reduction over S
-		pa, pb, na, nb := gpu_split_params(k, plan.split)
-		O, I := k.dims[0], k.dims[2]
-		partial := scratch_alloc(O * plan.split * I * size_of(f32))
-		in_bufs := bufs
-		in_bufs[k.n_in] = partial
-		label := k.label != "" ? fmt.tprintf("Reduce_Split %s", k.label) : ""
-		dispatch(program(k, .Reduce_Thread), in_bufs[:k.n_in + 1], pa[:na], {plan.threads, 1, 1}, {GPU_GROUP, 1, 1}, label)
-		kb := kernel_reduce_run(k.nodes[kernel_reduce_node(k)].op, nil, nil, O, plan.split, I)
-		dispatch(program(&kb, .Reduce_Thread), {partial, bufs[k.n_in]}, pb[:nb], {O * I, 1, 1}, {GPU_GROUP, 1, 1}, label)
+		a, b, ap, bp := gpu_split(k, plan.split)
+		partial := scratch_alloc(a.dims[0] * a.dims[2] * size_of(f32))
+		run_plan(&a, .Reduce_Thread, a.dims[0] * a.dims[2], ap, partial)
+		run_plan(&b, .Reduce_Thread, b.dims[0] * b.dims[2], bp, partial)
 		return
 	}
+	run_plan(k, plan.variant, plan.threads, -1, {})
+}
+
+// One dispatch of k's program under a variant; buffer slot `partial_slot` is
+// bound to the backend scratch `partial` (split reductions).
+@(private = "file")
+run_plan :: proc(k: ^Kernel, variant: GPU_Variant, threads, partial_slot: int, partial: Dev_Ref) {
+	bufs: [MAX_KERNEL_BUFS]Dev_Ref
+	for j in 0 ..< k.n_bufs do bufs[j] = j == partial_slot ? partial : resolve(k.bufs[j], output = j >= k.n_in)
 	p: [GPU_PARAMS]u32
 	n := gpu_params(k, &p)
-	dispatch(program(k, plan.variant), bufs[:k.n_bufs], p[:n], {plan.threads, 1, 1}, {GPU_GROUP, 1, 1},
-		k.label != "" ? fmt.tprintf("%v %s", plan.variant, k.label) : "")
+	dispatch(program(k, variant), bufs[:k.n_bufs], p[:n], {threads, 1, 1}, {GPU_GROUP, 1, 1},
+		k.label != "" ? fmt.tprintf("%v %s", variant, k.label) : "")
 }
 
 // ---- fixed kernels --------------------------------------------------------

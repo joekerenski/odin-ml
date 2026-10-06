@@ -7,3 +7,4 @@ extern __device__ const __dim3 blockIdx, threadIdx, blockDim, gridDim;
 __device__ float expf(float); __device__ float logf(float); __device__ float sqrtf(float);
 __device__ float __uint_as_float(unsigned int); __device__ float __int_as_float(int);
 __device__ void __syncthreads();
+__device__ float __shfl_xor_sync(unsigned int mask, float v, int lane_mask);
