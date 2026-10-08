@@ -121,7 +121,8 @@ Workload: one M4 training step, ~9.3 GFLOP, ~400 MB of activation traffic.
   Was 28.5 ms; now ~15.4 ms (PR 9). Target ≤ 15 ms (tinygrad BEAM 16.6);
   stretch ~8 ms.
 - RTX 4090: 82.6 TFLOPS fp32, 1008 GB/s. Floor ~1.5–2.5 ms/step, set by kernel
-  count × launch cost. Now 13 ms. Target < 6 ms; stretch ~2 ms.
+  count × launch cost. Was 13 ms; now ~10.4 ms (stage 9). Target < 6 ms;
+  stretch ~2 ms.
 - Kernels per step 1484 → ~600.
 One branch + PR per stage, measured with `make perf` on the M5; CUDA checked on
 the 4090 before merge:
@@ -209,6 +210,22 @@ the 4090 before merge:
    Not done: kernel-list replay (ICB / CUDA Graphs), Adam on the device (0.16
    ms on the M5's unified memory; matters on CUDA), epilogues on CUDA
    (cuBLAS) and after split-K / tiny GEMMs.
+9. CUDA check of stages 1–8 on the RTX 4090 (rev 254583f, CUDA 13.3, sm_89)
+   Stages 1–8 were built on the M5; this is their first run on CUDA. No
+   changes needed. Tests 138/138 (CPU, CUDA), parity 78/78, and parity clean
+   under compute-sanitizer (memcheck, racecheck, synccheck, initcheck).
+   cuBLAS GEMM vs float64: 1–3e-7 of output scale (fp32, no TF32; parity's
+   worst rel up to 4e-3 is its 1e-3 + |b| denominator near zero). Oracles
+   41/41 vs tinygrad on CUDA; whole-model check on the fixed batch: posterior
+   +0.032985, prior +1.826327, same as tinygrad on CUDA. MNIST MLP curves
+   match the CPU.
+   Baseline in bench/perf/baseline-cuda-linux-amd64.json (runs vary ±0.5 ms).
+   M4: 13 → ~10.4 ms, 672 kernels (634 on Metal: no GEMM epilogues on
+   CUDA); GPU time ~5.3 ms (GEMM 2.5, reductions 2.4, elementwise 0.4), so
+   about half the step is launch and host time. M3: 15.6 → ~9.1 ms.
+   2048³ GEMM 56 TFLOPS; streaming 919 GB/s (of 1008).
+   Next on CUDA: CUDA Graphs (replay a recorded step), Adam on the device,
+   GEMM epilogues.
 
 Milestones
 0. Cleanup ✓  One UOp model: one executor, autograd emits UOps ✓
